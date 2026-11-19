@@ -99,7 +99,14 @@ cp config.example.yaml config.yaml
 chmod 600 .env
 ```
 
-Edit `config.yaml` to map Plane projects and modules to repos:
+You now have two files to fill in over the next steps:
+
+| File | What goes in it |
+|---|---|
+| `.env` | Secrets: API tokens and webhook secrets. Never commit it. |
+| `config.yaml` | Which Plane projects and modules sync to which repos |
+
+Open `config.yaml` (`nano config.yaml`) and map Plane projects and modules to repos:
 
 ```yaml
 mappings:
@@ -113,8 +120,24 @@ A module mapping wins over a project-wide one.
 ### 2. Plane API token
 
 In Plane: your avatar → **Profile settings** → **Personal access tokens**
-(called API tokens in some versions) → create one → paste it into
-`PLANE_API_KEY`.
+(called API tokens in some versions) → create one and copy it.
+
+Open `.env` (`nano .env`) and paste it after `PLANE_API_KEY=`, with no quotes
+or spaces:
+
+```bash
+PLANE_API_KEY=plane_api_0123456789abcdef
+```
+
+While you're in `.env`, check the three lines above it. The defaults fit a
+standard install; change `PLANE_WORKSPACE` if your workspace URL isn't
+`plane.d5i.dev/d5i`:
+
+```bash
+PLANE_BASE_URL=http://localhost:8090       # where the bridge reaches Plane on this machine
+PLANE_PUBLIC_URL=https://plane.d5i.dev     # the address people click
+PLANE_WORKSPACE=d5i                        # the part after plane.d5i.dev/ in your browser
+```
 
 > [!NOTE]
 > The bridge acts as this user, so use an account that's a member of every
@@ -131,22 +154,32 @@ Create a fine-grained token at
 | Repository access | Only the repos in `config.yaml` |
 | Permissions | **Issues → Read and write** (Metadata → Read is added automatically) |
 
-Paste it into `GITHUB_TOKEN`. If the org requires approval for fine-grained
-tokens, an owner approves it under **Org settings → Personal access tokens →
-Pending requests**. Issues the bridge creates show as opened by the token's
-owner.
+If the org requires approval for fine-grained tokens, an owner approves it under
+**Org settings → Personal access tokens → Pending requests**. Issues the bridge
+creates show as opened by the token's owner.
 
-Then generate the GitHub webhook secret:
+Then make up a secret for the GitHub webhook:
 
 ```bash
-openssl rand -hex 32    # paste into GITHUB_WEBHOOK_SECRET
+openssl rand -hex 32
 ```
+
+Put both in `.env`:
+
+```bash
+GITHUB_TOKEN=github_pat_0123456789abcdef
+GITHUB_WEBHOOK_SECRET=<the output of openssl rand -hex 32>
+```
+
+Leave `PLANE_WEBHOOK_SECRET` empty for now; Plane gives you that one in step 6.
+Until then the bridge starts but turns away Plane webhooks.
 
 ### 4. Start the bridge
 
 ```bash
 docker compose up -d --build
-curl http://127.0.0.1:8095/health      # {"ok":true,"mappings":1}
+curl http://127.0.0.1:8095/health
+# {"ok":true,"mappings":1,"plane_webhook_ready":false}   (true after step 6)
 ```
 
 ### 5. Give it a public address
@@ -174,11 +207,16 @@ Plane → **Workspace settings → Webhooks → Add webhook**:
 | URL | `https://hooks.d5i.dev/plane/webhook` |
 | Events | Work items (issues) only |
 
-Copy the secret it shows (it starts with `plane_wh_`) into
-`PLANE_WEBHOOK_SECRET`, then restart:
+Plane shows a secret that starts with `plane_wh_`. Put it in `.env`:
 
 ```bash
-docker compose up -d
+PLANE_WEBHOOK_SECRET=plane_wh_0123456789abcdef
+```
+
+Then restart the bridge so it reads the new value:
+
+```bash
+docker compose up -d --force-recreate
 ```
 
 ### 7. GitHub org webhook
@@ -189,7 +227,7 @@ GitHub → **D5-Interactive → Settings → Webhooks → Add webhook**:
 |---|---|
 | Payload URL | `https://hooks.d5i.dev/github/webhook` |
 | Content type | `application/json` |
-| Secret | your `GITHUB_WEBHOOK_SECRET` |
+| Secret | the `GITHUB_WEBHOOK_SECRET` value from `.env` |
 | Events | **Let me select** → ✓ Issues, ✓ Pull requests |
 
 GitHub sends a ping right away; it should show a green check.

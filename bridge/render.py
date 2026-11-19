@@ -12,7 +12,7 @@ from markdownify import markdownify
 
 def verify_plane_signature(secret: str, body: bytes, header: str | None) -> bool:
     """Plane: X-Plane-Signature = hex HMAC-SHA256 of the raw body."""
-    if not header:
+    if not secret or not header:  # an empty secret would make signatures forgeable
         return False
     expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, header.strip())
@@ -20,7 +20,7 @@ def verify_plane_signature(secret: str, body: bytes, header: str | None) -> bool
 
 def verify_github_signature(secret: str, body: bytes, header: str | None) -> bool:
     """GitHub: X-Hub-Signature-256 = 'sha256=' + hex HMAC-SHA256 of the raw body."""
-    if not header or not header.startswith("sha256="):
+    if not secret or not header or not header.startswith("sha256="):
         return False
     expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, header.strip())

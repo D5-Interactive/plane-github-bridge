@@ -60,7 +60,9 @@ def load_settings(config_path: str | None = None) -> Settings:
         plane_public_url=_need("PLANE_PUBLIC_URL").rstrip("/"),
         plane_workspace=_need("PLANE_WORKSPACE"),
         plane_api_key=_need("PLANE_API_KEY"),
-        plane_webhook_secret=_need("PLANE_WEBHOOK_SECRET"),
+        # Optional at startup: Plane only shows this secret after the webhook exists,
+        # and the webhook needs the bridge running. Plane webhooks are refused until set.
+        plane_webhook_secret=os.environ.get("PLANE_WEBHOOK_SECRET", "").strip(),
         github_token=_need("GITHUB_TOKEN"),
         github_webhook_secret=_need("GITHUB_WEBHOOK_SECRET"),
         db_path=os.environ.get("BRIDGE_DB", "/data/bridge.db"),

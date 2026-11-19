@@ -33,13 +33,19 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
         except Exception:  # never let one bad event kill the worker
             log.exception("%s failed", name)
 
+    if not settings.plane_webhook_secret:
+        log.warning("PLANE_WEBHOOK_SECRET is not set: Plane webhooks will be refused until it is")
+
     @app.get("/health")
     def health():
-        return {"ok": True, "mappings": len(settings.mappings)}
+        return {"ok": True, "mappings": len(settings.mappings),
+                "plane_webhook_ready": bool(settings.plane_webhook_secret)}
 
     @app.post("/plane/webhook", status_code=202)
     async def plane_webhook(request: Request, tasks: BackgroundTasks,
                             x_plane_signature: str | None = Header(default=None)):
+        if not settings.plane_webhook_secret:
+            raise HTTPException(503, "PLANE_WEBHOOK_SECRET is not set on the bridge")
         body = await request.body()
         if not verify_plane_signature(settings.plane_webhook_secret, body, x_plane_signature):
             raise HTTPException(401, "bad signature")

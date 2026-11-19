@@ -231,3 +231,15 @@ def test_http_rejects_bad_signatures_and_accepts_good(env):
                     headers={"X-Hub-Signature-256": gsig, "X-GitHub-Event": "pull_request"})
     assert r.status_code == 202 and fp.item["state"] == "s-review"
     assert client.get("/health").json()["ok"] is True
+
+
+def test_missing_plane_secret_refuses_plane_webhooks(env):
+    bridge, fp, fg = env
+    bridge.s.plane_webhook_secret = ""
+    client = TestClient(build_app(bridge))
+    body = json.dumps(plane_event()).encode()
+    forged = hmac.new(b"", body, hashlib.sha256).hexdigest()  # signed with the empty key
+    assert client.post("/plane/webhook", content=body, headers={"X-Plane-Signature": forged}).status_code == 503
+    assert not verify_plane_signature("", body, forged)
+    assert client.get("/health").json()["plane_webhook_ready"] is False
+    assert not fg.created
