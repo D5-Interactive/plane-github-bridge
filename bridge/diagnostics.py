@@ -387,21 +387,25 @@ def _reason(e: Exception) -> str:
 def make_router(diag: Diagnostics, plane_base_url: str, workspace: str,
                 transport: httpx.BaseTransport | None = None,
                 recent_seconds: float = 7 * 86400, on_scan=None,
-                per_minute: int = 30, clock=time.monotonic) -> APIRouter:
+                per_minute: int = 30, clock=time.monotonic, trust_proxy_headers: bool = False,
+                max_clients: int = 10_000) -> APIRouter:
     """/status/PROJECT-N and /admin/sync-problems, checked against Plane with the caller's key.
 
     The caller's key is only used for those checks: it's never stored or logged. Each
     client address may make `per_minute` requests a minute (each one costs a Plane
-    call); behind a tunnel or proxy the address comes from CF-Connecting-IP or the
-    first X-Forwarded-For entry.
+    call). The address is the socket's, or, with trust_proxy_headers (only behind a
+    tunnel or proxy that sets them), CF-Connecting-IP or the first X-Forwarded-For
+    entry. At most max_clients addresses are remembered; the least recent go first.
     """
     hits: dict[str, list[float]] = {}
     hits_lock = threading.Lock()
 
     def throttle(request: Request) -> None:
-        ip = (request.headers.get("cf-connecting-ip")
-              or (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
-              or (request.client.host if request.client else "unknown"))
+        ip = ""
+        if trust_proxy_headers:
+            ip = (request.headers.get("cf-connecting-ip")
+                  or (request.headers.get("x-forwarded-for") or "").split(",")[0].strip())
+        ip = ip or (request.client.host if request.client else "unknown")
         now = clock()
         with hits_lock:
             recent = [t for t in hits.get(ip, []) if now - t < 60]
@@ -410,9 +414,12 @@ def make_router(diag: Diagnostics, plane_base_url: str, workspace: str,
                 raise HTTPException(429, "too many requests; try again in a minute")
             recent.append(now)
             hits[ip] = recent
-            if len(hits) > 10_000:          # forget idle addresses
+            if len(hits) > max_clients:
                 for k in [k for k, v in hits.items() if not v or now - v[-1] >= 60]:
-                    del hits[k]
+                    del hits[k]             # idle addresses first
+                if len(hits) > max_clients:  # then the least recently seen
+                    for k in sorted(hits, key=lambda k: hits[k][-1])[:len(hits) - max_clients]:
+                        del hits[k]
 
     router = APIRouter(dependencies=[Depends(throttle)])
     api = f"{plane_base_url.rstrip('/')}/api/v1"

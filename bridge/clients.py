@@ -630,14 +630,34 @@ class GitHubClient:
         _check(r)
         return r.json()
 
-    def recent_issues(self, repo: str, count: int = 30) -> list[dict]:
+    def recent_issues(self, repo: str, count: int = 30, since: str | None = None,
+                      max_pages: int = 3) -> list[dict]:
         """The repo's most recently created issues (open and closed), newest first.
-        Used before re-creating an issue, to find one an earlier attempt made."""
-        r = self._request("GET", f"/repos/{repo}/issues",
-                          params={"state": "all", "sort": "created", "direction": "desc",
-                                  "per_page": count})
+        Used before creating an issue, to find one an earlier attempt made.
+
+        since: an ISO time: every issue created since then (GitHub's `since` covers
+        them, as an issue's updated_at is never before its creation), up to max_pages
+        pages of 100. Without it, the newest `count`.
+        """
+        params: dict = {"state": "all", "sort": "created", "direction": "desc"}
+        if since is None:
+            r = self._request("GET", f"/repos/{repo}/issues", params={**params, "per_page": count})
+            _check(r)
+            return [i for i in r.json() if "pull_request" not in i]
+        out = []
+        for page in range(1, max_pages + 1):
+            r = self._request("GET", f"/repos/{repo}/issues",
+                              params={**params, "since": since, "per_page": 100, "page": page})
+            _check(r)
+            batch = r.json()
+            out.extend(i for i in batch if "pull_request" not in i)
+            if len(batch) < 100:
+                break
+        return out
+
+    def add_issue_comment(self, repo: str, number: int, body: str) -> None:
+        r = self._request("POST", f"/repos/{repo}/issues/{number}/comments", json={"body": body})
         _check(r)
-        return [i for i in r.json() if "pull_request" not in i]
 
     def update_issue(self, repo: str, number: int, **fields) -> dict:
         """PATCH an issue; returns the updated issue."""

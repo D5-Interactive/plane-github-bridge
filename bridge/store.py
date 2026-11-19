@@ -22,6 +22,7 @@ class Store:
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.executescript(
             """
+            DROP TABLE IF EXISTS own_writes;   -- never shipped; replaced by bridge_writes
             CREATE TABLE IF NOT EXISTS links (
                 plane_item_id    TEXT PRIMARY KEY,
                 plane_project_id TEXT NOT NULL,
@@ -175,29 +176,41 @@ class Store:
                 self._db.execute("INSERT OR IGNORE INTO seen_events (event_id) VALUES (?)", (event_id,))
                 self._db.commit()
 
-    # -------- the bridge's own writes (to ignore the webhooks they cause)
+    # -------- the bridge's own writes (to ignore the webhook each one causes)
 
-    def _own_writes_table(self) -> None:
-        self._db.execute("CREATE TABLE IF NOT EXISTS own_writes (plane_item_id TEXT NOT NULL, "
+    def _writes_table(self) -> None:
+        self._db.execute("CREATE TABLE IF NOT EXISTS bridge_writes (plane_item_id TEXT NOT NULL, "
                          "field TEXT NOT NULL, value TEXT NOT NULL, at REAL NOT NULL, "
-                         "PRIMARY KEY (plane_item_id, field, value))")
+                         "PRIMARY KEY (plane_item_id, field))")
 
     def record_own_write(self, item_id: str, field: str, value, at: float) -> None:
-        """Remember that the bridge just set `field` to `value` on the item or its issue."""
+        """Remember the bridge's latest write of `field` on the item or its issue."""
         with self._lock:
-            self._own_writes_table()
-            self._db.execute("INSERT OR REPLACE INTO own_writes VALUES (?, ?, ?, ?)",
+            self._writes_table()
+            self._db.execute("INSERT OR REPLACE INTO bridge_writes VALUES (?, ?, ?, ?)",
                              (item_id, field, str(value), at))
-            self._db.execute("DELETE FROM own_writes WHERE at < ?", (at - 3600,))
+            self._db.execute("DELETE FROM bridge_writes WHERE at < ?", (at - 3600,))
             self._db.commit()
 
-    def is_own_write(self, item_id: str, field: str, value, since: float) -> bool:
-        """True if the bridge set `field` to `value` on this item at or after `since`."""
+    def take_echo(self, item_id: str, field: str, value, since: float, snapshot_holds: bool) -> bool:
+        """Is this webhook the echo of the bridge's last write of `field`?
+
+        Yes only if `value` equals that write (made at or after `since`) and the
+        snapshot still holds it. A write matches one echo at most: it's forgotten
+        either way, so any later change to the field, even back to the same value,
+        counts as a real change.
+        """
         with self._lock:
-            self._own_writes_table()
-            return self._db.execute(
-                "SELECT 1 FROM own_writes WHERE plane_item_id = ? AND field = ? AND value = ? AND at >= ?",
-                (item_id, field, str(value), since)).fetchone() is not None
+            self._writes_table()
+            row = self._db.execute(
+                "SELECT value, at FROM bridge_writes WHERE plane_item_id = ? AND field = ?",
+                (item_id, field)).fetchone()
+            if row is None:
+                return False
+            self._db.execute("DELETE FROM bridge_writes WHERE plane_item_id = ? AND field = ?",
+                             (item_id, field))
+            self._db.commit()
+        return row[0] == str(value) and row[1] >= since and snapshot_holds
 
     def pr_link_known(self, item_id: str, pr_url: str) -> bool:
         """True if this PR link was already added to the item. Reads only."""

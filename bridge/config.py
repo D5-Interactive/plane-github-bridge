@@ -53,6 +53,7 @@ class Settings:
     quiet_hours: tuple[int, int] = (1, 5)
     reconcile: bool = True              # checks of edited modules/repos and the org scan
     first_contact_fix: bool = False     # fix open/closed on pairs with no snapshot yet
+    trust_proxy_headers: bool = False   # take client addresses from CF-Connecting-IP / X-Forwarded-For
 
     def owner_allowed(self, repo: str) -> bool:
         if not self.allowed_owners:
@@ -91,6 +92,9 @@ def _hours(value: str) -> tuple[int, int]:
         raise RuntimeError(f"BRIDGE_QUIET_HOURS must look like 1-5, not {value!r}") from None
     if not (0 <= a <= 23 and 0 <= b <= 23):
         raise RuntimeError(f"BRIDGE_QUIET_HOURS hours must be 0-23, not {value!r}")
+    if a == b:
+        raise RuntimeError(f"BRIDGE_QUIET_HOURS start and end must differ (got {value!r}); "
+                           "for example 1-5 for 1 a.m. to 5 a.m.")
     return a, b
 
 
@@ -137,4 +141,5 @@ def load_settings(config_path: str | None = None) -> Settings:
         quiet_hours=_hours(os.environ.get("BRIDGE_QUIET_HOURS", "1-5")),
         reconcile=_on(os.environ.get("BRIDGE_RECONCILE")),
         first_contact_fix=_on(os.environ.get("BRIDGE_FIRST_CONTACT_FIX"), default=False),
+        trust_proxy_headers=_on(os.environ.get("BRIDGE_TRUST_PROXY_HEADERS"), default=False),
     )

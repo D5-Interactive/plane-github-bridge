@@ -180,7 +180,8 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
         return {"accepted": True}
 
     app.include_router(make_router(bridge.diag, settings.plane_base_url, settings.plane_workspace,
-                                   on_scan=bridge.scheduler.force))
+                                   on_scan=bridge.scheduler.force,
+                                   trust_proxy_headers=getattr(settings, "trust_proxy_headers", False)))
     return app
 
 

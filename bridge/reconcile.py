@@ -75,7 +75,7 @@ def ensure_schema(store) -> None:
                    synced_at     REAL NOT NULL)""")
         store._db.execute(
             """CREATE TABLE IF NOT EXISTS repo_checks (
-                   repo       TEXT PRIMARY KEY,
+                   repo       TEXT PRIMARY KEY,   -- "owner/repo|module id"
                    checked_at REAL NOT NULL)""")
         store._db.commit()
 
@@ -112,16 +112,23 @@ def get_snapshot(store, plane_item_id: str) -> Snapshot | None:
                     row[7], row[8], row[9])
 
 
-def last_checked(store, repo: str) -> float | None:
+def _check_key(repo: str, module_id: str) -> str:
+    return f"{repo.lower()}|{module_id}"
+
+
+def last_checked(store, repo: str, module_id: str) -> float | None:
+    """When this module was last checked against this repo (each pair separately,
+    so one module's check doesn't hide changes from another linked to the repo)."""
     with store._lock:
         row = store._db.execute("SELECT checked_at FROM repo_checks WHERE repo = ?",
-                                (repo.lower(),)).fetchone()
+                                (_check_key(repo, module_id),)).fetchone()
     return row[0] if row else None
 
 
-def set_checked(store, repo: str, at: float) -> None:
+def set_checked(store, repo: str, module_id: str, at: float) -> None:
     with store._lock:
-        store._db.execute("INSERT OR REPLACE INTO repo_checks VALUES (?, ?)", (repo.lower(), at))
+        store._db.execute("INSERT OR REPLACE INTO repo_checks VALUES (?, ?)",
+                          (_check_key(repo, module_id), at))
         store._db.commit()
 
 
@@ -331,7 +338,7 @@ class Reconciler:
                 if number in linked_numbers or self.store.by_issue(repo, number):
                     continue
                 report.unlinked_issues.append({"repo": repo, "issue_number": number})
-        set_checked(self.store, repo, started)
+        set_checked(self.store, repo, module["id"], started)
         return report
 
     def _compare(self, report: Report, item: dict, issue: dict, groups: dict, base: dict,
