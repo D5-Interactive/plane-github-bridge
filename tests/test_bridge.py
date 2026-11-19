@@ -535,3 +535,29 @@ def test_health_reports_plane_problem(env):
     with TestClient(build_app(bridge)) as client:
         body = client.get("/health").json()
     assert body["plane_api_ok"] is False and "typo" in body["plane_problem"]
+
+
+# ---------------------------------------------------------------- catch-up sync
+
+def test_sync_creates_issue_for_item_added_to_module_later(env):
+    bridge, fp, fg = env
+    bridge.s.mappings = []
+    fp.module_desc = "https://github.com/acme/from-plane"
+    fp.module_members = set()
+    assert "kept in Plane" in bridge.handle_plane(plane_event())     # created outside the module
+    fp.module_members = {ITEM}                                       # then dragged in: no webhook
+    assert bridge.sync_linked_modules() == "created acme/from-plane#42"
+    assert bridge.sync_linked_modules() == "nothing new"             # never twice
+    assert len(fg.created) == 1
+
+
+def test_sync_ignores_unlinked_modules(env):
+    bridge, fp, fg = env
+    bridge.s.mappings = []
+    assert bridge.sync_linked_modules() == "nothing new"
+    assert not fg.created
+
+
+def test_sync_uses_config_mapping_by_module_name(env):
+    bridge, fp, fg = env                     # config maps API / Auth -> acme/auth-service
+    assert bridge.sync_linked_modules() == "created acme/auth-service#42"

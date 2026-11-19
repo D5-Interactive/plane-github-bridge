@@ -75,6 +75,13 @@ class PlaneClient:
             return f"Plane's API answered {r.status_code} for workspace '{self.ws}'"
         return None
 
+    def projects(self) -> list[dict]:
+        return self._paged("/projects/")
+
+    def module_item_ids(self, project_id: str, module_id: str) -> list[str]:
+        return [m.get("id") or m.get("issue")
+                for m in self._paged(f"/projects/{project_id}/modules/{module_id}/module-issues/")]
+
     def project(self, project_id: str) -> dict:
         hit = self._projects.get(project_id)
         if not hit or time.monotonic() - hit[0] > self.cache_seconds:

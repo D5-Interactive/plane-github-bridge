@@ -197,6 +197,38 @@ class Bridge:
                  ", ".join(changes), link)
         return f"module tidied for {meta.get('full_name', repo)}"
 
+    def sync_linked_modules(self) -> str:
+        """Catch-up pass: give every item in a linked module an issue if it has none.
+
+        Plane sends no webhook when an existing work item is added to a module, so
+        without this, items dragged into a linked module would never reach GitHub.
+        """
+        created, skipped_projects = [], 0
+        for project in self.plane.projects():
+            pid = project["id"]
+            try:
+                modules = self.plane.modules(pid)
+            except Exception:
+                skipped_projects += 1  # usually: the token's user isn't a member of this project
+                continue
+            ident = project.get("identifier", "")
+            pinned = {m.module.strip().lower(): m.repo for m in self.s.mappings_for(ident)}
+            for mod in modules:
+                repo = pinned.get((mod.get("name") or "").strip().lower()) or self._described_repo(mod)
+                if not repo:
+                    continue
+                for item_id in self.plane.module_item_ids(pid, mod["id"]):
+                    if not item_id or self.store.by_plane_item(item_id):
+                        continue
+                    with self._lock(item_id):
+                        if self.store.by_plane_item(item_id):
+                            continue
+                        result = self._maybe_create_issue(pid, item_id)
+                    if result.startswith("created"):
+                        created.append(result.removeprefix("created "))
+        note = f"; skipped {skipped_projects} project(s) the token can't read" if skipped_projects else ""
+        return (f"created {', '.join(created)}" if created else "nothing new") + note
+
     def _maybe_create_issue(self, project_id: str, item_id: str) -> str:
         item = self.plane.work_item(project_id, item_id)
         repo = self._repo_for(project_id, item)

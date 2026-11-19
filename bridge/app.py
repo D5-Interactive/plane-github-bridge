@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
@@ -28,6 +29,19 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
     settings = bridge.s
     state = {"plane_problem": None}
 
+    stop = threading.Event()
+
+    def sync_loop() -> None:
+        while True:
+            try:
+                result = bridge.sync_linked_modules()
+                if result != "nothing new":
+                    log.info("sync: %s", result)
+            except Exception:
+                log.exception("sync failed")
+            if stop.wait(settings.sync_interval):
+                return
+
     @asynccontextmanager
     async def lifespan(_app):
         state["plane_problem"] = bridge.plane.check_workspace()
@@ -35,7 +49,11 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
             log.error("PLANE SETUP PROBLEM: %s", state["plane_problem"])
         else:
             log.info("Plane workspace '%s' is reachable", settings.plane_workspace)
+        if settings.sync_interval > 0 and not state["plane_problem"]:
+            threading.Thread(target=sync_loop, name="module-sync", daemon=True).start()
+            log.info("catch-up sync of linked modules every %ss", settings.sync_interval)
         yield
+        stop.set()
 
     app = FastAPI(title="Plane-GitHub bridge", docs_url=None, redoc_url=None, openapi_url=None,
                   lifespan=lifespan)

@@ -27,6 +27,10 @@ class Settings:
     mappings: list[Mapping] = field(default_factory=list)
     # GitHub owners the bridge may create issues for. Empty = any the token can reach.
     allowed_owners: list[str] = field(default_factory=list)
+    # Seconds between catch-up syncs of linked modules (0 = off). Plane sends no
+    # webhook when an existing work item is added to a module, so this is how
+    # those items reach GitHub.
+    sync_interval: int = 120
 
     def owner_allowed(self, repo: str) -> bool:
         if not self.allowed_owners:
@@ -77,4 +81,5 @@ def load_settings(config_path: str | None = None) -> Settings:
         db_path=os.environ.get("BRIDGE_DB", "/data/bridge.db"),
         mappings=mappings,
         allowed_owners=[o.strip() for o in os.environ.get("GITHUB_ALLOWED_OWNERS", "").split(",") if o.strip()],
+        sync_interval=int(os.environ.get("BRIDGE_SYNC_INTERVAL", "120") or 0),
     )

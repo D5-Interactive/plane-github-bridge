@@ -427,8 +427,9 @@ Anyone who can edit a module in Plane can link it. No server access is needed.
    If the repo has no description on GitHub, only the link is kept. To change
    that second line, edit the repo's **About** on GitHub, then save the module
    again.
-4. That's it. New work items in that module get an issue in that repo. Existing
-   items get theirs the next time they're edited or moved into the module.
+4. That's it. Work items created in that module get an issue within seconds.
+   Existing items moved into the module get theirs within about two minutes
+   (see [Catch-up sync](#catch-up-sync)).
 
 > [!NOTE]
 > The tidy-up replaces everything else in the module's name and description, so
@@ -460,7 +461,7 @@ its description; issues that already exist stay linked.
 
 - Only work items in linked modules sync. Work items in unlinked modules or in
   no module stay in Plane. Moving an item into a linked module later creates its
-  issue.
+  issue at the next catch-up sync, within about two minutes.
 - Deleting a work item doesn't delete or close its issue.
 - A PR only moves a work item if it says it closes the linked issue or its
   branch is named after it.
@@ -494,6 +495,22 @@ Every request is checked against its HMAC-SHA256 signature first:
 `GITHUB_WEBHOOK_SECRET`. A bad or missing signature gets `401` and nothing else
 happens. A good one gets `202 Accepted` at once and is processed in the
 background, so Plane and GitHub never wait on the bridge.
+
+### Catch-up sync
+
+Plane sends **no webhook** when an existing work item is added to a module.
+Without help, an item created first and then dragged into a linked module would
+never reach GitHub. So every `BRIDGE_SYNC_INTERVAL` seconds (default 120, and
+once at startup) the bridge:
+
+1. lists the workspace's projects and their modules,
+2. picks the modules linked to a repo (description URL or `config.yaml`),
+3. creates an issue for every item in them that doesn't have one yet.
+
+Items that already have an issue are skipped, so it never creates duplicates.
+Projects the token's account can't read are skipped quietly. Each pass costs a
+few Plane API calls per project plus one per linked module. Set
+`BRIDGE_SYNC_INTERVAL=0` to turn it off.
 
 ### Deciding whether a work item goes to GitHub
 
@@ -655,6 +672,8 @@ A SQLite database at `/data/bridge.db`, in the `bridge-data` Docker volume:
 |---|---|
 | `plane: created owner/repo#12` | New issue made for a work item |
 | `plane: kept in Plane: ...` | The item isn't in a linked module; working as intended |
+| `sync: created owner/repo#12, ...` | The catch-up sync found items added to linked modules and made their issues |
+| `catch-up sync of linked modules every 120s` | Startup message; the sync is on |
 | `plane: updated owner/repo#12` | Title/description edit pushed to the issue |
 | `plane: module tidied for owner/repo` | Module renamed, description rewritten and/or repo link added |
 | `this Plane's API has no module links endpoint` | Your Plane can't take module links from the API; name and description still update |
