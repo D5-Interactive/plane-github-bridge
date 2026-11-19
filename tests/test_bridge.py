@@ -1,0 +1,233 @@
+import hashlib
+import hmac
+import json
+import re
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+from bridge.app import build_app
+from bridge.clients import GitHubClient, PlaneClient
+from bridge.config import Mapping, Settings
+from bridge.render import (closing_refs, normalize_plane_event, plane_html_to_markdown,
+                           verify_github_signature, verify_plane_signature)
+from bridge.store import Store
+from bridge.sync import Bridge
+
+PROJ, ITEM, MOD = "proj-1", "item-1", "mod-dbgc"
+STATES = [
+    {"id": "s-backlog", "name": "Backlog", "group": "backlog"},
+    {"id": "s-todo", "name": "Todo", "group": "unstarted"},
+    {"id": "s-prog", "name": "In Progress", "group": "started"},
+    {"id": "s-review", "name": "In Review", "group": "started"},
+    {"id": "s-done", "name": "Done", "group": "completed"},
+    {"id": "s-cancel", "name": "Cancelled", "group": "cancelled"},
+]
+DESC = ('<p>Add a scan command.</p><h3>Acceptance criteria</h3>'
+        '<ul data-type="taskList"><li data-checked="false" data-type="taskItem"><p>Scans all maps</p></li>'
+        '<li data-checked="true" data-type="taskItem"><p>Supports ?? wildcards</p></li></ul>')
+
+
+# ---------------------------------------------------------------- fakes
+
+class FakePlane:
+    def __init__(self):
+        self.item = {"id": ITEM, "name": "Scan command", "sequence_id": 7, "state": "s-todo",
+                     "description_html": DESC, "project": PROJ}
+        self.module_members = {ITEM}
+        self.links, self.patches = [], []
+
+    def handler(self, req: httpx.Request) -> httpx.Response:
+        assert req.headers["X-API-Key"] == "plane-key"
+        p = req.url.path.split("/workspaces/d5i", 1)[1]
+        if req.method == "GET" and p == f"/projects/{PROJ}/":
+            return httpx.Response(200, json={"id": PROJ, "identifier": "SECDEV"})
+        if req.method == "GET" and p == f"/projects/{PROJ}/issues/{ITEM}/":
+            return httpx.Response(200, json=self.item)
+        if req.method == "GET" and p == f"/projects/{PROJ}/states/":
+            return httpx.Response(200, json={"results": STATES, "next_page_results": False})
+        if req.method == "GET" and p == f"/projects/{PROJ}/modules/":
+            return httpx.Response(200, json={"results": [{"id": MOD, "name": "DBGC"}]})
+        if req.method == "GET" and p == f"/projects/{PROJ}/modules/{MOD}/module-issues/":
+            return httpx.Response(200, json={"results": [{"id": i} for i in self.module_members]})
+        if req.method == "PATCH" and p == f"/projects/{PROJ}/issues/{ITEM}/":
+            body = json.loads(req.content)
+            self.patches.append(body)
+            self.item["state"] = body["state"]
+            return httpx.Response(200, json=self.item)
+        if req.method == "POST" and p == f"/projects/{PROJ}/issues/{ITEM}/links/":
+            self.links.append(json.loads(req.content))
+            return httpx.Response(201, json={})
+        return httpx.Response(404, json={"path": p})
+
+
+class FakeGitHub:
+    def __init__(self):
+        self.created, self.updated = [], []
+
+    def handler(self, req: httpx.Request) -> httpx.Response:
+        assert req.headers["Authorization"] == "Bearer gh-token"
+        m = re.fullmatch(r"/repos/([^/]+/[^/]+)/issues(?:/(\d+))?", req.url.path)
+        assert m, req.url.path
+        body = json.loads(req.content)
+        if req.method == "POST":
+            n = 40 + len(self.created) + 2
+            self.created.append((m.group(1), body))
+            return httpx.Response(201, json={"number": n, "html_url": f"https://github.com/{m.group(1)}/issues/{n}"})
+        self.updated.append((m.group(1), int(m.group(2)), body))
+        return httpx.Response(200, json={})
+
+
+@pytest.fixture
+def env(tmp_path):
+    s = Settings(plane_base_url="http://plane.local", plane_public_url="https://plane.d5i.dev",
+                 plane_workspace="d5i", plane_api_key="plane-key", plane_webhook_secret="plane_wh_secret",
+                 github_token="gh-token", github_webhook_secret="gh-secret",
+                 mappings=[Mapping(project="SECDEV", module="DBGC", repo="D5-Interactive/DBGC")])
+    fp, fg = FakePlane(), FakeGitHub()
+    bridge = Bridge(s, Store(str(tmp_path / "b.db")),
+                    PlaneClient(s.plane_base_url, "d5i", "plane-key", transport=httpx.MockTransport(fp.handler)),
+                    GitHubClient("gh-token", transport=httpx.MockTransport(fg.handler)))
+    return bridge, fp, fg
+
+
+def plane_event(event="workitem.created", eid="e1", prev=None):
+    return {"version": "v2", "event": event, "event_id": eid, "entity_type": "issue",
+            "entity_id": ITEM, "data": {"id": ITEM, "project_id": PROJ, "name": "Scan command"},
+            "previous_attributes": prev or {}}
+
+
+# ---------------------------------------------------------------- pure helpers
+
+def test_signatures():
+    body = b'{"a":1}'
+    sig = hmac.new(b"k", body, hashlib.sha256).hexdigest()
+    assert verify_plane_signature("k", body, sig)
+    assert not verify_plane_signature("k", body + b" ", sig)
+    assert not verify_plane_signature("k", body, None)
+    assert verify_github_signature("k", body, "sha256=" + sig)
+    assert not verify_github_signature("k", body, sig)
+
+
+@pytest.mark.parametrize("payload,expected", [
+    ({"event": "workitem.created"}, ("workitem", "created")),
+    ({"event": "workitem.updated"}, ("workitem", "updated")),
+    ({"event": "issue", "action": "create"}, ("workitem", "created")),
+    ({"event": "issue", "action": "updated"}, ("workitem", "updated")),
+    ({"event": "WebhookScope.ScopeChoices.WORK_ITEM_UPDATED"}, ("workitem", "updated")),
+    ({"event": "workitem.comment.created"}, (None, None)),
+    ({"event": "cycle.created"}, (None, None)),
+])
+def test_normalize(payload, expected):
+    assert normalize_plane_event(payload) == expected
+
+
+def test_markdown_keeps_checklists():
+    md = plane_html_to_markdown(DESC)
+    assert "Add a scan command." in md
+    assert "### Acceptance criteria" in md
+    assert "- [ ] Scans all maps" in md
+    assert "- [x] Supports ?? wildcards" in md
+
+
+def test_closing_refs():
+    text = "Closes #12, fixes D5-Interactive/Other#3 and resolves: #12. Mentions #99."
+    assert closing_refs(text, "D5-Interactive/DBGC") == [
+        ("D5-Interactive/DBGC", 12), ("D5-Interactive/Other", 3)]
+
+
+# ---------------------------------------------------------------- flows
+
+def test_created_item_in_module_makes_issue_once(env):
+    bridge, fp, fg = env
+    assert bridge.handle_plane(plane_event()).startswith("created D5-Interactive/DBGC#42")
+    repo, body = fg.created[0]
+    assert repo == "D5-Interactive/DBGC" and body["title"] == "Scan command"
+    assert "- [ ] Scans all maps" in body["body"]
+    assert "https://plane.d5i.dev/d5i/browse/SECDEV-7/" in body["body"]
+    assert fp.links[0]["url"] == "https://github.com/D5-Interactive/DBGC/issues/42"
+    # an update afterwards (e.g. our own link being added) must not create a second issue
+    bridge.handle_plane(plane_event("workitem.updated", "e2", {"state": "x"}))
+    assert len(fg.created) == 1
+    # duplicate delivery of the same event id is ignored
+    assert bridge.handle_plane(plane_event()) == "ignored: duplicate delivery"
+
+
+def test_item_added_to_module_later(env):
+    bridge, fp, fg = env
+    fp.module_members = set()
+    assert "not in a mapped module" in bridge.handle_plane(plane_event())
+    fp.module_members = {ITEM}
+    assert bridge.handle_plane(plane_event("workitem.updated", "e2")).startswith("created")
+
+
+def test_unmapped_project_ignored(env):
+    bridge, fp, fg = env
+    bridge.s.mappings = [Mapping(project="WEBDEV", repo="D5-Interactive/d5i.store")]
+    assert "no mapping" in bridge.handle_plane(plane_event())
+    assert not fg.created
+
+
+def test_title_and_description_edits_pushed(env):
+    bridge, fp, fg = env
+    bridge.handle_plane(plane_event())
+    fp.item["name"] = "Scan command v2"
+    out = bridge.handle_plane(plane_event("workitem.updated", "e3", {"name": "Scan command"}))
+    assert out == "updated D5-Interactive/DBGC#42"
+    assert fg.updated[-1][2]["title"] == "Scan command v2"
+
+
+def gh_pr(action, number=5, body="Closes #42", draft=False, merged=False, state="open"):
+    return {"action": action, "repository": {"full_name": "D5-Interactive/DBGC"},
+            "pull_request": {"number": number, "title": "Add scan", "body": body, "draft": draft,
+                             "merged": merged, "state": state,
+                             "html_url": f"https://github.com/D5-Interactive/DBGC/pull/{number}"}}
+
+
+def test_pr_and_issue_lifecycle(env):
+    bridge, fp, fg = env
+    bridge.handle_plane(plane_event())
+
+    assert bridge.handle_github("pull_request", gh_pr("opened", draft=True)) == "moved to progress"
+    assert fp.item["state"] == "s-prog"
+    assert bridge.handle_github("pull_request", gh_pr("ready_for_review")) == "moved to review"
+    assert fp.item["state"] == "s-review"
+    pr_links = [l for l in fp.links if "/pull/" in l["url"]]
+    assert len(pr_links) == 1  # PR link added once, not on every event
+
+    assert bridge.handle_github("pull_request", gh_pr("closed", merged=True, state="closed")) == "moved to done"
+    issue_closed = {"action": "closed", "repository": {"full_name": "D5-Interactive/DBGC"},
+                    "issue": {"number": 42, "state_reason": "completed"}}
+    assert bridge.handle_github("issues", issue_closed) == "unchanged: already done"
+
+    reopened = {**issue_closed, "action": "reopened"}
+    assert bridge.handle_github("issues", reopened) == "moved to todo"
+    not_planned = {**issue_closed, "issue": {"number": 42, "state_reason": "not_planned"}}
+    assert bridge.handle_github("issues", not_planned) == "moved to cancelled"
+
+
+def test_pr_for_unlinked_issue_ignored(env):
+    bridge, fp, fg = env
+    assert "does not close a linked issue" in bridge.handle_github("pull_request", gh_pr("opened", body="Closes #1"))
+
+
+# ---------------------------------------------------------------- HTTP layer
+
+def test_http_rejects_bad_signatures_and_accepts_good(env):
+    bridge, fp, fg = env
+    client = TestClient(build_app(bridge))
+    body = json.dumps(plane_event()).encode()
+    assert client.post("/plane/webhook", content=body, headers={"X-Plane-Signature": "nope"}).status_code == 401
+    sig = hmac.new(b"plane_wh_secret", body, hashlib.sha256).hexdigest()
+    r = client.post("/plane/webhook", content=body, headers={"X-Plane-Signature": sig})
+    assert r.status_code == 202 and len(fg.created) == 1  # background task ran
+
+    gbody = json.dumps(gh_pr("opened")).encode()
+    gsig = "sha256=" + hmac.new(b"gh-secret", gbody, hashlib.sha256).hexdigest()
+    assert client.post("/github/webhook", content=gbody,
+                       headers={"X-Hub-Signature-256": "sha256=bad", "X-GitHub-Event": "pull_request"}).status_code == 401
+    r = client.post("/github/webhook", content=gbody,
+                    headers={"X-Hub-Signature-256": gsig, "X-GitHub-Event": "pull_request"})
+    assert r.status_code == 202 and fp.item["state"] == "s-review"
+    assert client.get("/health").json()["ok"] is True

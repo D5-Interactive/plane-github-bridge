@@ -1,0 +1,27 @@
+[project]
+name = "plane-github-bridge"
+version = "0.1.0"
+description = "Two-way bridge between self-hosted Plane Community Edition and GitHub"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.115",
+    "httpx>=0.28",
+    "markdownify>=0.14",
+    "pyyaml>=6.0",
+    "uvicorn[standard]>=0.32",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+]
+
+[tool.uv]
+# An app, not a library: uv installs the dependencies but doesn't build a wheel.
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
