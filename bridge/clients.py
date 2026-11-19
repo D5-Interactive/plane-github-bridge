@@ -15,8 +15,8 @@ MAX_WAIT = 60.0
 DEFAULT_WAIT = 10.0
 
 
-def retry_after(r: httpx.Response, now: float | None = None) -> float:
-    """Seconds to wait before retrying a rate-limited request, capped at MAX_WAIT.
+def server_wait(r: httpx.Response, now: float | None = None) -> float:
+    """Seconds the server asks us to wait before retrying, uncapped (never negative).
 
     Reads Retry-After (seconds or an HTTP date), then X-RateLimit-Reset (an epoch
     time, or a number of seconds if it's small), else DEFAULT_WAIT.
@@ -41,7 +41,12 @@ def retry_after(r: httpx.Response, now: float | None = None) -> float:
             wait = None
     if wait is None:
         wait = DEFAULT_WAIT
-    return max(0.0, min(MAX_WAIT, wait))
+    return max(0.0, wait)
+
+
+def retry_after(r: httpx.Response, now: float | None = None) -> float:
+    """server_wait, capped at MAX_WAIT."""
+    return min(MAX_WAIT, server_wait(r, now))
 
 
 class Pacer:
@@ -56,14 +61,21 @@ class Pacer:
         self.clock, self.sleep = clock, sleep
         self._lock = threading.Lock()
         self._next = 0.0
+        self._hold_until = 0.0      # after a 429: nobody sends before this
 
-    def wait(self) -> float:
-        if not self.interval:
-            return 0.0
+    def hold(self, seconds: float) -> None:
+        """After a 429, make every caller wait until the server's window has passed,
+        not just the thread that got it."""
+        with self._lock:
+            self._hold_until = max(self._hold_until, self.clock() + seconds)
+
+    def wait(self, honor_hold: bool = True) -> float:
         with self._lock:
             now = self.clock()
-            start = max(now, self._next)
-            self._next = start + self.interval
+            start = max(now, self._hold_until) if honor_hold else now
+            if self.interval:
+                start = max(start, self._next)
+                self._next = start + self.interval
         delay = start - now
         if delay > 0:
             self.sleep(delay)
@@ -71,11 +83,17 @@ class Pacer:
 
 
 def _check(r: httpx.Response) -> None:
-    """raise_for_status, but put the server's own error message in the exception and the log."""
+    """raise_for_status, logging only the status, method and path.
+
+    Error bodies can echo work item content, so they're logged at DEBUG only and
+    kept out of the exception message (which tracebacks print).
+    """
     if r.is_error:
-        detail = r.text.strip().replace("\n", " ")[:500]
-        log.error("%s %s -> %s: %s", r.request.method, r.request.url, r.status_code, detail or "(no body)")
-        raise httpx.HTTPStatusError(f"{r.status_code} from {r.request.method} {r.request.url.path}: {detail}",
+        log.error("%s %s -> %s", r.request.method, r.request.url.path, r.status_code)
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("error body for %s %s: %s", r.request.method, r.request.url.path,
+                      r.text.strip().replace("\n", " ")[:500] or "(no body)")
+        raise httpx.HTTPStatusError(f"{r.status_code} from {r.request.method} {r.request.url.path}",
                                     request=r.request, response=r)
 
 
@@ -118,15 +136,24 @@ class PlaneClient:
         and the caller (for example the catch-up sync) can stop for now. Retrying a
         write is safe: Plane rejected it without doing anything.
         """
+        honor_hold = True
         for attempt in range(self.max_retries + 1):
-            self.pacer.wait()
+            self.pacer.wait(honor_hold=honor_hold)
             r = self.http.request(method, path, **kwargs)
             if r.status_code != 429 or attempt == self.max_retries:
                 return r
-            wait = retry_after(r)
+            wait = server_wait(r)
+            if wait > MAX_WAIT:
+                # Longer than we'd ever sleep: give up now rather than sleep and fail anyway.
+                log.warning("Plane rate limit: %s %s answered 429 and asks for %.0fs; not waiting",
+                            method, r.request.url.path, wait)
+                self.pacer.hold(MAX_WAIT)
+                return r
             log.warning("Plane rate limit: %s %s answered 429; waiting %.0fs (retry %d of %d)",
                         method, r.request.url.path, wait, attempt + 1, self.max_retries)
+            self.pacer.hold(wait)        # other threads wait out the same window
             self.sleep(wait)
+            honor_hold = False           # this thread already waited it out
         return r  # not reached
 
     def _get(self, path: str, **params):
@@ -275,7 +302,11 @@ class GitHubClient:
         """Send a request; on a rate limit, wait as GitHub says (capped) and retry once."""
         r = self.http.request(method, path, **kwargs)
         if _github_rate_limited(r):
-            wait = retry_after(r)
+            wait = server_wait(r)
+            if wait > MAX_WAIT:     # e.g. the hourly primary limit: don't sleep, fail now
+                log.warning("GitHub rate limit: %s %s answered %s and asks for %.0fs; not waiting",
+                            method, r.request.url.path, r.status_code, wait)
+                return r
             log.warning("GitHub rate limit: %s %s answered %s; waiting %.0fs and retrying once",
                         method, r.request.url.path, r.status_code, wait)
             self.sleep(wait)

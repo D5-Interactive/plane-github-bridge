@@ -13,6 +13,7 @@ from bridge.store import Link, Store
 from bridge.sync import PERMANENT_RETRY_SECONDS, Bridge
 
 PROJ = "proj-1"
+RATE_LIMITED_BODY = {"error_code": 5900, "error_message": "RATE_LIMIT_EXCEEDED"}
 
 
 class Plane:
@@ -24,6 +25,9 @@ class Plane:
         self.calls: Counter = Counter()
         self.links: list[tuple[str, str]] = []
         self.fail_link_for: set[str] = set()     # add_link answers 500 for these items
+        self.gone: set[str] = set()              # add_link answers 404 (item deleted)
+        self.already_linked: set[str] = set()    # add_link answers Plane's duplicate-URL 400
+        self.module_patch_status: int | None = None
         self.rate_limited_after: int | None = None  # answer 429 once this many calls were made
         self.total = 0
 
@@ -49,6 +53,8 @@ class Plane:
         if m:
             return httpx.Response(404, json={})
         if req.method == "PATCH" and re.fullmatch(rf"/projects/{PROJ}/modules/[^/]+/", p):
+            if self.module_patch_status:
+                return httpx.Response(self.module_patch_status, json=RATE_LIMITED_BODY)
             return httpx.Response(200, json={})
         m = re.fullmatch(rf"/projects/{PROJ}/issues/([^/]+)/", p)
         if m and req.method == "GET":
@@ -59,6 +65,10 @@ class Plane:
         if m and req.method == "POST":
             if m.group(1) in self.fail_link_for:
                 return httpx.Response(500, json={"error": "boom"})
+            if m.group(1) in self.gone:
+                return httpx.Response(404, json={"error": "Issue does not exist"})
+            if m.group(1) in self.already_linked:
+                return httpx.Response(400, json={"error": "URL already exists for this Issue"})
             self.links.append((m.group(1), json.loads(req.content)["url"]))
             return httpx.Response(201, json={})
         return httpx.Response(404, json={"path": p})
@@ -68,6 +78,8 @@ class GitHub:
     def __init__(self):
         self.created: list[tuple[str, str]] = []
         self.refuse: dict[str, int] = {}     # repo -> status for issue creation
+        self.refuse_headers: dict[str, str] = {}
+        self.refuse_message = "Issues are disabled for this repo"
 
     def handler(self, req: httpx.Request) -> httpx.Response:
         m = re.fullmatch(r"/repos/([^/]+/[^/]+)", req.url.path)
@@ -80,7 +92,8 @@ class GitHub:
         if m and req.method == "POST":
             repo = m.group(1)
             if repo in self.refuse:
-                return httpx.Response(self.refuse[repo], json={"message": "Issues are disabled for this repo"})
+                return httpx.Response(self.refuse[repo], headers=self.refuse_headers,
+                                      json={"message": self.refuse_message})
             title = json.loads(req.content)["title"]
             self.created.append((repo, title))
             n = len([r for r, _ in self.created if r == repo])
@@ -96,7 +109,7 @@ def make(tmp_path, modules, db="b.db"):
     bridge = Bridge(s, Store(str(tmp_path / db)),
                     PlaneClient(s.plane_base_url, "acme", "k", transport=httpx.MockTransport(plane.handler),
                                 sleep=lambda _s: None),
-                    GitHubClient("t", transport=httpx.MockTransport(gh.handler)))
+                    GitHubClient("t", transport=httpx.MockTransport(gh.handler), sleep=lambda _s: None))
     bridge.plane.cache_seconds = 0          # every pass re-reads, like the 120 s interval does
     return bridge, plane, gh
 

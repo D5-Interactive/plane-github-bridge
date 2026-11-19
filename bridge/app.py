@@ -13,7 +13,7 @@ from .clients import GitHubClient, PlaneClient
 from .config import load_settings
 from .render import verify_github_signature, verify_plane_signature
 from .store import Store
-from .sync import Bridge
+from .sync import LINK_REPAIRS_PER_PASS, Bridge
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -43,6 +43,17 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
             if stop.wait(settings.sync_interval):
                 return
 
+    def prepare_store() -> None:
+        """Startup housekeeping for the catch-up sync."""
+        cleared = bridge.store.clear_failures()
+        if cleared:
+            # A restart often follows a fix (token, repo access), so give parked items a fresh try.
+            log.info("sync: cleared %d parked item(s); they'll be tried again", cleared)
+        if settings.recheck_links:
+            n = bridge.store.recheck_all_links()
+            log.warning("BRIDGE_RECHECK_LINKS is set: re-checking %d issue link(s) in Plane, %d per pass. "
+                        "Remove the setting once the log shows no more repairs", n, LINK_REPAIRS_PER_PASS)
+
     @asynccontextmanager
     async def lifespan(_app):
         state["plane_problem"] = bridge.plane.check_workspace()
@@ -50,6 +61,7 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
             log.error("PLANE SETUP PROBLEM: %s", state["plane_problem"])
         else:
             log.info("Plane workspace '%s' is reachable", settings.plane_workspace)
+        prepare_store()
         if settings.sync_interval > 0 and not state["plane_problem"]:
             threading.Thread(target=sync_loop, name="module-sync", daemon=True).start()
             log.info("catch-up sync of linked modules every %ss", settings.sync_interval)

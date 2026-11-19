@@ -34,7 +34,7 @@ from collections import defaultdict
 
 import httpx
 
-from .clients import GitHubClient, PlaneClient
+from .clients import GitHubClient, PlaneClient, _github_rate_limited
 from .config import Settings
 from .render import (branch_issue_number, closing_refs, esc, github_repo_in, issue_body,
                      mention_refs, normalize_plane_event, plain_text, plane_html_to_markdown,
@@ -61,22 +61,42 @@ LINK_REPAIRS_PER_PASS = 10
 
 
 class _StopPass(Exception):
-    """A rate limit was hit: end this catch-up pass and let the next one resume."""
+    """End this catch-up pass and let the next one resume.
+
+    kind is "rate" (a rate limit) or "auth" (a key or token was rejected)."""
+
+    def __init__(self, reason: str, kind: str = "rate"):
+        super().__init__(reason)
+        self.kind = kind
 
 
 def _failure_kind(e: Exception) -> str:
-    """"rate" (stop the pass), "permanent" (don't retry soon) or "transient" (retry next pass)."""
+    """How the catch-up sync treats an error:
+
+    "rate"      a rate limit: stop the pass, the next one resumes
+    "auth"      a key or token was rejected (401): stop the pass, log once
+    "permanent" GitHub refused this item for a lasting reason: park it
+    "transient" anything else: retry next pass
+    """
     if isinstance(e, httpx.HTTPStatusError):
         status, host = e.response.status_code, e.request.url.host
         if status == 429:
             return "rate"
+        if status == 401:
+            return "auth"
         if host.endswith("github.com"):
-            text = e.response.text.lower()
-            if status == 403 and "rate limit" in text:
+            if _github_rate_limited(e.response):
                 return "rate"
             if status in (403, 404, 410, 422):
                 return "permanent"
     return "transient"
+
+
+def _stop_if_pass_ending(e: Exception) -> None:
+    """Raise _StopPass for errors that should end the whole pass (rate limit, rejected key)."""
+    kind = _failure_kind(e)
+    if kind in ("rate", "auth"):
+        raise _StopPass(_short_reason(e), kind) from None
 
 
 def _short_reason(e: Exception) -> str:
@@ -167,8 +187,10 @@ class Bridge:
             if repo and self.plane.item_in_module(project_id, mod["id"], item):
                 try:
                     self.tidy_module_description(project_id, mod)
-                except Exception:
-                    log.exception("couldn't tidy the description of module %s", mod.get("id"))
+                except Exception as e:
+                    if _failure_kind(e) in ("rate", "auth"):
+                        raise
+                    log.warning("couldn't tidy module %s (%s)", mod.get("id"), _short_reason(e))
                 return repo
         # Unlinked module, or no module at all: keep it off GitHub.
         return None
@@ -205,8 +227,10 @@ class Bridge:
         try:
             link = self.plane.ensure_module_link(project_id, module["id"], url,
                                                  f"GitHub: {meta.get('full_name', repo)}")
-        except Exception:
-            log.exception("couldn't add the repo link to module %s", module.get("id"))
+        except Exception as e:
+            if _failure_kind(e) in ("rate", "auth"):
+                raise       # don't pile more requests onto a rate limit
+            log.warning("couldn't add the repo link to module %s (%s)", module.get("id"), _short_reason(e))
             link = "failed"
 
         if not changes:
@@ -216,7 +240,9 @@ class Bridge:
         # description on its own and then try each of those separately.
         try:
             self.plane.update_module(project_id, module["id"], **changes)
-        except Exception:
+        except Exception as e:
+            if _failure_kind(e) in ("rate", "auth"):
+                raise       # the fallbacks below would only hit the same limit
             optional = {f: changes.pop(f) for f in ("name", "start_date") if f in changes}
             if not optional:
                 raise
@@ -226,7 +252,9 @@ class Bridge:
                 try:
                     self.plane.update_module(project_id, module["id"], **{field: value})
                     changes[field] = value
-                except Exception:
+                except Exception as e:
+                    if _failure_kind(e) in ("rate", "auth"):
+                        raise
                     log.warning("Plane refused module %r's %s=%r; left as is",
                                 module.get("name"), field, value)
             if not changes:
@@ -249,26 +277,36 @@ class Bridge:
         created: list[str] = []
         failed = repaired = skipped_projects = 0
         stopped = ""
+        logged_repos: set[str] = set()      # parked repos already logged in this pass
         try:
             repaired = self._repair_plane_links()
-            for project in self.plane.projects():
+            try:
+                projects = self.plane.projects()
+            except Exception as e:
+                _stop_if_pass_ending(e)
+                log.warning("sync: couldn't list Plane projects (%s)", _short_reason(e))
+                projects = []
+            for project in projects:
                 pid, ident = project["id"], project.get("identifier", "")
                 try:
                     modules = self.plane.modules(pid)
                 except Exception as e:
-                    if _failure_kind(e) == "rate":
-                        raise _StopPass(_short_reason(e)) from None
+                    _stop_if_pass_ending(e)
                     skipped_projects += 1  # usually: the token's user isn't a member of this project
                     continue
                 linked = self._linked_modules(ident, modules)
                 if not linked:
                     continue                # nothing linked here: no item listings at all
-                c, f = self._sync_project(pid, ident, linked)
+                c, f = self._sync_project(pid, ident, linked, logged_repos)
                 created += c
                 failed += f
         except _StopPass as e:
-            stopped = str(e)
-            log.warning("sync: stopped early, will resume next pass (%s)", stopped)
+            stopped = e.kind
+            if e.kind == "auth":
+                log.error("sync: stopped, a key or token was rejected (%s); check GITHUB_TOKEN "
+                          "and PLANE_API_KEY. Will try again next pass", e)
+            else:
+                log.warning("sync: stopped early, will resume next pass (%s)", e)
 
         parts = []
         if created:
@@ -277,8 +315,10 @@ class Bridge:
             parts.append(f"repaired {repaired} Plane link(s)")
         if failed:
             parts.append(f"{failed} item(s) failed")
-        if stopped:
+        if stopped == "rate":
             parts.append("stopped early: rate limited")
+        elif stopped == "auth":
+            parts.append("stopped: credentials rejected")
         if not parts:
             return "nothing new"    # quiet: the caller logs only when something happened
         if skipped_projects:
@@ -302,15 +342,16 @@ class Bridge:
         # A repo outside GITHUB_ALLOWED_OWNERS never gets issues: don't list its items.
         return [t for t in out if self.s.owner_allowed(t[1])]
 
-    def _sync_project(self, pid: str, ident: str, linked: list[tuple[dict, str, bool]]) -> tuple[list[str], int]:
+    def _sync_project(self, pid: str, ident: str, linked: list[tuple[dict, str, bool]],
+                      logged_repos: set[str] | None = None) -> tuple[list[str], int]:
+        logged_repos = set() if logged_repos is None else logged_repos
         # item id -> (module, repo, pinned): the first linked module listing it wins.
         targets: dict[str, tuple[dict, str, bool]] = {}
         for mod, repo, pinned in linked:
             try:
                 ids = self.plane.module_item_ids(pid, mod["id"])
             except Exception as e:
-                if _failure_kind(e) == "rate":
-                    raise _StopPass(_short_reason(e)) from None
+                _stop_if_pass_ending(e)
                 log.warning("sync: couldn't list module %s in %s (%s)", mod.get("id"), ident, _short_reason(e))
                 continue
             for item_id in ids:
@@ -323,15 +364,14 @@ class Bridge:
             if self.store.by_plane_item(item_id):
                 continue
             past = self.store.failure(item_id)
-            if past and now - past[1] < PERMANENT_RETRY_SECONDS:
-                continue
+            if past and past[0].lower() == repo.lower() and now - past[2] < PERMANENT_RETRY_SECONDS:
+                continue        # parked for this repo; a different repo means the module was relinked
             if not pinned and mod["id"] not in tidied:
                 tidied.add(mod["id"])
                 try:
                     self.tidy_module_description(pid, mod)
                 except Exception as e:
-                    if _failure_kind(e) == "rate":
-                        raise _StopPass(_short_reason(e)) from None
+                    _stop_if_pass_ending(e)
                     log.warning("sync: couldn't tidy module %s (%s)", mod.get("id"), _short_reason(e))
             try:
                 with self._lock(item_id):
@@ -339,15 +379,17 @@ class Bridge:
                         continue
                     result = self._maybe_create_issue(pid, item_id, repo=repo)
             except Exception as e:
+                _stop_if_pass_ending(e)
                 kind = _failure_kind(e)
-                if kind == "rate":
-                    raise _StopPass(_short_reason(e)) from None
                 failed += 1
                 reason = _short_reason(e)
                 if kind == "permanent":
-                    self.store.record_failure(item_id, reason, now)
-                    log.warning("sync: %s item %s not sent to %s (%s); retrying in %dh or when edited",
-                                ident, item_id, repo, reason, PERMANENT_RETRY_SECONDS // 3600)
+                    self.store.record_failure(item_id, repo, reason, now)
+                    if repo.lower() not in logged_repos:     # one line per repo per pass
+                        logged_repos.add(repo.lower())
+                        log.warning("sync: %s refused items from %s (%s); parked for %dh, or until "
+                                    "the item is edited or the bridge restarts",
+                                    repo, ident, reason, PERMANENT_RETRY_SECONDS // 3600)
                 else:
                     log.warning("sync: %s item %s failed, retrying next pass (%s)", ident, item_id, reason)
                 continue
@@ -359,14 +401,22 @@ class Bridge:
         """Add issue links that never reached Plane (the pass died between the two calls)."""
         repaired = 0
         for link in self.store.missing_plane_links(LINK_REPAIRS_PER_PASS):
+            self.store.link_attempted(link.plane_item_id, self.clock())
             try:
                 self.plane.add_link(link.plane_project_id, link.plane_item_id, link.issue_url,
                                     f"GitHub {link.repo}#{link.issue_number}")
             except Exception as e:
-                if _failure_kind(e) == "rate":
-                    raise _StopPass(_short_reason(e)) from None
-                log.warning("sync: couldn't add the link for %s#%s yet (%s)",
-                            link.repo, link.issue_number, _short_reason(e))
+                _stop_if_pass_ending(e)
+                status = e.response.status_code if isinstance(e, httpx.HTTPStatusError) else None
+                if status == 404:
+                    # The work item is gone (deleted, or its project is no longer readable):
+                    # stop trying instead of spending a call on it every pass.
+                    self.store.mark_plane_linked(link.plane_item_id)
+                    log.warning("sync: work item %s is gone from Plane; not adding the link for %s#%s",
+                                link.plane_item_id, link.repo, link.issue_number)
+                else:
+                    log.warning("sync: couldn't add the link for %s#%s yet (%s)",
+                                link.repo, link.issue_number, _short_reason(e))
                 continue
             self.store.mark_plane_linked(link.plane_item_id)
             repaired += 1
