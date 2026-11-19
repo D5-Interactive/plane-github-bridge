@@ -221,9 +221,37 @@ Until then the bridge starts but turns away Plane webhooks.
 
 ```bash
 docker compose up -d --build
-curl http://127.0.0.1:8095/health
-# {"ok":true,"mappings":1,"plane_webhook_ready":false}   (true after step 6)
 ```
+
+The first build takes a minute or two. Give the bridge a few seconds to boot,
+then check it:
+
+```bash
+sleep 5
+curl http://127.0.0.1:8095/health
+```
+
+You should see:
+
+```json
+{"ok":true,"mappings":1,"plane_webhook_ready":false}
+```
+
+`mappings` is the number of mappings in `config.yaml`. `plane_webhook_ready`
+stays `false` until step 6. The log also warns that `PLANE_WEBHOOK_SECRET` is not
+set; that's expected for now.
+
+If `curl` can't connect, check that the container is up and read its log:
+
+```bash
+docker compose ps                    # STATUS should be "Up", not "Restarting"
+docker compose logs --tail 30 bridge
+```
+
+| Log says | Fix |
+|---|---|
+| `Missing required environment variable ...` | That line in `.env` is empty or misspelled |
+| `IsADirectoryError` or a YAML error | `config.yaml` is missing, so Docker created a folder in its place. Run `docker compose down && rmdir config.yaml && cp config.example.yaml config.yaml`, fill it in, then start again |
 
 ### 5. Give it a public address
 
@@ -237,6 +265,7 @@ Plane and GitHub need to reach the bridge over HTTPS. Point a hostname such as
 |---|---|
 | Subdomain | `hooks` |
 | Domain | `example.com` |
+| Path | leave empty |
 | Service URL | `http://localhost:8095` |
 
 **With a reverse proxy** such as Caddy:
@@ -247,6 +276,14 @@ hooks.example.com {
 }
 ```
 
+Check it from a **different machine**, such as your laptop:
+
+```bash
+curl https://hooks.example.com/health
+```
+
+You should get the same `{"ok":true,...}` as in step 4.
+
 > [!TIP]
 > The bridge only listens on `127.0.0.1`, so your tunnel or proxy is the only
 > way in. Only `/plane/webhook`, `/github/webhook` and `/health` exist, and both
@@ -254,39 +291,82 @@ hooks.example.com {
 
 ### 6. Plane webhook
 
-Plane → **Workspace settings → Webhooks → Add webhook**:
+1. In Plane, open **Workspace settings → Webhooks → Add webhook**.
+2. Fill in:
 
-| Field | Value |
-|---|---|
-| URL | `https://hooks.example.com/plane/webhook` |
-| Events | Work items (issues) only |
+   | Field | Value |
+   |---|---|
+   | URL | `https://hooks.example.com/plane/webhook` |
+   | Events | **Work items** (called Issues in some versions) only. Projects, cycles, modules and comments aren't needed |
 
-Plane shows a secret that starts with `plane_wh_`. Put it in `.env`:
+3. Save. Plane shows a secret that starts with `plane_wh_`. Copy it; Plane may
+   not show it again.
+4. On the server, open `.env` and paste it in:
 
-```bash
-PLANE_WEBHOOK_SECRET=plane_wh_0123456789abcdef
-```
+   ```bash
+   nano .env
+   ```
 
-Then restart the bridge so it reads the new value:
+   ```bash
+   PLANE_WEBHOOK_SECRET=plane_wh_0123456789abcdef
+   ```
 
-```bash
-docker compose up -d --force-recreate
-```
+5. Recreate the container so it reads the new value. A plain `restart` does not
+   reload `.env`:
+
+   ```bash
+   docker compose up -d --force-recreate
+   sleep 5 && curl http://127.0.0.1:8095/health
+   ```
+
+   `plane_webhook_ready` should now be `true`.
 
 ### 7. GitHub webhook
 
-GitHub → **your-org → Settings → Webhooks → Add webhook**. One org webhook covers
-every repo, including ones you add later. Without org owner access, add the same
-webhook to each mapped repo under **Repo settings → Webhooks** instead.
+One webhook on the organization covers every repo, including ones you add
+later. If you aren't an org owner, add the same webhook to each mapped repo
+under **Repo → Settings → Webhooks** instead.
 
-| Field | Value |
+1. On the server, print the webhook secret you made in step 3:
+
+   ```bash
+   grep '^GITHUB_WEBHOOK_SECRET=' .env
+   ```
+
+   GitHub doesn't generate this one; you give it the same value the bridge has.
+
+2. On GitHub, open **your-org → Settings → Webhooks → Add webhook** and fill in:
+
+   | Field | Value |
+   |---|---|
+   | Payload URL | `https://hooks.example.com/github/webhook` |
+   | Content type | `application/json` (the default is form-encoded; change it) |
+   | Secret | everything after `GITHUB_WEBHOOK_SECRET=` from step 1 |
+   | SSL verification | Enable SSL verification (the default) |
+
+3. Under **Which events would you like to trigger this webhook?**, choose **Let
+   me select individual events**. A long checklist opens. **Push** is ticked by
+   default; leave it ticked, and make sure exactly these five are on:
+
+   - ✓ Branch or tag creation
+   - ✓ Issues
+   - ✓ Pull requests
+   - ✓ Pull request reviews
+   - ✓ Pushes
+
+   Leave every other box unticked. "Send me everything" also works, since the
+   bridge ignores events it doesn't use, but it sends your server a lot of
+   pointless traffic.
+
+4. Keep **Active** ticked and click **Add webhook**.
+5. Open the webhook again and select the **Recent Deliveries** tab. GitHub sends
+   a ping as soon as the webhook is created; it should show a green ✓.
+
+| Ping shows | Meaning |
 |---|---|
-| Payload URL | `https://hooks.example.com/github/webhook` |
-| Content type | `application/json` |
-| Secret | the `GITHUB_WEBHOOK_SECRET` value from `.env` |
-| Events | **Let me select** → ✓ Issues, ✓ Pull requests, ✓ Pull request reviews, ✓ Pushes, ✓ Branch or tag creation |
-
-GitHub sends a ping right away; it should show a green check.
+| ✓ 202 | Working (202 means "accepted") |
+| ✕ 401 | The secret doesn't match `.env`. Paste it again, or make a new one in both places |
+| ✕ couldn't connect / 502 | GitHub can't reach the bridge. Recheck step 5 |
 
 ### 8. Try it
 
