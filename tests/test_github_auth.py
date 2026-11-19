@@ -14,7 +14,7 @@ from bridge.app import build_app, github_auth_for
 from bridge.clients import GitHubClient, PlaneClient
 from bridge.config import Settings
 from bridge.github_auth import (APP_EVENTS, APP_PERMISSIONS, AppCredentials, AppTokens, CredentialFile,
-                                GitHubAuth, app_jwt, manifest)
+                                GitHubAuth, NoGitHubCredentials, app_jwt, manifest)
 from bridge.store import Store
 from bridge.sync import Bridge
 
@@ -106,6 +106,15 @@ class FakeAppGitHub:
         if req.method == "POST" and p.endswith("/issues"):
             return httpx.Response(201, json={"number": 1, "html_url": "https://github.com/x/y/issues/1"})
         return httpx.Response(404, json={})
+
+
+def wait_for(cond, timeout=3.0):
+    """Startup work on GitHub happens in a background thread; wait for its result."""
+    import time as _time
+    end = _time.monotonic() + timeout
+    while not cond():
+        assert _time.monotonic() < end, "timed out"
+        _time.sleep(0.01)
 
 
 def creds(pem):
@@ -233,9 +242,13 @@ def test_saved_credentials_are_private(keypair, tmp_path):
     assert f.load().webhook_secret == "w"
 
 
-def test_manifest_asks_for_least_privilege():
+def test_manifest_asks_for_the_documented_permissions():
+    """What's used today (issues, pull requests, metadata) plus the two reserved ones
+    (checks, contents) the README lists; never administration."""
     m = manifest("acme Plane bridge", "https://hooks.example.com")
-    assert m["default_permissions"] == APP_PERMISSIONS
+    assert m["default_permissions"] == APP_PERMISSIONS == {
+        "issues": "write", "pull_requests": "write", "metadata": "read",
+        "checks": "write", "contents": "read"}
     assert "administration" not in m["default_permissions"]
     assert set(m["default_events"]) == set(APP_EVENTS)
     assert m["hook_attributes"]["url"] == "https://hooks.example.com/github/webhook"
@@ -340,8 +353,10 @@ def test_bad_private_key_is_reported_in_health(bare, keypair):
     bare.gh.auth.use_app(AppTokens(creds(pem), transport=httpx.MockTransport(
         lambda r: httpx.Response(401, json={"message": "A JSON web token could not be decoded"}))))
     with TestClient(build_app(bare)) as client:
+        wait_for(lambda: "github_problem" in client.get("/health").json())
         health = client.get("/health").json()
     assert "rejected the app's private key" in health["github_problem"]
+    assert "A JSON web token could not be decoded" in health["github_problem"]
 
 
 # ---------------------------------------------------------------- per-account lookup (ALL-84)
@@ -425,19 +440,49 @@ def test_broken_app_falls_back_to_the_token(keypair, status, caplog):
     assert gh.get_repo("acme/one") == {"name": "one"}               # no exception
     gh.create_issue("acme/one", "t", "b")
     assert [c[2] for c in fake.calls] == ["Bearer ghp_pat", "Bearer ghp_pat"]
-    assert str(status) in gh.auth.app.problem
+    assert str(status) in gh.auth.app.problem_now()
     assert len([r for r in caplog.records if "GITHUB APP PROBLEM" in r.getMessage()]) == 1   # logged once
 
 
-def test_broken_app_without_a_token_sends_no_auth(keypair):
+@pytest.mark.parametrize("status", [401, 500])
+def test_broken_app_without_a_token_sends_nothing_unsigned(keypair, status):
+    """PR #9 review: with an app and no GITHUB_TOKEN, a request the app can't sign isn't sent
+    unsigned (a private repo would answer 404 and the sync would park the item for hours)."""
     pem, public = keypair
     clock = Clock()
     fake = FakeAppGitHub(public, clock)
-    fake.app_status = 401
+    fake.app_status = status
     gh = app_client(pem, fake, clock)
-    gh.get_repo("acme/one")
-    assert fake.calls[-1][2] == ""
-    assert "rejected the app's private key" in gh.auth.app.problem
+    for _ in range(2):                         # the failure itself, then during the pause
+        with pytest.raises(NoGitHubCredentials):
+            gh.get_repo("acme/one")
+        with pytest.raises(NoGitHubCredentials):
+            gh.create_issue("acme/one", "t", "b")
+    assert fake.calls == []                    # nothing reached a repo endpoint
+    assert str(status) in gh.auth.app.problem_now()
+
+
+def test_no_unsigned_request_when_the_app_is_not_installed_and_no_token(keypair):
+    pem, public = keypair
+    clock = Clock()
+    fake = FakeAppGitHub(public, clock, installed=())
+    gh = app_client(pem, fake, clock)
+    with pytest.raises(NoGitHubCredentials, match="isn't installed on acme"):
+        gh.get_repo("acme/one")
+    assert fake.calls == []
+
+
+def test_no_credentials_at_all_fails_fast():
+    def handler(req):
+        raise AssertionError("nothing should be sent")
+    gh = GitHubClient(GitHubAuth(), transport=httpx.MockTransport(handler))
+    with pytest.raises(NoGitHubCredentials):
+        gh.get_repo("acme/one")
+
+
+def test_the_sync_treats_missing_credentials_as_temporary():
+    from bridge.sync import _failure_kind
+    assert _failure_kind(NoGitHubCredentials("x")) == "transient"
 
 
 def test_github_unreachable_during_minting_falls_back(keypair):
@@ -452,7 +497,7 @@ def test_github_unreachable_during_minting_falls_back(keypair):
     gh = GitHubClient(GitHubAuth(pat="ghp_pat", app=tokens), transport=httpx.MockTransport(fake.handler))
     assert gh.get_repo("acme/one") == {"name": "one"}
     assert fake.calls[-1][2] == "Bearer ghp_pat"
-    assert "can't reach GitHub" in tokens.problem
+    assert "can't reach GitHub" in tokens.problem_now()
 
 
 def test_problem_clears_when_the_app_works_again(keypair):
@@ -462,11 +507,11 @@ def test_problem_clears_when_the_app_works_again(keypair):
     fake.app_status = 500
     gh = app_client(pem, fake, clock, pat="ghp_pat")
     gh.get_repo("acme/one")
-    assert gh.auth.app.problem
+    assert gh.auth.app.problem_now()
     fake.app_status = 200
     clock.t += AppTokens.cooldown + 1          # past the pause after a failure (ALL-93)
     gh.get_repo("acme/one")
-    assert gh.auth.app.problem is None and fake.calls[-1][2] == "Bearer ghs_900_1"
+    assert gh.auth.app.problem_now() is None and fake.calls[-1][2] == "Bearer ghs_900_1"
 
 
 def test_health_shows_a_runtime_app_problem_live(bare, keypair):
@@ -492,6 +537,7 @@ def test_health_lists_where_the_app_is_installed(bare, keypair):
     bare.s.allowed_owners = ["acme", "other"]
     bare.gh.auth.use_app(AppTokens(creds(pem), transport=httpx.MockTransport(fake.handler), clock=clock))
     with TestClient(build_app(bare)) as client:
+        wait_for(lambda: not client.get("/health").json()["github_app_unknown_on"])
         health = client.get("/health").json()
         assert health["github_app_installed_on"] == ["acme"]
         assert health["github_app_missing_on"] == ["other"]
@@ -809,7 +855,7 @@ def test_lookup_succeeds_but_minting_fails(keypair, status):
     assert gh.get_repo("acme/one") == {"name": "one"}
     assert fake.lookups == 1 and fake.minted == 0
     assert fake.calls[-1][2] == "Bearer ghp_pat"
-    assert "minting an installation token" in gh.auth.app.problem
+    assert "minting an installation token" in gh.auth.app.problem_now()
 
 
 def test_a_failing_app_is_skipped_for_a_while(keypair):
@@ -829,7 +875,7 @@ def test_a_failing_app_is_skipped_for_a_while(keypair):
     assert {c[2] for c in fake.calls[seen:]} == {"Bearer ghp_pat"}
     clock.t += AppTokens.cooldown + 1
     gh.get_repo("acme/one")
-    assert fake.calls[-1][2] == "Bearer ghs_900_1" and gh.auth.app.problem is None
+    assert fake.calls[-1][2] == "Bearer ghs_900_1" and gh.auth.app.problem_now() is None
 
 
 def test_problem_clears_on_any_successful_app_call(keypair):
@@ -912,3 +958,252 @@ def test_health_reports_unknown_coverage(bare, keypair):
     health = client.get("/health").json()
     assert health["github_app_installed_on"] == [] and health["github_app_missing_on"] == []
     assert health["github_app_unknown_on"] == ["acme"]
+
+
+# ---------------------------------------------------------------- PR #9 review, round 2
+
+def test_remint_then_secondary_limit_sleeps_and_resends_once(keypair):
+    """401 -> re-mint -> secondary-limit 403 -> sleep -> resend: one issue, no token fallback."""
+    pem, _ = keypair
+    mints, sends, sleeps = [], [], []
+
+    def handler(req):
+        p = req.url.path
+        if p.endswith("/installation"):
+            return httpx.Response(200, json={"id": 1})
+        if p.endswith("/access_tokens"):
+            mints.append(1)
+            return httpx.Response(201, json={"token": f"ghs_{len(mints)}", "expires_at": "2099-01-01T00:00:00Z"})
+        sends.append(req.headers.get("Authorization"))
+        if len(sends) == 1:
+            return httpx.Response(401, json={"message": "Bad credentials"})
+        if len(sends) == 2:
+            return httpx.Response(403, headers={"Retry-After": "3"},
+                                  json={"message": "You have exceeded a secondary rate limit"})
+        return httpx.Response(201, json={"number": 7})
+
+    t = httpx.MockTransport(handler)
+    gh = GitHubClient(GitHubAuth(pat="ghp_pat", app=AppTokens(AppCredentials("1", pem), transport=t)),
+                      transport=t, sleep=sleeps.append)
+    assert gh.create_issue("acme/r", "t", "b") == {"number": 7}
+    assert sends == ["Bearer ghs_1", "Bearer ghs_2", "Bearer ghs_2"]
+    assert len(mints) == 2 and sleeps == [3.0]
+
+
+def test_a_404_after_a_remint_falls_back_to_the_token(keypair):
+    pem, _ = keypair
+    mints, seen = [], []
+
+    def app_side(req):
+        if req.url.path.endswith("/installation"):
+            return httpx.Response(200, json={"id": 1})
+        mints.append(1)
+        return httpx.Response(201, json={"token": f"ghs_{len(mints)}"})
+
+    def repo(req):
+        a = req.headers.get("Authorization")
+        seen.append(a)
+        if a == "Bearer ghs_1":
+            return httpx.Response(401)
+        if a == "Bearer ghs_2":
+            return httpx.Response(404)
+        return httpx.Response(200, json={"name": "r"})
+
+    app = AppTokens(AppCredentials("1", pem), transport=httpx.MockTransport(app_side), clock=Clock())
+    gh = GitHubClient(GitHubAuth(pat="ghp_pat", app=app), transport=httpx.MockTransport(repo))
+    assert gh.get_repo("acme/r") == {"name": "r"}
+    assert seen == ["Bearer ghs_1", "Bearer ghs_2", "Bearer ghp_pat"]
+
+
+def _two_accounts(pem, clock, mint_bad):
+    calls = {"bad_mints": 0, "good_mints": 0}
+
+    def handler(req):
+        p = req.url.path
+        if p == "/orgs/bad/installation":
+            return httpx.Response(200, json={"id": 1})
+        if p == "/orgs/good/installation":
+            return httpx.Response(200, json={"id": 2})
+        if p == "/app/installations/1/access_tokens":
+            calls["bad_mints"] += 1
+            return mint_bad()
+        if p == "/app/installations/2/access_tokens":
+            calls["good_mints"] += 1
+            return httpx.Response(201, json={"token": f"ghs_good_{calls['good_mints']}",
+                                             "expires_at": iso(clock() + 3600)})
+        return httpx.Response(200, json={"auth": req.headers.get("Authorization")})
+
+    t = httpx.MockTransport(handler)
+    app = AppTokens(AppCredentials("1", pem), transport=t, clock=clock)
+    return GitHubClient(GitHubAuth(pat="ghp_pat", app=app), transport=t), app, calls
+
+
+def test_a_suspended_installation_does_not_pause_other_accounts(keypair):
+    pem, _ = keypair
+    clock = Clock()
+    gh, app, calls = _two_accounts(pem, clock, lambda: httpx.Response(
+        403, json={"message": "This installation has been suspended"}))
+    assert gh.get_repo("bad/r") == {"auth": "Bearer ghp_pat"}
+    assert gh.get_repo("good/r") == {"auth": "Bearer ghs_good_1"}      # not paused
+    assert not app.cooling()
+    assert "installation has been suspended" in app.problem_now()
+    assert app.problem is None                                         # not an app-wide problem
+    gh.get_repo("bad/r")                                               # remembered: no new mint
+    assert calls["bad_mints"] == 1
+    clock.t += AppTokens.account_failure_ttl + 1
+    gh.get_repo("bad/r")
+    assert calls["bad_mints"] == 2
+    app.forget("bad")                                                  # e.g. an "unsuspend" event
+    assert "suspended" not in (app.problem_now() or "")
+
+
+def test_health_shows_github_s_message_for_a_refused_account(keypair, tmp_path):
+    pem, _ = keypair
+    clock = Clock()
+    gh, app, _ = _two_accounts(pem, clock, lambda: httpx.Response(
+        403, json={"message": "This installation has been suspended"}))
+    gh.get_repo("bad/r")
+    s = Settings(plane_base_url="http://plane.local", plane_public_url="https://plane.example.com",
+                 plane_workspace="acme", plane_api_key="k", plane_webhook_secret="",
+                 db_path=str(tmp_path / "h.db"))
+    plane = PlaneClient(s.plane_base_url, "acme", "k",
+                        transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"results": []})))
+    client = TestClient(build_app(Bridge(s, Store(s.db_path), plane, gh)))
+    assert "installation has been suspended" in client.get("/health").json()["github_problem"]
+
+
+def test_a_cached_token_is_used_during_a_pause(keypair):
+    pem, _ = keypair
+    clock = Clock()
+    gh, app, _ = _two_accounts(pem, clock, lambda: httpx.Response(503, json={}))
+    assert gh.get_repo("good/r") == {"auth": "Bearer ghs_good_1"}
+    gh.get_repo("bad/r")                                               # 5xx: app-wide pause
+    assert app.cooling()
+    assert gh.get_repo("good/r") == {"auth": "Bearer ghs_good_1"}      # cached token still used
+
+
+def test_concurrent_requests_during_a_failure_make_one_lookup(keypair):
+    import threading
+    import time as _time
+    pem, _ = keypair
+    lookups, repo_calls = [], []
+
+    def handler(req):
+        if req.url.path.endswith("/installation"):
+            lookups.append(1)
+            _time.sleep(0.2)
+            return httpx.Response(500, json={})
+        repo_calls.append(req.headers.get("Authorization"))
+        return httpx.Response(200, json={})
+
+    t = httpx.MockTransport(handler)
+    gh = GitHubClient(GitHubAuth(pat="ghp_pat", app=AppTokens(AppCredentials("1", pem), transport=t)),
+                      transport=t)
+    threads = [threading.Thread(target=gh.get_repo, args=("acme/r",)) for _ in range(5)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert len(lookups) == 1
+    assert repo_calls == ["Bearer ghp_pat"] * 5
+
+
+def test_forget_during_a_mint_does_not_cache_the_old_token(keypair):
+    pem, public = keypair
+    clock = Clock()
+    fake = FakeAppGitHub(public, clock)
+    holder = {}
+
+    def handler(req):
+        r = fake.handler(req)
+        if req.url.path.endswith("/access_tokens"):
+            holder["app"].forget("acme")       # an installation event lands mid-mint
+        return r
+
+    app = AppTokens(creds(pem), transport=httpx.MockTransport(handler), clock=clock)
+    holder["app"] = app
+    assert app.token_for("acme") == "ghs_900_1"           # this caller still gets it
+    assert app.token_for("acme") == "ghs_900_2"           # but it wasn't cached
+
+
+def test_startup_does_not_wait_for_a_hanging_github(bare, keypair):
+    import threading
+    import time as _time
+    pem, public = keypair
+    release = threading.Event()
+    fake = FakeAppGitHub(public, Clock())
+
+    def hanging(req):
+        release.wait(10)                       # GitHub accepts the connection, then nothing
+        return fake.handler(req)
+
+    bare.gh.auth.use_app(AppTokens(creds(pem), transport=httpx.MockTransport(hanging), clock=Clock()))
+    started = _time.monotonic()
+    try:
+        with TestClient(build_app(bare)) as client:
+            assert _time.monotonic() - started < 2
+            assert client.get("/health").status_code == 200
+            assert client.post("/plane/webhook", content=b"{}").status_code == 503   # served at once
+            release.set()
+            wait_for(lambda: bare.gh.auth.app.check_ok)
+    finally:
+        release.set()
+
+
+def test_check_survives_a_non_json_answer(keypair):
+    pem, _ = keypair
+    tokens = AppTokens(creds(pem), transport=httpx.MockTransport(
+        lambda r: httpx.Response(200, text="<html>proxy login</html>")), clock=Clock())
+    assert "isn't JSON" in tokens.check()
+    assert not tokens.check_ok and tokens.cooling()
+
+
+def test_installation_event_clears_parked_items_for_that_account(bare, keypair):
+    pem, public = keypair
+    fake = FakeAppGitHub(public, Clock())
+    bare.gh.auth.use_app(AppTokens(creds(pem), transport=httpx.MockTransport(fake.handler), clock=Clock()))
+    bare.store.record_failure("item-1", "Acme/repo", "GitHub answered 404", 1.0)
+    bare.store.record_failure("item-2", "acme-two/repo", "GitHub answered 404", 1.0)
+    client = TestClient(build_app(bare))
+    body = json.dumps({"action": "added", "installation": {"id": 900, "account": {"login": "acme"}}}).encode()
+    sig = "sha256=" + hmac.new(b"app-secret", body, hashlib.sha256).hexdigest()
+    r = client.post("/github/webhook", content=body,
+                    headers={"X-Hub-Signature-256": sig, "X-GitHub-Event": "installation_repositories"})
+    assert r.status_code == 202
+    assert bare.store.failure("item-1") is None
+    assert bare.store.failure("item-2") is not None        # another account: untouched
+
+
+def test_setup_pages_send_no_referrer(bare):
+    client = TestClient(build_app(bare))
+    page = client.get(f"/setup?token={client.app.state.setup.token}")
+    assert page.headers["referrer-policy"] == "no-referrer"
+    assert '<meta name="referrer" content="no-referrer">' in page.text
+
+
+def test_setup_query_strings_stay_out_of_the_access_log():
+    import logging
+    from bridge.app import _HideSetupQuery
+    rec = logging.LogRecord("uvicorn.access", logging.INFO, "", 0, '%s - "%s %s HTTP/%s" %d',
+                            ("1.2.3.4:5", "GET", "/setup/callback?code=abc&state=def", "1.1", 303), None)
+    assert _HideSetupQuery().filter(rec)
+    assert "abc" not in rec.getMessage() and "/setup/callback?..." in rec.getMessage()
+    other = logging.LogRecord("uvicorn.access", logging.INFO, "", 0, '%s - "%s %s HTTP/%s" %d',
+                              ("1.2.3.4:5", "GET", "/health?x=1", "1.1", 200), None)
+    _HideSetupQuery().filter(other)
+    assert "/health?x=1" in other.getMessage()
+    assert any(isinstance(f, _HideSetupQuery) for f in logging.getLogger("uvicorn.access").filters)
+
+
+def test_setup_states_are_safe_across_threads(bare):
+    import threading
+    from bridge.setup import SetupFlow
+    flow = SetupFlow(bare.s, GitHubAuth())
+    states = []
+    threads = [threading.Thread(target=lambda: states.extend(flow._new_state() for _ in range(200)))
+               for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(states) == 800 and all(flow._take_state(x) for x in states)

@@ -29,6 +29,21 @@ if logging.getLogger().getEffectiveLevel() > logging.DEBUG:
         logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 
+class _HideSetupQuery(logging.Filter):
+    """Keep /setup's query strings (the setup token, GitHub's one-time code) out of
+    uvicorn's access log. uvicorn's access records carry the path as args[2]."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str) \
+                and args[2].startswith("/setup") and "?" in args[2]:
+            record.args = args[:2] + (args[2].split("?", 1)[0] + "?...",) + args[3:]
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_HideSetupQuery())
+
+
 APP_UPKEEP_SECONDS = 60.0
 
 
@@ -69,15 +84,32 @@ def build_app(bridge: Bridge | None = None,
 
     stop = threading.Event()
 
+    def first_app_check(app_tokens: AppTokens) -> None:
+        """Check the app's key and look it up on the allowed accounts, logging the result."""
+        if app_tokens.check() is not None:        # problems are logged by check()
+            return
+        log.info("acting on GitHub as the app %s", app_tokens.creds.slug or app_tokens.creds.app_id)
+        if settings.allowed_owners:
+            _installed, missing = app_tokens.refresh_coverage(settings.allowed_owners)
+            if missing:
+                log.warning("GitHub App is not installed on: %s", ", ".join(missing))
+
     def app_upkeep() -> None:
-        """Retry a failed GitHub App check and refresh install coverage that has expired.
-        Runs whether or not the catch-up sync does, and picks up an app made by /setup."""
-        while not stop.wait(APP_UPKEEP_SECONDS):
+        """The app's startup check, then: retry a failed check and refresh install
+        coverage that has expired. In its own thread, so GitHub being slow or down
+        never holds up startup (webhooks are accepted meanwhile). Runs whether or
+        not the catch-up sync does, and picks up an app made by /setup."""
+        while True:
             if auth.app:
                 try:
-                    auth.app.maybe_recheck(settings.allowed_owners)
+                    if auth.app.checked_at is None:
+                        first_app_check(auth.app)
+                    else:
+                        auth.app.maybe_recheck(settings.allowed_owners)
                 except Exception:
                     log.exception("GitHub App upkeep failed")
+            if stop.wait(APP_UPKEEP_SECONDS):
+                return
 
     def sync_loop() -> None:
         while True:
@@ -117,17 +149,10 @@ def build_app(bridge: Bridge | None = None,
                         "sync anyway, it will retry", problem)
         else:
             log.info("Plane workspace '%s' is reachable", settings.plane_workspace)
-        if auth.app:
-            # In a worker thread too: GitHub being slow must not hold up startup.
-            if await anyio.to_thread.run_sync(auth.app.check) is None:   # problems are logged by check()
-                log.info("acting on GitHub as the app %s", auth.app.creds.slug or auth.app.creds.app_id)
-                if settings.allowed_owners:
-                    installed, missing = await anyio.to_thread.run_sync(
-                        auth.app.refresh_coverage, settings.allowed_owners)
-                    if missing:
-                        log.warning("GitHub App is not installed on: %s", ", ".join(missing))
-        else:
+        if not auth.app:
             setup.announce()
+        # The app's startup check runs in the upkeep thread, not here: startup
+        # doesn't wait for GitHub at all.
         threading.Thread(target=app_upkeep, name="github-app-upkeep", daemon=True).start()
         prepare_store()
         if settings.sync_interval > 0 and not (problem and setup_problem):
@@ -138,6 +163,11 @@ def build_app(bridge: Bridge | None = None,
 
     app = FastAPI(title="Plane-GitHub bridge", docs_url=None, redoc_url=None, openapi_url=None,
                   lifespan=lifespan)
+
+    def clear_parked(owner: str) -> None:
+        cleared = bridge.store.clear_failures_for_owner(owner)
+        if cleared:
+            log.info("sync: GitHub App installation changed on %s; cleared %d parked item(s)", owner, cleared)
 
     def run(name: str, fn, *args):
         try:
@@ -171,8 +201,9 @@ def build_app(bridge: Bridge | None = None,
             out["plane_problem"] = state["plane_problem"]
             if state["temporary"]:
                 out["plane_problem_temporary"] = True
-        if auth.app and auth.app.problem:        # live: the latest reason the app can't be used
-            out["github_problem"] = auth.app.problem
+        problem = auth.app.problem_now() if auth.app else None
+        if problem:                               # live: why the app can't be used right now
+            out["github_problem"] = problem
         return out
 
     @app.post("/plane/webhook", status_code=202)
@@ -204,6 +235,8 @@ def build_app(bridge: Bridge | None = None,
             account = ((json.loads(body or b"{}").get("installation") or {}).get("account") or {})
             if account.get("login"):
                 auth.app.forget(account["login"])   # cheap: never waits on network calls
+                # Repos the app now covers may have parked items; try them again.
+                tasks.add_task(clear_parked, account["login"])
             if settings.allowed_owners:             # network calls: off the event loop
                 tasks.add_task(auth.app.refresh_coverage, settings.allowed_owners)
             return {"accepted": True}

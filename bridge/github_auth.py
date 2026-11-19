@@ -30,8 +30,9 @@ log = logging.getLogger("bridge")
 API = "https://api.github.com"
 HEADERS = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
 
-# What the app needs and nothing more. Checks are for check runs on commits and
-# PRs; Contents read lets it see commits and branches.
+# The permissions the app asks for. The bridge uses Issues, Pull requests and
+# Metadata today. Checks (write) and Contents (read) are reserved: asked for now
+# so a later version doesn't need every installation to approve new permissions.
 APP_PERMISSIONS = {
     "issues": "write",
     "pull_requests": "write",
@@ -102,6 +103,24 @@ class AppError(Exception):
     """The GitHub App couldn't be used: bad key, clock drift, GitHub down. Message has no secrets."""
 
 
+class NoGitHubCredentials(Exception):
+    """No credential can sign this request right now, so it isn't sent at all.
+
+    Raised instead of sending a request unsigned, which GitHub would answer with a
+    404 for a private repo (and the catch-up sync would park as permanent). It
+    isn't an HTTP error, so the sync treats it as temporary and retries.
+    """
+
+
+def _github_message(r: httpx.Response) -> str:
+    """GitHub's own short explanation ("This installation has been suspended"), if any."""
+    try:
+        msg = r.json().get("message")
+    except (ValueError, AttributeError):
+        return ""
+    return " ".join(str(msg).split())[:200] if msg else ""
+
+
 class AppTokens:
     """Installation tokens for one GitHub App, one per account (org or user).
 
@@ -119,9 +138,14 @@ class AppTokens:
     # let that stick for the full negative_ttl.
     settle_seconds = 120.0
     settle_ttl = 30.0
-    # After the app fails (bad key, GitHub down), use the personal token for this
-    # long before trying the app again, so every call doesn't pay for the failure.
+    # After the app fails as a whole (key can't sign, GitHub down or erroring), use
+    # the personal token for this long before calling GitHub as the app again, so
+    # every call doesn't pay for the failure. Still-valid cached tokens keep working.
     cooldown = 45.0
+    # After GitHub refuses the app for one account (installation suspended, 401,
+    # 403 or 422 on its lookup or token), skip that account for this long. Other
+    # accounts are unaffected. An installation webhook for the account clears it.
+    account_failure_ttl = 300.0
     # How often a failed or never-run check() is retried in the background.
     recheck_every = 300.0
 
@@ -136,7 +160,13 @@ class AppTokens:
         self._installations: dict[str, tuple[int | None, float]] = {}
         self._tokens: dict[str, tuple[str, float]] = {}     # owner -> (token, expires_at)
         self._forgotten_at: dict[str, float] = {}
-        # The latest reason the app couldn't be used, shown in /health; None when it works.
+        # Bumped by forget(), so an answer that was in flight when the account was
+        # forgotten isn't cached over the reset.
+        self._generation: dict[str, int] = {}
+        # owner -> (why GitHub refused the app for that account, skipped until)
+        self._account_failures: dict[str, tuple[str, float]] = {}
+        # The latest reason the app as a whole couldn't be used; None when it works.
+        # /health shows problem_now(), which adds per-account refusals.
         self.problem: str | None = None
         # Until when the app is skipped after a failure (see cooldown).
         self.cooling_until = 0.0
@@ -160,42 +190,105 @@ class AppTokens:
             raise self._fail(f"can't reach GitHub's API ({type(e).__name__})") from None
 
     def cooling(self) -> bool:
-        """True while the app is skipped after a failure."""
+        """True while the app as a whole is skipped after a failure."""
         return self.clock() < self.cooling_until
 
     def _fail(self, message: str) -> AppError:
-        """Record why the app can't be used, logging only when the reason changes."""
+        """Record why the app as a whole can't be used (pauses it for every account),
+        logging only when the reason changes."""
         if message != self.problem:
             log.error("GITHUB APP PROBLEM: %s", message)
         self.problem = message
         self.cooling_until = self.clock() + self.cooldown
         return AppError(message)
 
-    def _ok(self) -> None:
+    def _fail_account(self, key: str, message: str) -> AppError:
+        """Record that GitHub refused the app for one account; other accounts carry on."""
+        with self._guard:
+            before = self._account_failures.get(key)
+            self._account_failures[key] = (message, self.clock() + self.account_failure_ttl)
+        if not before or before[0] != message:
+            log.error("GITHUB APP PROBLEM: %s", message)
+        return AppError(message)
+
+    def _ok(self, key: str | None = None) -> None:
+        """A call as the app worked: the app as a whole (and that account) is fine."""
         if self.problem:
             log.info("GitHub App working again")
         self.problem = None
         self.cooling_until = 0.0
+        if key:
+            with self._guard:
+                dropped = self._account_failures.pop(key, None)
+            if dropped:
+                log.info("GitHub App working again for %s", key)
+
+    def _account_failure(self, key: str) -> str | None:
+        """Why the app is skipped for this account right now, or None."""
+        with self._guard:
+            hit = self._account_failures.get(key)
+        return hit[0] if hit and hit[1] > self.clock() else None
+
+    def _precheck(self, key: str) -> None:
+        """Raise instead of calling GitHub while the app (or this account) is skipped.
+
+        Called right before each network call, inside the account's lock, so
+        callers queued behind a failing call don't each repeat it.
+        """
+        if self.cooling():
+            raise AppError(self.problem or "the GitHub App is paused after a failure")
+        why = self._account_failure(key)
+        if why:
+            raise AppError(why)
+
+    def problem_now(self) -> str | None:
+        """What /health shows: the app-wide problem, else refusals for single accounts."""
+        if self.problem:
+            return self.problem
+        now = self.clock()
+        with self._guard:
+            current = sorted(m for m, until in self._account_failures.values() if until > now)
+        return "; ".join(current) or None
 
     def _describe(self, r: httpx.Response, what: str) -> str:
+        said = _github_message(r)
+        said = f' ("{said}")' if said else ""
         if r.status_code == 401:
-            return (f"GitHub rejected the app's private key (401) while {what}. Check that it "
+            return (f"GitHub rejected the app's private key (401{said}) while {what}. Check that it "
                     f"belongs to app {self.creds.app_id} and that the server's clock is right")
-        return f"GitHub answered {r.status_code} while {what}"
+        return f"GitHub answered {r.status_code}{said} while {what}"
+
+    def _refused(self, r: httpx.Response, key: str, what: str) -> AppError:
+        """An error answer on an account's lookup or token: per account for a refusal
+        (suspended, 401, 403, 422), app-wide for anything else (5xx and the like)."""
+        message = self._describe(r, what)
+        if r.status_code in (401, 403, 422):
+            return self._fail_account(key, message)
+        return self._fail(message)
+
+    def _json(self, r: httpx.Response, what: str) -> dict:
+        try:
+            data = r.json()
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            raise self._fail(f"GitHub answered {r.status_code} with something that isn't JSON while {what}")
+        return data
 
     def check(self) -> str | None:
         """None if GitHub accepts the app's key; otherwise a message saying why not."""
         self.checked_at, self.check_ok = self.clock(), False
+        what = f"checking app {self.creds.app_id}"
         try:
             r = self._app_request("GET", "/app")
+            if r.is_error:
+                raise self._fail(self._describe(r, what))
+            meta = self._json(r, what)
         except AppError as e:
             return str(e)
-        if r.is_error:
-            return str(self._fail(self._describe(r, f"checking app {self.creds.app_id}")))
         self.check_ok = True
-        meta = r.json()
-        self.creds.slug = self.creds.slug or meta.get("slug", "")
-        self.creds.html_url = self.creds.html_url or meta.get("html_url", "")
+        self.creds.slug = self.creds.slug or str(meta.get("slug") or "")
+        self.creds.html_url = self.creds.html_url or str(meta.get("html_url") or "")
         self._ok()
         return None
 
@@ -205,15 +298,21 @@ class AppTokens:
 
     def _lookup_installation(self, owner: str) -> int | None:
         """The app's installation on an account (org first, then user), or None. Network call."""
+        key = owner.lower()
+        what = f"looking up the app's installation on {owner}"
         for kind in ("orgs", "users"):
+            self._precheck(key)
             r = self._app_request("GET", f"/{kind}/{owner}/installation")
             if r.status_code == 404:
                 continue
             if r.is_error:
-                raise self._fail(self._describe(r, f"looking up the app's installation on {owner}"))
-            self._ok()
-            return r.json()["id"]
-        self._ok()                            # GitHub answered: the app itself works
+                raise self._refused(r, key, what)
+            inst = self._json(r, what).get("id")
+            if not isinstance(inst, int):
+                raise self._fail(f"GitHub's answer has no installation ID while {what}")
+            self._ok(key)
+            return inst
+        self._ok(key)                         # GitHub answered: the app itself works
         return None
 
     def installation_id(self, owner: str) -> int | None:
@@ -221,6 +320,7 @@ class AppTokens:
         now = self.clock()
         with self._guard:
             hit = self._installations.get(key)
+            generation = self._generation.get(key, 0)
         if hit and hit[1] > now:
             return hit[0]
         inst = self._lookup_installation(owner)
@@ -234,44 +334,58 @@ class AppTokens:
         else:
             until = float("inf")
         with self._guard:
-            self._installations[key] = (inst, until)
+            if self._generation.get(key, 0) == generation:    # not forgotten meanwhile
+                self._installations[key] = (inst, until)
         return inst
 
     def token_for(self, owner: str, repo: str | None = None) -> str | None:
         """An installation token for owner's repos, or None if the app isn't installed there.
 
-        Raises AppError when the app can't be used at all (bad key, GitHub down).
+        Raises AppError when the app can't be used for this account right now (bad
+        key, GitHub down, installation suspended). A still-valid cached token is
+        returned even while the app is paused after a failure.
         """
         key = owner.lower()
         with self._owner_lock(key):           # one mint per account at a time
             with self._guard:
                 hit = self._tokens.get(key)
+                generation = self._generation.get(key, 0)
             now = self.clock()
             if hit and hit[1] - self.margin > now:
                 return hit[0]
+            self._precheck(key)               # a caller ahead of us may just have failed
             inst = self.installation_id(owner)
             if inst is None:
                 return None
+            what = f"minting an installation token for {owner}"
+            self._precheck(key)
             r = self._app_request("POST", f"/app/installations/{inst}/access_tokens")
             if r.status_code == 404:          # app was uninstalled since we looked
                 with self._guard:
                     self._installations.pop(key, None)
                 return None
             if r.is_error:
-                raise self._fail(self._describe(r, f"minting an installation token for {owner}"))
-            data = r.json()
+                raise self._refused(r, key, what)
+            data = self._json(r, what)
+            token = data.get("token")
+            if not isinstance(token, str) or not token:
+                raise self._fail(f"GitHub's answer has no token while {what}")
             with self._guard:
-                self._tokens[key] = (data["token"], _expiry(data.get("expires_at"), now))
-            self._ok()
+                if self._generation.get(key, 0) == generation:    # not forgotten meanwhile
+                    self._tokens[key] = (token, _expiry(data.get("expires_at"), now))
+            self._ok(key)
             log.debug("minted installation token for %s", owner)
-            return data["token"]
+            return token
 
     def forget(self, owner: str) -> None:
-        """Drop what's cached for an account. Never waits on network calls."""
+        """Drop what's cached for an account, including a refusal (an installation
+        event may mean it was unsuspended). Never waits on network calls."""
         key = owner.lower()
         with self._guard:
             self._tokens.pop(key, None)
             self._installations.pop(key, None)
+            self._account_failures.pop(key, None)
+            self._generation[key] = self._generation.get(key, 0) + 1
             self._forgotten_at[key] = self.clock()
 
     def refresh_coverage(self, owners: list[str]) -> tuple[list[str], list[str]]:
@@ -332,6 +446,9 @@ class GitHubAuth(httpx.Auth):
     owner when an app is set up and installed there, and the personal access token
     otherwise: also when the app can't be used right now, or the installation can't
     reach that one repo. The app can be switched on at runtime (after /setup).
+
+    A request is never sent unsigned: with no usable token it raises
+    NoGitHubCredentials instead.
     """
 
     # The 403 fallback below reads the response's message.
@@ -348,46 +465,49 @@ class GitHubAuth(httpx.Auth):
     def use_app(self, app: AppTokens) -> None:
         self.app = app
 
-    def _token(self, path: str) -> tuple[str | None, str | None]:
-        """(token, owner it was minted for, or None when it's the PAT or nothing)."""
+    def _token(self, path: str) -> tuple[str, str | None]:
+        """(token, owner it was minted for, or None when it's the personal token).
+
+        Raises NoGitHubCredentials rather than returning no token at all.
+        """
         m = _REPO_PATH.match(path)
-        if self.app and m and not self.app.cooling():
+        why = ""
+        if self.app and m:
             try:
                 token = self.app.token_for(m.group(1), m.group(2))
-            except AppError:
-                token = None                  # already logged and shown in /health
+            except AppError as e:
+                token, why = None, str(e)     # already logged and shown in /health
             if token:
                 return token, m.group(1)
-        return (self.pat or None), None
+            why = why or f"the GitHub App isn't installed on {m.group(1)}"
+        if self.pat:
+            return self.pat, None
+        if self.app:
+            raise NoGitHubCredentials(f"not sending {path}: {why or 'the GitHub App only signs repo requests'}, "
+                                      f"and GITHUB_TOKEN isn't set as a fallback")
+        raise NoGitHubCredentials(f"not sending {path}: no GitHub App or GITHUB_TOKEN is set up yet")
 
-    def _set(self, request: httpx.Request, token: str | None) -> None:
-        if token:
-            request.headers["Authorization"] = f"Bearer {token}"
-        else:
-            request.headers.pop("Authorization", None)
+    def _set(self, request: httpx.Request, token: str) -> None:
+        request.headers["Authorization"] = f"Bearer {token}"
 
     def auth_flow(self, request: httpx.Request):
         token, owner = self._token(request.url.path)
         self._set(request, token)
         response = yield request
-        if not (owner and self.app):
-            return
-        if response.status_code == 401:
+        if owner and self.app and response.status_code == 401:
             # A revoked or rotated installation token: mint a fresh one and try once more.
             self.app.forget(owner)
-            token, _ = self._token(request.url.path)
-            if token:
-                self._set(request, token)
-                yield request
-        elif response.status_code == 404 and self.pat:
-            # The installation can't see this repo (not in a "select repositories"
-            # install); the personal token may.
-            self._set(request, self.pat)
-            yield request
-        elif (response.status_code == 403 and self.pat
-              and _INTEGRATION_403 in response.text.lower()):
-            # A public repo outside the install: reads work with the installation
-            # token, writes are refused. The personal token may be allowed.
+            token, owner = self._token(request.url.path)
+            self._set(request, token)
+            response = yield request
+        if not (owner and self.app and self.pat):
+            return
+        if response.status_code == 404 or (response.status_code == 403
+                                           and _INTEGRATION_403 in response.text.lower()):
+            # 404: the installation can't see this repo (not in a "select
+            # repositories" install). 403 "not accessible by integration": a public
+            # repo outside the install, where reads work but writes are refused.
+            # Either way the personal token may be allowed.
             self._set(request, self.pat)
             yield request
 

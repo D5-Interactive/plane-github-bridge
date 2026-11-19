@@ -35,9 +35,15 @@ _OWNER = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 STATE_TTL = 3600.0        # GitHub's codes are valid for an hour too
 
 
+# The setup pages' URLs carry the setup token or GitHub's one-time code: never
+# send them to another site in a Referer header.
+NO_REFERRER = {"Referrer-Policy": "no-referrer"}
+
+
 def _page(title: str, body: str, status: int = 200) -> HTMLResponse:
-    return HTMLResponse(status_code=status, content=f"""<!doctype html>
+    return HTMLResponse(status_code=status, headers=NO_REFERRER, content=f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
 <title>{html.escape(title)}</title>
 <style>
  body{{font:16px/1.5 system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem;color:#222}}
@@ -55,6 +61,7 @@ class SetupFlow:
         self.s, self.auth, self.transport, self.clock = settings, auth, transport, clock
         self.token = None if auth.app else secrets.token_urlsafe(24)
         self._states: dict[str, float] = {}
+        self._states_lock = threading.Lock()   # setup pages are served from several threads
         self._callback_lock = threading.Lock()
 
     # ------------------------------------------------------------ helpers
@@ -82,14 +89,20 @@ class SetupFlow:
 
     def _new_state(self) -> str:
         now = self.clock()
-        self._states = {k: v for k, v in self._states.items() if v > now}
         state = secrets.token_urlsafe(24)
-        self._states[state] = now + STATE_TTL
+        with self._states_lock:
+            self._states = {k: v for k, v in self._states.items() if v > now}
+            self._states[state] = now + STATE_TTL
         return state
 
     def _take_state(self, state: str | None) -> bool:
-        expires = self._states.pop(state or "", 0)
+        with self._states_lock:
+            expires = self._states.pop(state or "", 0)
         return expires > self.clock()
+
+    def _clear_states(self) -> None:
+        with self._states_lock:
+            self._states.clear()
 
     # ------------------------------------------------------------ routes
 
@@ -158,7 +171,7 @@ class SetupFlow:
                 raise HTTPException(404, "A GitHub App is already set up for this bridge")
             if not code or not self._take_state(state):
                 raise HTTPException(403, "This setup link is unknown or expired. Start again from /setup")
-            self._states.clear()               # every other open setup page is now stale
+            self._clear_states()               # every other open setup page is now stale
             try:
                 creds = convert_manifest(code, transport=self.transport)
             except (RuntimeError, httpx.HTTPError, KeyError) as e:
@@ -174,5 +187,6 @@ class SetupFlow:
             log.info("GitHub App %s (id %s) created and saved; install it on your org next",
                      creds.slug, creds.app_id)
             if creds.html_url:
-                return RedirectResponse(f"{creds.html_url}/installations/new", status_code=303)
+                return RedirectResponse(f"{creds.html_url}/installations/new", status_code=303,
+                                        headers=NO_REFERRER)
             return _page("App created", "<p>Install it from the app's page on GitHub.</p>")
