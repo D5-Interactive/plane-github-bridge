@@ -20,6 +20,7 @@ A small, self-hosted webhook service that links [Plane](https://plane.so) Commun
 [Linking repos](#-linking-plane-to-repos) ·
 [Team workflow](#-team-workflow) ·
 [Limits](#-limits) ·
+[Reference](#-reference) ·
 [Development](#-development)
 
 </div>
@@ -453,6 +454,202 @@ its description; issues that already exist stay linked.
 - State names should be **Todo, In Progress, In Review, Done** and
   **Cancelled**. Otherwise the bridge falls back to the first state in the
   matching state group.
+
+## ◆ Reference
+
+The exact rules the bridge follows. Everything here matches the code in
+`bridge/`; if you change a rule, update this section with it.
+
+### Events it listens to
+
+| Source | Event | What the bridge does |
+|---|---|---|
+| Plane | Work item created / updated | Creates the GitHub issue if the item is in a linked module and has none yet; otherwise pushes title/description edits to its issue |
+| Plane | Work item deleted | Nothing. The issue stays |
+| Plane | Module created / updated | Tidies the module if its description links a repo |
+| GitHub | `issues` closed / reopened | Moves the work item's state |
+| GitHub | `pull_request` | Moves the state, adds the PR link and an activity comment |
+| GitHub | `pull_request_review` submitted | Activity comment |
+| GitHub | `push` | Activity comment listing the commits |
+| GitHub | `create` (branch) | Activity comment and branch link |
+| GitHub | `ping` | Replies so GitHub shows a green ✓ |
+| Either | Anything else | Ignored and logged |
+
+Every request is checked against its HMAC-SHA256 signature first:
+`X-Plane-Signature` with `PLANE_WEBHOOK_SECRET`, `X-Hub-Signature-256` with
+`GITHUB_WEBHOOK_SECRET`. A bad or missing signature gets `401` and nothing else
+happens. A good one gets `202 Accepted` at once and is processed in the
+background, so Plane and GitHub never wait on the bridge.
+
+### Deciding whether a work item goes to GitHub
+
+When a work item without an issue is created or updated, the bridge looks for a
+repo in this order and stops at the first match:
+
+1. **`config.yaml`** mappings for the item's project, if the item is in that
+   mapping's module.
+2. **Module descriptions:** each module in the project whose description holds a
+   `https://github.com/owner/repo` URL, if the item is in that module.
+3. **No match:** the item stays in Plane. The log says
+   `kept in Plane: item isn't in a module linked to a repo`.
+
+Then two last checks: the repo's owner must be in `GITHUB_ALLOWED_OWNERS` (when
+that's set), and the token must be able to create issues there.
+
+Details:
+
+- The URL can be anywhere in the description, in plain text or as a link.
+  `.git` endings and trailing paths like `/issues/3` are ignored. The first
+  GitHub repo URL wins.
+- Project descriptions are **not** read. An item in no module never syncs.
+- An item in several linked modules goes to the first one Plane lists.
+- Module and project details are cached for 60 seconds, so a new link takes up
+  to a minute to apply.
+- An item gets at most one issue, ever. Moving it to another module afterwards
+  doesn't create a second issue or move the existing one.
+
+### What the GitHub issue contains
+
+| Issue field | Comes from |
+|---|---|
+| Title | The work item's name |
+| Body | The work item's description, converted to GitHub Markdown |
+| Footer | `Synced from Plane work item [ALL-12](link). Plan, estimate and edit the task in Plane; do the code work here.` |
+
+Plane checklists become GitHub task lists: an unchecked item is `- [ ]`,
+a checked one `- [x]`. Headings, lists, bold, links and code carry over.
+
+The work item gets a link back, titled `GitHub owner/repo#12`.
+
+### Edits after the issue exists
+
+- **Plane → GitHub:** when the work item's **title or description** changes, the
+  bridge rewrites the issue's title and body from the work item. Other fields
+  (assignees, labels, priority, estimate, dates) aren't copied.
+- **GitHub → Plane:** edits to the issue's title or body are not copied back,
+  and the next Plane edit overwrites them. Treat Plane as the source of truth
+  for the task's wording.
+
+### How PRs, branches and commits find their work item
+
+GitHub activity is matched to a work item through the issue the bridge created.
+Activity on any other issue is ignored.
+
+| Activity | Matched when |
+|---|---|
+| Pull request | Its title or body says `close`, `closes`, `closed`, `fix`, `fixes`, `fixed`, `resolve`, `resolves` or `resolved` followed by `#12` (or `owner/repo#12`), **or** its branch is named after the issue |
+| Branch | Its name starts with the issue number: `12-scan-command`, `12_scan`, `feature/12-scan` |
+| Commit | It's pushed to a branch named after the issue, **or** its message mentions `#12` anywhere |
+| Review | It's on a PR that matches, by the PR rules above |
+
+### State changes
+
+| On GitHub | Work item moves to |
+|---|---|
+| PR opened as a draft, converted to draft, or closed without merging | In Progress |
+| PR opened (not draft), marked ready, reopened, edited, or new commits pushed to it | In Review |
+| PR merged | Done |
+| Issue closed as completed | Done |
+| Issue closed as not planned | Cancelled |
+| Issue reopened | Todo |
+
+The bridge finds each target state by **name** first (`Todo`, `In Progress`,
+`In Review`, `Done`, `Cancelled`, case-insensitive) and otherwise takes the
+first state in the matching Plane state group (unstarted, started, completed,
+cancelled). With no `In Review` state, PRs in review land in the first
+"started" state. If the work item is already in the target state, nothing is
+sent.
+
+### Activity comments
+
+Comments are posted by the Plane account that owns `PLANE_API_KEY`, and start
+with `◆ GitHub ·`.
+
+| Activity | Comment | Also adds a link |
+|---|---|---|
+| Branch created | `branch 12-scan created by zep` | The branch |
+| Push | `3 commits pushed to 12-scan by zep`, then each commit's short hash (linked) and first line, up to 10, then "…and N more" | ✕ |
+| PR opened / ready / converted / closed / reopened / merged | `PR repo#5 "Add scan" merged into main by zep` | The PR, the first time it's seen |
+| Review | `lead ✓ approved PR repo#5`, `✕ requested changes on`, or `commented on` (empty review comments are skipped) | ✕ |
+
+Each one is posted once. The bridge records what it has posted for each work
+item (each commit, branch, review and PR event), so a commit is listed only the
+first time it's pushed, and a redelivered GitHub event posts nothing new. Commit messages and
+names are HTML-escaped, so nothing in a commit can inject markup into Plane.
+
+### Module tidy-up
+
+Runs when Plane reports a module was created or updated, and whenever a work
+item is synced through a module. If the module's description links a repo that
+the token can see and the owner is allowed:
+
+1. **Name** → the repo's name (`auth-service`). If another module in the
+   project already has that name, Plane refuses the rename and only the
+   description is updated.
+2. **Description** → the repo link, then the repo's GitHub description (its
+   **About** text). No About text, just the link.
+
+The comparison is on the visible text, so the `module.updated` webhook caused by
+the bridge's own edit changes nothing and can't loop. Anything else that was in
+the description is replaced.
+
+### What's stored
+
+A SQLite database at `/data/bridge.db`, in the `bridge-data` Docker volume:
+
+| Table | Holds |
+|---|---|
+| `links` | Work item ↔ GitHub issue pairs. This is what makes "one issue per item" work |
+| `seen_events` | Plane event IDs, to drop Plane's retries |
+| `posted` | Which commits, branches, reviews and PR events were already posted per item |
+| `pr_links` | Which PR links were already added per item |
+
+> [!WARNING]
+> Deleting the volume (`docker compose down -v`) forgets every link. The next
+> edit to an already-synced work item would then create a **second** GitHub
+> issue. Back the volume up with the rest of your server.
+
+### Security model
+
+- The bridge listens on `127.0.0.1:8095` only; a tunnel or reverse proxy is the
+  only way in.
+- Both webhooks need a valid HMAC signature. An unset `PLANE_WEBHOOK_SECRET`
+  rejects every Plane webhook with `503` rather than accepting unsigned ones.
+- The GitHub token needs only **Issues: Read and write** (plus the automatic
+  **Metadata: Read**). It can't read or change code.
+- `GITHUB_ALLOWED_OWNERS` stops anyone in Plane from pointing a module at a repo
+  outside your org.
+- The container runs as an unprivileged user.
+
+### Reading the log
+
+`docker compose logs -f bridge` prints one line per event:
+
+| Log line | Meaning |
+|---|---|
+| `plane: created owner/repo#12` | New issue made for a work item |
+| `plane: kept in Plane: ...` | The item isn't in a linked module; working as intended |
+| `plane: updated owner/repo#12` | Title/description edit pushed to the issue |
+| `plane: module tidied for owner/repo` | Module renamed and/or its description rewritten |
+| `plane: unchanged: module already tidy` | The bridge's own edit coming back; harmless |
+| `plane: ignored: token can't see owner/repo` | Add the repo to the GitHub token, or fix the URL |
+| `plane: ignored: ... GITHUB_ALLOWED_OWNERS` | The module links a repo outside the allowed owners |
+| `plane: ignored: duplicate delivery` | Plane retried an event already handled |
+| `github:push: ignored: commits don't touch a linked issue` | A push unrelated to any synced work item |
+| `github:pull_request: moved to review` | State changed on the work item |
+| `... failed` followed by a traceback | Something errored; the event is skipped and the bridge keeps running |
+| `WARNING PLANE_WEBHOOK_SECRET is not set` | Expected until setup step 6 is done |
+
+Set `LOG_LEVEL=DEBUG` in `.env` and recreate the container to also print each
+Plane payload as received.
+
+### API usage
+
+Per Plane event the bridge makes a handful of Plane API calls (the work item,
+plus the project and module list when they're not cached) and at most one or two
+GitHub calls. Plane's API rate limit applies per API key, so a very large import
+of work items into linked modules may hit it; events that fail are logged and
+skipped, and editing the item again retries it.
 
 ## ◆ Development
 
