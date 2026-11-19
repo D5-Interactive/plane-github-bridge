@@ -1207,3 +1207,59 @@ def test_setup_states_are_safe_across_threads(bare):
     for t in threads:
         t.join()
     assert len(states) == 800 and all(flow._take_state(x) for x in states)
+
+
+def test_a_jwt_401_on_one_account_pauses_the_whole_app(keypair):
+    """A 401 on a JWT-signed call is the key or the clock, not the account."""
+    pem, _ = keypair
+    clock = Clock()
+    lookups = []
+
+    def handler(req):
+        if req.url.path.endswith("/installation"):
+            lookups.append(req.url.path)
+            return httpx.Response(401, json={"message": "'Expiration time' claim ('exp') is too far in the future"})
+        return httpx.Response(200, json={"auth": req.headers.get("Authorization")})
+
+    t = httpx.MockTransport(handler)
+    app = AppTokens(AppCredentials("1", pem), transport=t, clock=clock)
+    gh = GitHubClient(GitHubAuth(pat="ghp_pat", app=app), transport=t)
+    assert gh.get_repo("a/r") == {"auth": "Bearer ghp_pat"}
+    assert app.cooling() and "rejected the app's private key" in app.problem
+    assert gh.get_repo("b/r") == {"auth": "Bearer ghp_pat"}
+    assert lookups == ["/orgs/a/installation"]           # b isn't tried separately
+
+
+@pytest.mark.parametrize("status,headers,wait", [(403, {"Retry-After": "20"}, 20),
+                                                 (429, {"Retry-After": "600"}, 60)])
+def test_a_rate_limit_on_minting_is_a_short_pause_not_an_account_refusal(keypair, status, headers, wait):
+    pem, _ = keypair
+    clock = Clock()
+    gh, app, calls = _two_accounts(pem, clock, lambda: httpx.Response(
+        status, headers=headers, json={"message": "You have exceeded a secondary rate limit"}))
+    assert gh.get_repo("bad/r") == {"auth": "Bearer ghp_pat"}
+    assert app.cooling() and "rate limit" in app.problem
+    assert app._account_failure("bad") is None           # not a 5-minute refusal
+    clock.t += wait - 1
+    assert app.cooling()
+    clock.t += 2                                         # capped at MAX_WAIT (60s)
+    assert not app.cooling()
+    gh.get_repo("bad/r")
+    assert calls["bad_mints"] == 2                       # tried again right after the pause
+
+
+def test_missing_credentials_on_a_webhook_log_one_line(bare, keypair, caplog):
+    import logging
+    pem, public = keypair
+    fake = FakeAppGitHub(public, Clock(), installed=())
+    bare.gh.auth.use_app(AppTokens(creds(pem), transport=httpx.MockTransport(fake.handler), clock=Clock()))
+    bare.handle_github = lambda event, payload: bare.gh.get_repo("acme/one")
+    client = TestClient(build_app(bare))
+    body = json.dumps({"action": "opened"}).encode()
+    sig = "sha256=" + hmac.new(b"app-secret", body, hashlib.sha256).hexdigest()
+    with caplog.at_level(logging.INFO, logger="bridge"):
+        client.post("/github/webhook", content=body,
+                    headers={"X-Hub-Signature-256": sig, "X-GitHub-Event": "issues"})
+    hits = [r for r in caplog.records if "NoGitHubCredentials" in r.getMessage() or "skipped" in r.getMessage()]
+    assert len(hits) == 1 and hits[0].levelno == logging.WARNING and hits[0].exc_info is None
+    assert "isn't installed on acme" in hits[0].getMessage()

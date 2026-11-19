@@ -259,10 +259,22 @@ class AppTokens:
         return f"GitHub answered {r.status_code}{said} while {what}"
 
     def _refused(self, r: httpx.Response, key: str, what: str) -> AppError:
-        """An error answer on an account's lookup or token: per account for a refusal
-        (suspended, 401, 403, 422), app-wide for anything else (5xx and the like)."""
+        """An error answer on an account's lookup or token (JWT-signed calls).
+
+        A rate limit pauses the whole app for as long as GitHub asks (capped). A 401
+        means the JWT itself was refused (wrong key, clock skew): app-wide. A 403 or
+        422 is GitHub refusing the app on this one account (e.g. suspended).
+        Anything else (5xx and the like) is app-wide.
+        """
+        from .clients import MAX_WAIT, _github_rate_limited, server_wait   # clients imports us
+        if _github_rate_limited(r):
+            wait = min(server_wait(r, now=self.clock()), MAX_WAIT)
+            err = self._fail(f"GitHub's rate limit ({r.status_code}) while {what}; "
+                             f"pausing the app for {wait:.0f}s")
+            self.cooling_until = self.clock() + wait
+            return err
         message = self._describe(r, what)
-        if r.status_code in (401, 403, 422):
+        if r.status_code in (403, 422):
             return self._fail_account(key, message)
         return self._fail(message)
 

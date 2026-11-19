@@ -13,7 +13,8 @@ from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
 from .clients import GitHubClient, PlaneClient
 from .config import Settings, load_settings
-from .github_auth import AppCredentials, AppTokens, CredentialFile, GitHubAuth, load_private_key
+from .github_auth import (AppCredentials, AppTokens, CredentialFile, GitHubAuth, NoGitHubCredentials,
+                          load_private_key)
 from .setup import SetupFlow
 from .render import verify_github_signature, verify_plane_signature
 from .store import Store
@@ -172,6 +173,8 @@ def build_app(bridge: Bridge | None = None,
     def run(name: str, fn, *args):
         try:
             log.info("%s: %s", name, fn(*args))
+        except NoGitHubCredentials as e:   # expected while the app is failing: one line
+            log.warning("%s: skipped, %s", name, e)
         except Exception:  # never let one bad event kill the worker
             log.exception("%s failed", name)
 

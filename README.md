@@ -507,10 +507,11 @@ outside the install that the app can read but not write to (GitHub answers
 and while the app is failing (`/health` shows the reason, with GitHub's own
 message, as `github_problem`):
 
-- **The whole app** (a key that can't sign, GitHub errors or unreachable): the
-  bridge uses the token for about 45 seconds before calling GitHub as the app
-  again, so every call doesn't pay for the failure. Installation tokens it
-  already has keep working meanwhile.
+- **The whole app** (a key that can't sign or that GitHub rejects, a skewed
+  clock, GitHub errors or unreachable): the bridge uses the token for about 45
+  seconds before calling GitHub as the app again, so every call doesn't pay for
+  the failure. A GitHub rate limit pauses the app for as long as GitHub asks,
+  up to a minute. Installation tokens it already has keep working meanwhile.
 - **One account** (GitHub refuses the app there, for example "This installation
   has been suspended"): only that account uses the token, for 5 minutes or
   until an installation event for it arrives. Other accounts keep the app.
