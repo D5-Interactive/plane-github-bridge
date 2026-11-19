@@ -19,11 +19,12 @@ import hashlib
 import json
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass
 
 import httpx
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
 from .clients import GitHubClient, PlaneClient, _check
 
@@ -385,12 +386,35 @@ def _reason(e: Exception) -> str:
 
 def make_router(diag: Diagnostics, plane_base_url: str, workspace: str,
                 transport: httpx.BaseTransport | None = None,
-                recent_seconds: float = 7 * 86400, on_scan=None) -> APIRouter:
+                recent_seconds: float = 7 * 86400, on_scan=None,
+                per_minute: int = 30, clock=time.monotonic) -> APIRouter:
     """/status/PROJECT-N and /admin/sync-problems, checked against Plane with the caller's key.
 
-    The caller's key is only used for those checks: it's never stored or logged.
+    The caller's key is only used for those checks: it's never stored or logged. Each
+    client address may make `per_minute` requests a minute (each one costs a Plane
+    call); behind a tunnel or proxy the address comes from CF-Connecting-IP or the
+    first X-Forwarded-For entry.
     """
-    router = APIRouter()
+    hits: dict[str, list[float]] = {}
+    hits_lock = threading.Lock()
+
+    def throttle(request: Request) -> None:
+        ip = (request.headers.get("cf-connecting-ip")
+              or (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+              or (request.client.host if request.client else "unknown"))
+        now = clock()
+        with hits_lock:
+            recent = [t for t in hits.get(ip, []) if now - t < 60]
+            if len(recent) >= per_minute:
+                hits[ip] = recent
+                raise HTTPException(429, "too many requests; try again in a minute")
+            recent.append(now)
+            hits[ip] = recent
+            if len(hits) > 10_000:          # forget idle addresses
+                for k in [k for k, v in hits.items() if not v or now - v[-1] >= 60]:
+                    del hits[k]
+
+    router = APIRouter(dependencies=[Depends(throttle)])
     api = f"{plane_base_url.rstrip('/')}/api/v1"
 
     def as_caller(key: str) -> httpx.Client:

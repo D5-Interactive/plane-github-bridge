@@ -175,6 +175,30 @@ class Store:
                 self._db.execute("INSERT OR IGNORE INTO seen_events (event_id) VALUES (?)", (event_id,))
                 self._db.commit()
 
+    # -------- the bridge's own writes (to ignore the webhooks they cause)
+
+    def _own_writes_table(self) -> None:
+        self._db.execute("CREATE TABLE IF NOT EXISTS own_writes (plane_item_id TEXT NOT NULL, "
+                         "field TEXT NOT NULL, value TEXT NOT NULL, at REAL NOT NULL, "
+                         "PRIMARY KEY (plane_item_id, field, value))")
+
+    def record_own_write(self, item_id: str, field: str, value, at: float) -> None:
+        """Remember that the bridge just set `field` to `value` on the item or its issue."""
+        with self._lock:
+            self._own_writes_table()
+            self._db.execute("INSERT OR REPLACE INTO own_writes VALUES (?, ?, ?, ?)",
+                             (item_id, field, str(value), at))
+            self._db.execute("DELETE FROM own_writes WHERE at < ?", (at - 3600,))
+            self._db.commit()
+
+    def is_own_write(self, item_id: str, field: str, value, since: float) -> bool:
+        """True if the bridge set `field` to `value` on this item at or after `since`."""
+        with self._lock:
+            self._own_writes_table()
+            return self._db.execute(
+                "SELECT 1 FROM own_writes WHERE plane_item_id = ? AND field = ? AND value = ? AND at >= ?",
+                (item_id, field, str(value), since)).fetchone() is not None
+
     def pr_link_known(self, item_id: str, pr_url: str) -> bool:
         """True if this PR link was already added to the item. Reads only."""
         with self._lock:

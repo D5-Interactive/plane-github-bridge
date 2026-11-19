@@ -531,13 +531,23 @@ class PlaneClient:
         _check(r)
         self._modules.pop(project_id, None)
 
-    def set_state(self, project_id: str, item_id: str, state_id: str) -> None:
-        r = self._request("PATCH", f"/projects/{project_id}/issues/{item_id}/", json={"state": state_id})
-        _check(r)
+    def set_state(self, project_id: str, item_id: str, state_id: str) -> dict:
+        return self.update_work_item(project_id, item_id, state=state_id)
 
-    def update_work_item(self, project_id: str, item_id: str, **fields) -> None:
+    def update_work_item(self, project_id: str, item_id: str, **fields) -> dict:
+        """PATCH a work item; returns the updated item (or {} if Plane sent no body)."""
         r = self._request("PATCH", f"/projects/{project_id}/issues/{item_id}/", json=fields)
         _check(r)
+        try:
+            body = r.json()
+        except ValueError:
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    def item_comments_html(self, project_id: str, item_id: str) -> list[str]:
+        """The HTML of a work item's comments, for checking whether one was already posted."""
+        return [c.get("comment_html") or "" for c in
+                self._paged(f"/projects/{project_id}/issues/{item_id}/comments/")]
 
     def item_link_urls(self, project_id: str, item_id: str) -> list[str]:
         """The URLs already in a work item's Links section."""
@@ -629,6 +639,12 @@ class GitHubClient:
         _check(r)
         return [i for i in r.json() if "pull_request" not in i]
 
-    def update_issue(self, repo: str, number: int, **fields) -> None:
+    def update_issue(self, repo: str, number: int, **fields) -> dict:
+        """PATCH an issue; returns the updated issue."""
         r = self._request("PATCH", f"/repos/{repo}/issues/{number}", json=fields)
         _check(r)
+        try:
+            body = r.json()
+        except ValueError:
+            return {}
+        return body if isinstance(body, dict) else {}

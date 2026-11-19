@@ -51,6 +51,8 @@ class Settings:
     org_scan: bool = True
     timezone: str = "UTC"
     quiet_hours: tuple[int, int] = (1, 5)
+    reconcile: bool = True              # checks of edited modules/repos and the org scan
+    first_contact_fix: bool = False     # fix open/closed on pairs with no snapshot yet
 
     def owner_allowed(self, repo: str) -> bool:
         if not self.allowed_owners:
@@ -71,6 +73,14 @@ def _need(name: str) -> str:
     if not v:
         raise RuntimeError(f"Missing required environment variable {name}")
     return v
+
+
+def _on(value: str | None, default: bool = True) -> bool:
+    """A yes/no setting; empty means the default."""
+    v = (value or "").strip().lower()
+    if not v:
+        return default
+    return v not in ("0", "false", "no", "off")
 
 
 def _hours(value: str) -> tuple[int, int]:
@@ -122,7 +132,9 @@ def load_settings(config_path: str | None = None) -> Settings:
         public_url=os.environ.get("BRIDGE_PUBLIC_URL", "").strip().rstrip("/"),
         reconcile_delay=float(os.environ.get("BRIDGE_RECONCILE_DELAY", "30") or 0),
         queue_max_age=float(os.environ.get("BRIDGE_QUEUE_MAX_AGE", "300") or 300),
-        org_scan=os.environ.get("BRIDGE_ORG_SCAN", "1").strip().lower() not in ("0", "false", "no", "off"),
+        org_scan=_on(os.environ.get("BRIDGE_ORG_SCAN")),
         timezone=os.environ.get("BRIDGE_TIMEZONE", "UTC").strip() or "UTC",
         quiet_hours=_hours(os.environ.get("BRIDGE_QUIET_HOURS", "1-5")),
+        reconcile=_on(os.environ.get("BRIDGE_RECONCILE")),
+        first_contact_fix=_on(os.environ.get("BRIDGE_FIRST_CONTACT_FIX"), default=False),
     )
