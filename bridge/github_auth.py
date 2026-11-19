@@ -389,6 +389,25 @@ class AppTokens:
             log.debug("minted installation token for %s", owner)
             return token
 
+    def cached_state(self, owner: str) -> str:
+        """What the app knows about an account, without any network call:
+        "token" (a valid cached token), "installed", "missing" (not installed, fresh
+        answer), "refused" (GitHub refused the app there, or the app is paused with
+        no cached token) or "unknown" (not looked up, or the answer expired)."""
+        key = owner.lower()
+        now = self.clock()
+        with self._guard:
+            tok = self._tokens.get(key)
+            inst = self._installations.get(key)
+            failure = self._account_failures.get(key)
+        if tok and tok[1] - self.margin > now:
+            return "token"
+        if (failure and failure[1] > now) or self.cooling():
+            return "refused"
+        if inst and inst[1] > now:
+            return "installed" if inst[0] is not None else "missing"
+        return "unknown"
+
     def forget(self, owner: str) -> None:
         """Drop what's cached for an account, including a refusal (an installation
         event may mean it was unsuspended). Never waits on network calls."""
@@ -466,9 +485,65 @@ class GitHubAuth(httpx.Auth):
     # The 403 fallback below reads the response's message.
     requires_response_body = True
 
-    def __init__(self, pat: str = "", app: AppTokens | None = None):
+    # How long "this repo needs the personal token" (the installation can't reach it)
+    # is remembered, so such a repo doesn't cost two requests on every call.
+    needs_pat_ttl = 600.0
+
+    def __init__(self, pat: str = "", app: AppTokens | None = None, clock=time.time):
         self.pat = pat
         self.app = app
+        self.clock = clock
+        self._needs_pat: dict[str, float] = {}      # "owner/repo" -> remembered until
+        self._needs_pat_lock = threading.Lock()
+        # Called with (credential key, response) for every response, including a
+        # re-mint or PAT-fallback resend inside one request, so the right pacer
+        # learns from it. Set by GitHubClient.
+        self.observer = None
+
+    # -------- which credential a request uses (for pacing), without network calls
+
+    @staticmethod
+    def cred_key(owner: str | None) -> str:
+        """The pacing key of a credential: each installation token and the personal
+        token have their own rate limits."""
+        return f"app:{owner.lower()}" if owner else "pat"
+
+    def _pat_remembered(self, repo_full: str) -> bool:
+        with self._needs_pat_lock:
+            until = self._needs_pat.get(repo_full.lower())
+        return until is not None and until > self.clock()
+
+    def predict_key(self, path: str) -> str:
+        """The credential a request to `path` will most likely use."""
+        m = _REPO_PATH.match(path)
+        if not (self.app and m):
+            return "pat"
+        owner = m.group(1)
+        if self.pat and self._pat_remembered(f"{owner}/{m.group(2)}"):
+            return "pat"
+        state = self.app.cached_state(owner)
+        if state in ("missing", "refused") and self.pat:
+            return "pat"
+        return self.cred_key(owner)
+
+    def can_sign(self, owner: str) -> bool:
+        """Cheap check (no network): could anything sign a request for owner's repos?
+        False only when there's no personal token and the app is known to be
+        unusable there (not installed, refused, or paused with no cached token)."""
+        if self.pat:
+            return True
+        if not self.app:
+            return False
+        return self.app.cached_state(owner) not in ("missing", "refused")
+
+    def forget(self, owner: str) -> None:
+        """An installation changed on an account: drop cached answers for it."""
+        prefix = owner.lower() + "/"
+        with self._needs_pat_lock:
+            for k in [k for k in self._needs_pat if k.startswith(prefix)]:
+                del self._needs_pat[k]
+        if self.app:
+            self.app.forget(owner)
 
     @property
     def mode(self) -> str:
@@ -484,6 +559,8 @@ class GitHubAuth(httpx.Auth):
         """
         m = _REPO_PATH.match(path)
         why = ""
+        if self.app and m and self.pat and self._pat_remembered(f"{m.group(1)}/{m.group(2)}"):
+            return self.pat, None             # the installation can't reach this repo (recent answer)
         if self.app and m:
             try:
                 token = self.app.token_for(m.group(1), m.group(2))
@@ -502,16 +579,24 @@ class GitHubAuth(httpx.Auth):
     def _set(self, request: httpx.Request, token: str) -> None:
         request.headers["Authorization"] = f"Bearer {token}"
 
+    def _sent(self, request: httpx.Request, owner: str | None, response: httpx.Response) -> None:
+        key = self.cred_key(owner)
+        request.extensions["bridge_cred"] = key
+        if self.observer is not None:
+            self.observer(key, response)
+
     def auth_flow(self, request: httpx.Request):
         token, owner = self._token(request.url.path)
         self._set(request, token)
         response = yield request
+        self._sent(request, owner, response)
         if owner and self.app and response.status_code == 401:
             # A revoked or rotated installation token: mint a fresh one and try once more.
             self.app.forget(owner)
             token, owner = self._token(request.url.path)
             self._set(request, token)
             response = yield request
+            self._sent(request, owner, response)
         if not (owner and self.app and self.pat):
             return
         if response.status_code == 404 or (response.status_code == 403
@@ -521,7 +606,14 @@ class GitHubAuth(httpx.Auth):
             # repo outside the install, where reads work but writes are refused.
             # Either way the personal token may be allowed.
             self._set(request, self.pat)
-            yield request
+            response = yield request
+            self._sent(request, None, response)
+            m = _REPO_PATH.match(request.url.path)
+            if m and response.is_success:
+                # The token reached what the installation couldn't: remember for a
+                # while (not on a plain 404 both answer, such as a deleted issue).
+                with self._needs_pat_lock:
+                    self._needs_pat[f"{m.group(1)}/{m.group(2)}".lower()] = self.clock() + self.needs_pat_ttl
 
 
 def load_private_key(path: str) -> str:

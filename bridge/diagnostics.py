@@ -283,7 +283,18 @@ class Diagnostics:
         if repo and number:
             self._apply(f"github:{repo}#{number}", self._open_on_issue(repo, number))
 
+    def _github_can_sign(self, repo: str) -> bool:
+        auth = getattr(self.gh, "auth", None)
+        can = getattr(auth, "can_sign", None)
+        return can is None or can(repo.split("/", 1)[0])
+
     def _apply(self, target: str, want: bool) -> bool:
+        if target.startswith("github:") and not \
+                self._github_can_sign(target.removeprefix("github:").rsplit("#", 1)[0]):
+            # Nothing can sign GitHub calls for that account right now: leave the label
+            # change pending without calling GitHub (or logging) until it can.
+            self._set_flag(target, want, False)
+            return False
         try:
             if target.startswith("plane:"):
                 _, project_id, item_id = target.split(":", 2)

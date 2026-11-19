@@ -413,7 +413,8 @@ the permissions and events above, and its webhook pointed at
    the bridge has one `GITHUB_WEBHOOK_SECRET`, so both webhooks must use it;
    whichever doesn't match gets `401`.
 2. After step 3, turn on the app's webhook (**Active**) first. Delete the org
-   webhook a minute later. Events in that overlap arrive twice, which is
+   webhook (and any repo webhooks) a minute later; left in place, every event
+   arrives twice and doubles the bridge's API calls. Events in that overlap arrive twice, which is
    harmless: each activity comment is posted once and state moves don't
    repeat. A gap, on the other hand, loses events.
 3. Check `/health`: `github_app_missing_on` and `github_app_unknown_on` must
@@ -530,12 +531,28 @@ Without `GITHUB_TOKEN`, a request the app can't sign right now isn't sent at
 all; the catch-up sync skips that repo for the rest of the pass (one log line,
 no Plane reads for its items) and tries again next pass instead of parking it.
 When an installation event arrives (the app installed, or repos added to it),
-items parked for that account's repos are tried again on the next pass.
+items parked for that account's repos are tried again on the next pass, and
+actions waiting in the retry queue for them are retried at once. While nothing
+can sign for an account, its queued actions back off without reading Plane, and
+sync-problem labels for its issues wait instead of being retried against GitHub.
+
+Each credential (the app's token for each account, and the personal token) has
+its own GitHub rate limit, so the bridge paces each one separately: one account
+running low doesn't slow the others, and a rate limit on one doesn't pause the
+rest. A webhook action that would have to wait more than 60 seconds for its
+credential's budget isn't held up: it goes into the retry queue. `/health`
+shows the pacers under `github_pacers`. A repo the app's installation
+can't reach but the token can is remembered for 10 minutes (or until an
+installation event), so it costs one request per call, not two.
 
 To move from a token to an app later, do option A, check that
 `github_app_missing_on` and `github_app_unknown_on` in `/health` are empty,
-then delete the org webhook. With an app made by `/setup`, both its secret and
-`GITHUB_WEBHOOK_SECRET` are accepted in the meantime, so nothing is missed.
+then **delete the org webhook** (and any repo webhooks you added instead). The
+app delivers its own webhooks; while the old one is still there, every event
+arrives twice. That's harmless (the bridge handles each event once), but it
+doubles the bridge's work and API calls. With an app made by `/setup`, both its
+secret and `GITHUB_WEBHOOK_SECRET` are accepted in the meantime, so nothing is
+missed.
 Once the org webhook is gone, remove `GITHUB_WEBHOOK_SECRET` from `.env` and
 recreate the container: as long as it's set, deliveries signed with it are
 still accepted.
@@ -902,6 +919,7 @@ unless `BRIDGE_TRUST_PROXY_HEADERS=1`, which takes it from `CF-Connecting-IP` or
 |---|---|
 | `ok`, `mappings`, `plane_webhook_ready`, `plane_api_ok`, `plane_problem`, `plane_problem_temporary` | See [setup step 3](#3-start-the-bridge) |
 | `github_auth`, `github_webhook_ready`, `github_app`, `github_app_installed_on`, `github_app_missing_on`, `github_app_unknown_on`, `github_problem` | How the bridge signs GitHub calls; see [setup step 5](#5-connect-github) |
+| `github_pacers` | One pacer per GitHub credential (`app:<account>` for the app's token on each account, `pat` for the personal token), same fields as `github_pacer` (which is the personal token's) |
 | `queue` | `length`: actions waiting to be retried; `oldest_age`: seconds the oldest has waited; `stale`: how many were flagged `stuck` |
 | `plane_pacer`, `github_pacer` | The pacing in force. `source`: `headers` (learned from the last response), `configured` (`PLANE_RATE_LIMIT`, until headers are seen) or `off`; `limit` and `limit_source` (`header`, or `inferred`, see [API usage](#api-usage)); `remaining`, `reset_in`; `interval` and `background_interval` (seconds between calls); `background_blocked_for`; `reserve_share`; `hold_in` (seconds left of a hold after a 429); `waiting` (callers waiting per lane) |
 | `scheduler` | The org scan: `class` of the last scan (`light`, `heavy`, `slow`), `next_run`, `last_run` and its measurements in `last`, and `quiet_hours_only` (the next run may only start in the quiet hours); `{"enabled": false}` when the org scan or checks are off |

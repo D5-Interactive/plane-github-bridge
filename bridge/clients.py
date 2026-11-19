@@ -88,6 +88,15 @@ def _header(headers, *names: str) -> str:
     return ""
 
 
+class PaceTooLong(Exception):
+    """The rate-limit budget would make this call wait longer than allowed; it
+    wasn't sent. Treated like a rate limit: the action is queued for later."""
+
+    def __init__(self, seconds: float, what: str = ""):
+        super().__init__(f"rate-limit budget spent{f' ({what})' if what else ''}: next slot in {seconds:.0f}s")
+        self.seconds = seconds
+
+
 class Pacer:
     """Spaces requests so a client stays under its rate limit.
 
@@ -225,11 +234,14 @@ class Pacer:
             self._hold_until = max(self._hold_until, until)
             return until
 
-    def wait(self, honor_hold: bool = True, own_hold: float | None = None) -> float:
+    def wait(self, honor_hold: bool = True, own_hold: float | None = None,
+             max_wait: float | None = None) -> float:
         """Wait for this caller's slot, in the current lane. Returns seconds waited.
 
         own_hold: the end of a hold this caller set and has already slept through.
         It still waits for any longer hold another thread set since.
+        max_wait: in the interactive lane, raise PaceTooLong instead of waiting
+        longer than this (the caller queues the work instead of blocking).
         """
         if current_lane() == LANE_BACKGROUND:
             return self._wait_background(honor_hold, own_hold)
@@ -239,6 +251,8 @@ class Pacer:
             start = max(self._hold_start(now, honor_hold, own_hold), budget_start)
             if interval:
                 start = max(start, self._next - tolerance)
+            if max_wait is not None and start - now > max_wait:
+                raise PaceTooLong(start - now, self.resource)
             self._take(now, start, interval)
             delay = start - now
             if delay > 0:
@@ -591,14 +605,40 @@ class GitHubClient:
                      "X-GitHub-Api-Version": "2022-11-28"},
             auth=self.auth, timeout=20, transport=transport)
         self.sleep = sleep
-        # No configured pace: GitHub's x-ratelimit-* headers (core resource) set it.
-        self.pacer = Pacer(0, clock=clock, sleep=sleep, wall=wall, reserve_share=reserve_share)
+        # One pacer per credential: each installation token (per account) and the
+        # personal token have their own rate limits. No configured pace: GitHub's
+        # x-ratelimit-* headers (core resource) set it.
+        self._pacer_args = dict(clock=clock, sleep=sleep, wall=wall, reserve_share=reserve_share)
+        self._pacers: dict[str, Pacer] = {}
+        self._pacers_lock = threading.Lock()
+        self.pacer = self.pacer_for("pat")      # the personal token's (and /health's github_pacer)
+        self.auth.observer = self._observe
+
+    def pacer_for(self, key: str) -> Pacer:
+        with self._pacers_lock:
+            p = self._pacers.get(key)
+            if p is None:
+                p = self._pacers[key] = Pacer(0, resource="core", **self._pacer_args)
+            return p
+
+    def _observe(self, key: str, response: httpx.Response) -> None:
+        """Every response, including resends inside one request, teaches the pacer
+        of the credential that was actually used."""
+        self.pacer_for(key).observe(response.headers)
+
+    def pacer_snapshots(self) -> dict[str, dict]:
+        with self._pacers_lock:
+            pacers = dict(self._pacers)
+        return {k: p.snapshot() for k, p in sorted(pacers.items())}
 
     def _send(self, method: str, path: str, own_hold: float | None = None, **kwargs) -> httpx.Response:
-        self.pacer.wait(own_hold=own_hold)
-        r = self.http.request(method, path, **kwargs)
-        self.pacer.observe(r.headers)
-        return r
+        # Wait on the pacer of the credential this request will most likely use. A
+        # long wait in the interactive lane raises PaceTooLong (queued) instead.
+        self.pacer_for(self.auth.predict_key(path)).wait(own_hold=own_hold, max_wait=MAX_WAIT)
+        return self.http.request(method, path, **kwargs)
+
+    def _used(self, r: httpx.Response, path: str) -> Pacer:
+        return self.pacer_for(r.request.extensions.get("bridge_cred") or self.auth.predict_key(path))
 
     def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         """Send a request, paced by GitHub's rate-limit headers; on a rate limit, wait
@@ -615,11 +655,11 @@ class GitHubClient:
             if wait > MAX_WAIT:     # e.g. the hourly primary limit: don't sleep, fail now
                 log.warning("GitHub rate limit: %s %s answered %s and asks for %.0fs; not waiting",
                             method, r.request.url.path, r.status_code, wait)
-                self.pacer.hold(MAX_WAIT)
+                self._used(r, path).hold(MAX_WAIT)     # only that credential's calls wait
                 return r
             log.warning("GitHub rate limit: %s %s answered %s; waiting %.0fs and retrying once",
                         method, r.request.url.path, r.status_code, wait)
-            own_hold = self.pacer.hold(wait)
+            own_hold = self._used(r, path).hold(wait)
             self.sleep(wait)
             r = self._send(method, path, own_hold=own_hold, **kwargs)
         return r

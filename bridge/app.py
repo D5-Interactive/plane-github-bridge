@@ -261,6 +261,7 @@ def build_app(bridge: Bridge | None = None,
         out["queue"] = bridge.queue.stats()
         out["plane_pacer"] = bridge.plane.pacer.snapshot()
         out["github_pacer"] = bridge.gh.pacer.snapshot()
+        out["github_pacers"] = bridge.gh.pacer_snapshots()
         out["scheduler"] = (bridge.scheduler.snapshot() if settings.reconcile and settings.org_scan
                             else {"enabled": False})
         out["problems"] = bridge.diag.counts()
@@ -295,7 +296,9 @@ def build_app(bridge: Bridge | None = None,
         if x_github_event in ("installation", "installation_repositories") and auth.app:
             account = ((json.loads(body or b"{}").get("installation") or {}).get("account") or {})
             if account.get("login"):
-                auth.app.forget(account["login"])   # cheap: never waits on network calls
+                # Cheap: forgets cached answers and makes its queued actions due now;
+                # never waits on network calls.
+                bridge.github_account_changed(account["login"])
                 # Repos the app now covers may have parked items; try them again.
                 tasks.add_task(clear_parked, account["login"])
             if settings.allowed_owners:             # network calls: off the event loop

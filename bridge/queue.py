@@ -98,6 +98,31 @@ class RetryQueue:
                 (kind, key, data, reason, now, now, now))
             self.store._db.commit()
 
+    def set_payload_field(self, kind: str, key: str, field: str, value) -> None:
+        """Add a detail learned while running an entry (e.g. its repo) without
+        counting it as a new intent (the version isn't bumped)."""
+        with self.store._lock:
+            row = self.store._db.execute("SELECT payload FROM retry_queue WHERE kind = ? AND key = ?",
+                                         (kind, key)).fetchone()
+            if row is None:
+                return
+            payload = json.loads(row[0])
+            payload[field] = value
+            self.store._db.execute("UPDATE retry_queue SET payload = ? WHERE kind = ? AND key = ?",
+                                   (json.dumps(payload, sort_keys=True), kind, key))
+            self.store._db.commit()
+
+    def wake_owner(self, owner: str) -> int:
+        """Make every entry for repos of this GitHub account due now (its credentials
+        just changed). Returns how many."""
+        prefix = owner.lower() + "/"
+        with self.store._lock:
+            cur = self.store._db.execute(
+                "UPDATE retry_queue SET next_at = ? WHERE substr(lower(json_extract(payload, '$.repo')), 1, ?) = ?",
+                (self.clock(), len(prefix), prefix))
+            self.store._db.commit()
+            return cur.rowcount
+
     def done(self, entry_id: int, version: int | None = None) -> bool:
         """Remove a finished entry. With version: only if nothing was merged into it
         since it was read (a newer intent put while the handler ran stays queued,

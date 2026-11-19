@@ -37,7 +37,7 @@ from collections import defaultdict
 import httpx
 
 from . import guards, listing
-from .clients import (LANE_BACKGROUND, LANE_INTERACTIVE, GitHubClient, PlaneClient,
+from .clients import (LANE_BACKGROUND, LANE_INTERACTIVE, GitHubClient, PaceTooLong, PlaneClient,
                       _github_rate_limited, current_lane, lane,
                       plane_not_found)
 from .config import Settings
@@ -106,6 +106,8 @@ def _failure_kind(e: Exception) -> str:
     """
     if isinstance(e, NoGitHubCredentials):
         return "no_credentials"
+    if isinstance(e, PaceTooLong):
+        return "rate"
     if isinstance(e, httpx.HTTPStatusError):
         status, host = e.response.status_code, e.request.url.host
         if status == 429:
@@ -565,6 +567,7 @@ class Bridge:
         if not self.s.owner_allowed(repo):
             log.warning("refusing %s: owner not in GITHUB_ALLOWED_OWNERS", repo)
             return f"ignored: {repo} is not in GITHUB_ALLOWED_OWNERS"
+        self._require_credentials(repo)
 
         ref, url = self._item_ref(project_id, item)
         issue, adopted = None, False
@@ -738,6 +741,8 @@ class Bridge:
 
     def _action_failed(self, kind: str, key: str, payload: dict, e: Exception) -> str:
         fk, reason = _failure_kind(e), _short_reason(e)
+        if getattr(e, "repo", None) and not payload.get("repo"):
+            payload = {**payload, "repo": e.repo}      # lets the retry check credentials cheaply
         if fk in ("permanent", "gone"):
             self._refused(kind, payload, fk, reason)
             return f"refused: {reason}"
@@ -786,10 +791,13 @@ class Bridge:
         Each runs in the pacing lane it was queued from."""
         def wrap(kind):
             def run(payload: dict) -> None:
+                self._precheck_credentials(kind, payload)
                 with self._lock(self._lock_key(kind, payload)), lane(payload.get("lane", LANE_INTERACTIVE)):
                     try:
                         self.handlers[kind](payload)
                     except Exception as e:
+                        if getattr(e, "repo", None) and not payload.get("repo"):
+                            self.queue.set_payload_field(kind, payload.get("_key", ""), "repo", e.repo)
                         fk = _failure_kind(e)
                         if fk not in ("permanent", "gone"):
                             raise
@@ -802,6 +810,37 @@ class Bridge:
             return run
         return run_due(self.queue, {k: wrap(k) for k in self.handlers}, limit=limit,
                        stop=lambda e: _failure_kind(e) in ("rate", "auth"))
+
+    _GITHUB_BOUND = ("create_issue", "push_edit", "sync_item")
+
+    def _require_credentials(self, repo: str) -> None:
+        """Raise NoGitHubCredentials (naming the repo, so a queued retry can check it
+        cheaply) when nothing can sign for the repo's owner right now."""
+        can_sign = getattr(getattr(self.gh, "auth", None), "can_sign", None)
+        if can_sign and not can_sign(repo.split("/", 1)[0]):
+            e = NoGitHubCredentials(f"no GitHub credentials for {repo.split('/', 1)[0]} yet")
+            e.repo = repo
+            raise e
+
+    def _precheck_credentials(self, kind: str, payload: dict) -> None:
+        """Before a queued GitHub-bound action re-reads anything from Plane: if nothing
+        can sign for the repo's owner right now (known cheaply, no network), fail it
+        straight away so it backs off, instead of spending Plane calls each retry."""
+        repo = payload.get("repo") or ""
+        can_sign = getattr(getattr(self.gh, "auth", None), "can_sign", None)
+        if kind in self._GITHUB_BOUND and "/" in repo and can_sign and not can_sign(repo.split("/", 1)[0]):
+            raise NoGitHubCredentials(f"no GitHub credentials for {repo.split('/', 1)[0]} yet")
+
+    def github_account_changed(self, owner: str) -> int:
+        """An installation changed on a GitHub account: forget cached answers and make
+        its queued actions due now. Database only; never waits on the network."""
+        auth = getattr(self.gh, "auth", None)
+        if auth is not None and hasattr(auth, "forget"):
+            auth.forget(owner)
+        woke = self.queue.wake_owner(owner)
+        if woke:
+            log.info("GitHub account %s changed; %d queued action(s) retried now", owner, woke)
+        return woke
 
     # -------- action handlers (payload -> result)
 
