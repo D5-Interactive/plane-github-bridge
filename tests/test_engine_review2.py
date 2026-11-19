@@ -337,3 +337,93 @@ def test_closing_keyword_pr_merged_into_the_default_branch_still_moves_to_done(e
     bridge.handle_github("pull_request", merged_pr(branch="feature-x", body="Closes #1"), "p1")
     assert world.items["item-1"]["state"] == "st-done"
     assert world.issues[1]["state"] == "open" and 1 not in world.gh_comments   # GitHub closes it itself
+
+
+# ---------------------------------------------------------------- auditor round 4
+
+def test_pr_merged_into_develop_doesnt_pull_a_done_item_back(env):
+    """Auditor F1 (test_done_item_pulled_back_by_dev_merge)."""
+    bridge, world, clock = env
+    _linked(bridge, world)
+    world.items["item-1"]["state"] = "st-done"
+    world.issues[1]["state"] = "closed"
+    r = bridge.handle_github("pull_request", merged_pr(base="develop"), "p1")
+    assert r.endswith("unchanged: already done or cancelled in Plane")
+    assert world.items["item-1"]["state"] == "st-done" and world.issues[1]["state"] == "closed"
+    s = get_snapshot(bridge.store, "item-1")
+    assert s.p_closed and s.g_closed and bridge.diag.counts()["open"] == 0
+
+
+@pytest.mark.parametrize("action", ["opened", "ready_for_review", "reopened"])
+def test_open_pr_events_dont_pull_a_cancelled_item_back(env, action):
+    bridge, world, clock = env
+    _linked(bridge, world)
+    world.items["item-1"]["state"] = "st-cancel"
+    event = merged_pr(branch="1-scan")
+    event["action"] = action
+    event["pull_request"].update(state="open", merged=False)
+    bridge.handle_github("pull_request", event, f"p-{action}")
+    assert world.items["item-1"]["state"] == "st-cancel"
+
+
+def test_issue_reopen_still_reopens_a_done_item(env):
+    bridge, world, clock = env
+    _linked(bridge, world)
+    gh_does(bridge, world, "closed", "d1", state_reason="completed")
+    assert world.items["item-1"]["state"] == "st-done"
+    gh_does(bridge, world, "reopened", "d2")
+    assert world.items["item-1"]["state"] == "st-todo"
+
+
+def test_divergent_pair_is_never_recorded_silently(env):
+    """Auditor F1 (test_done_pullback_divergence_flagged): whatever records a pair
+    open on one side and closed on the other raises state_differs, and a later
+    matching record clears it."""
+    bridge, world, clock = env
+    _linked(bridge, world)
+    link = bridge.store.by_plane_item("item-1")
+    bridge._record_pair(link, "Item 1", False, "Item 1", True)
+    (problem,) = bridge.diag.open_problems(kind="state_differs")
+    assert problem.plane_item_id == "item-1" and "plane-sync-problem" in world.issues[1]["labels"]
+    bridge._record_pair(link, "Item 1", False, "Item 1", True)            # not raised twice
+    assert bridge.diag.open_problems(kind="state_differs")[0].count == 1
+    bridge._record_pair(link, "Item 1", True, "Item 1", True)
+    assert bridge.diag.open_problems(kind="state_differs") == []
+    assert "plane-sync-problem" not in world.issues[1]["labels"]
+
+
+def test_closing_keyword_merge_flags_until_github_closes_the_issue(env):
+    """Default-branch merge with "Closes #1": Done in Plane while GitHub hasn't closed
+    the issue yet is flagged, and the flag clears when GitHub's close arrives."""
+    bridge, world, clock = env
+    _linked(bridge, world)
+    bridge.handle_github("pull_request", merged_pr(branch="feature-x", body="Closes #1"), "p1")
+    assert bridge.diag.open_problems(kind="state_differs")
+    gh_does(bridge, world, "closed", "d1", state_reason="completed")
+    assert bridge.diag.open_problems(kind="state_differs") == []
+    assert world.items["item-1"]["state"] == "st-done"
+
+
+def test_main_then_release_merge_keeps_the_item_done(env):
+    """Chaperone (test_main_then_release_merge): 1-scan merged to main, then the same
+    branch merged to release/1.x, must not pull the item back to In Review."""
+    bridge, world, clock = env
+    _linked(bridge, world)
+    bridge.handle_github("pull_request", merged_pr(number=7), "p1")
+    assert world.items["item-1"]["state"] == "st-done" and world.issues[1]["state"] == "closed"
+    bridge.handle_github("pull_request", merged_pr(number=8, base="release/1.x"), "p2")
+    bridge.run_org_scan()
+    assert world.items["item-1"]["state"] == "st-done" and world.issues[1]["state"] == "closed"
+    assert bridge.diag.counts()["open"] == 0
+
+
+def test_fork_pr_merged_into_default_is_flagged_not_silent(env):
+    """Chaperone (test_fork_default): a fork PR from branch 1-x merged into main with
+    no keyword moves Plane to Done while the issue stays open; that pair is flagged."""
+    bridge, world, clock = env
+    _linked(bridge, world)
+    bridge.handle_github("pull_request", merged_pr(head_repo="someone/api-fork"), "p1")
+    bridge.run_org_scan()
+    assert world.items["item-1"]["state"] == "st-done" and world.issues[1]["state"] == "open"
+    (problem,) = bridge.diag.open_problems(kind="state_differs")
+    assert problem.plane_item_id == "item-1" and "plane-sync-problem" in world.issues[1]["labels"]

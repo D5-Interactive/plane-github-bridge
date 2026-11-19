@@ -568,7 +568,8 @@ class Bridge:
         self.diag.resolve(kind="refused", plane_item_id=item_id)
         p = plane_side(item, self._groups(project_id))
         g = github_side(issue)
-        self._record_pair(link, p.title, p.closed, g.title, g.closed, g_stamp=issue.get("updated_at", ""))
+        if not (p.closed and not g.closed):     # otherwise the close below records the pair
+            self._record_pair(link, p.title, p.closed, g.title, g.closed, g_stamp=issue.get("updated_at", ""))
         if not adopted:
             log.info("created %s#%s for %s", repo, issue["number"], ref)
         self._add_issue_link(link)
@@ -588,10 +589,20 @@ class Bridge:
 
     def _record_pair(self, link: Link, p_title: str, p_closed: bool, g_title: str, g_closed: bool,
                      p_stamp: str | None = None, g_stamp: str | None = None) -> None:
-        """Remember both sides as they really are after a sync of the pair."""
+        """Remember both sides as they really are after a sync of the pair.
+
+        A pair recorded open on one side and closed on the other is never left
+        silent: it's flagged state_differs (once), so checks don't treat it as a
+        settled baseline nobody will look at. A matching pair clears that flag."""
         record_snapshot(self.store, link.plane_item_id, link.repo, link.issue_number,
                         p_title=p_title, g_title=g_title, p_closed=p_closed, g_closed=g_closed,
                         p_stamp=p_stamp, g_stamp=g_stamp, synced_at=self.clock())
+        if p_closed == g_closed:
+            self.diag.resolve(kind="state_differs", plane_item_id=link.plane_item_id)
+        elif not self.diag.open_problems(kind="state_differs", plane_item_id=link.plane_item_id):
+            self._report_problem({"kind": "state_differs", "field": "closed",
+                                  "project_id": link.plane_project_id, "item_id": link.plane_item_id,
+                                  "repo": link.repo, "issue_number": link.issue_number})
 
     # -------- writes that record themselves, so the webhooks they cause are ignored
 
@@ -823,11 +834,19 @@ class Bridge:
             # The issue was closed or reopened again since this event: it no longer
             # says what to do. Bring the pair in line from what both sides show now.
             return "superseded: " + self._sync_reconcile(link, {"closed": "github"})
-        if p.get("match_group") and (item_group(item, groups) in CLOSED_GROUPS) == want_closed:
+        is_closed = item_group(item, groups) in CLOSED_GROUPS
+        if p.get("match_group") and is_closed == want_closed:
             # An issue closed or reopened while the item already is: nothing to move.
             # (Often the webhook for the bridge's own write.)
             result = f"unchanged: already {'closed' if want_closed else 'open'} in Plane"
             p_closed = want_closed
+        elif not p.get("match_group") and is_closed and not want_closed:
+            # A PR event (opened, ready, merged into another branch...) never pulls an
+            # item that's already done or cancelled back to In Progress or In Review.
+            log.info("%s#%s: PR event left the done/cancelled work item where it is (not moved "
+                     "to %s)", link.repo, link.issue_number, target)
+            result = "unchanged: already done or cancelled in Plane"
+            p_closed = True
         else:
             result = self._move(link, target, item=item)
             p_closed = want_closed if not result.startswith("skipped") else \

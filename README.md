@@ -669,7 +669,7 @@ Anything the bridge can't settle on its own is a **sync problem**:
 |---|---|---|---|
 | `stuck` | A queued action is still failing after `BRIDGE_QUEUE_MAX_AGE` seconds | Item and issue | The action succeeds |
 | `refused` | Plane or GitHub refused an action for a lasting reason | Item and issue | A later action on the item succeeds, or the item is edited in Plane (it's tried again) |
-| `state_differs` | Open on one side, closed on the other, and the bridge can't tell which is right (first contact, or both changed) | Item and issue | The two sides match |
+| `state_differs` | Open on one side, closed on the other, and the bridge can't tell which is right (first contact, or both changed), or a sync left them that way (for example a fork PR merged into the default branch: Done in Plane, issue still open; or a `Closes #N` merge before GitHub has closed the issue) | Item and issue | The two sides match |
 | `title_differs` | The titles differ and the bridge can't tell which side is right | Item and issue | The two sides match |
 | `issue_missing` | The item's linked issue is gone from the repo | Item | A check finds the issue again |
 | `unlinked_issues` | Issues in a linked repo with no Plane item | No | The repo has none |
@@ -856,7 +856,9 @@ The bridge finds each target state by **name** first (`Todo`, `In Progress`,
 first state in the matching Plane state group (unstarted, started, completed,
 cancelled). With no `In Review` state, PRs in review land in the first
 "started" state. If the work item is already in the target state, nothing is
-sent.
+sent. A PR event never moves a work item that's already in a completed or
+cancelled state back to In Progress or In Review (for example a branch merged
+into `main` and later into `release/1.x`); only reopening the issue does.
 
 **Merged PRs from the issue's branch.** GitHub only closes an issue on merge when
 the PR says `Closes #12`. When a PR from a branch named after the issue (such
