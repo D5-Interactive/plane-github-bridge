@@ -237,3 +237,55 @@ def test_old_database_is_migrated(tmp_path):
     store.save(Link("item-2", "p", "acme/a", 4, "u", plane_linked=False))
     assert [l.plane_item_id for l in store.missing_plane_links(10)] == ["item-2"]
     Store(str(path))                                               # opening again is harmless
+
+
+# ---------------------------------------------------------------- no credentials for a repo (PR #9 review)
+
+def _uncovered(tmp_path, modules):
+    """A bridge whose GitHub App is installed nowhere, with no personal token."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from bridge.github_auth import AppCredentials, AppTokens, GitHubAuth
+    pem = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode()
+    bridge, plane, gh = make(tmp_path, modules)
+    app = AppTokens(AppCredentials("1", pem), transport=httpx.MockTransport(
+        lambda r: httpx.Response(404, json={"message": "Not Found"})))
+    auth = GitHubAuth(app=app)
+    bridge.gh = GitHubClient(auth, transport=httpx.MockTransport(gh.handler), sleep=lambda _s: None)
+    return bridge, plane, gh, auth
+
+
+def item_reads(plane):
+    return sum(n for (method, key), n in plane.calls.items()
+               if method == "GET" and re.fullmatch(r"/projects/[^/]+/issues/[^/]+/", key))
+
+
+def test_a_repo_nothing_can_sign_for_is_skipped_without_reading_items(tmp_path, caplog):
+    bridge, plane, gh, auth = _uncovered(tmp_path, {"mod-a": ("acme/a", items("a", 5))})
+    with caplog.at_level("WARNING", logger="bridge"):
+        bridge.sync_linked_modules()
+        bridge.sync_linked_modules()
+    assert item_reads(plane) == 0                      # nothing read from Plane for that repo
+    skips = [r for r in caplog.records if "skipping acme/a for this pass" in r.getMessage()]
+    assert len(skips) == 2                             # one line per repo per pass
+    assert not any("couldn't tidy" in r.getMessage() for r in caplog.records)
+    assert all(bridge.store.failure(i) is None for i in items("a", 5))   # not parked
+    auth.pat = "ghp_now_set"                           # credentials arrive
+    bridge.sync_linked_modules()
+    assert len(gh.created) == 5
+
+
+def test_create_path_without_credentials_stops_reading_that_repo(tmp_path, caplog):
+    """A pinned module skips the tidy step, so the first item is read; the rest aren't."""
+    bridge, plane, gh, _ = _uncovered(tmp_path, {"mod-a": ("acme/a", items("a", 4)),
+                                                  "mod-b": ("acme/b", items("b", 1))})
+    bridge.gh.auth.pat = ""
+    mods = {m["id"]: m for m in bridge.plane.modules(PROJ)}
+    with caplog.at_level("WARNING", logger="bridge"):
+        created, failed = bridge._sync_project(PROJ, "API", [(mods["mod-a"], "acme/a", True),
+                                                             (mods["mod-b"], "acme/b", True)])
+    assert item_reads(plane) == 2                      # one for acme/a (then skipped), one for acme/b
+    assert created == [] and failed == 2
+    assert sum("skipping acme/a" in r.getMessage() for r in caplog.records) == 1
+    assert bridge.store.failure("item-a-1") is None

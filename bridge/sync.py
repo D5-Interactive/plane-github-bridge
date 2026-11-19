@@ -46,6 +46,7 @@ from .queue import RetryQueue, run_due
 from .reconcile import (CLOSED_GROUPS, Reconciler, decide, get_snapshot, github_side, item_group,
                         iso, last_checked, plane_side, record_snapshot)
 from .scheduler import Debouncer, ScanScheduler
+from .github_auth import NoGitHubCredentials
 from .render import (branch_issue_number, closing_refs, esc, github_repo_in, issue_body,
                      mention_refs, normalize_plane_event, plain_text, plane_html_to_markdown,
                      repo_description_html)
@@ -98,8 +99,13 @@ def _failure_kind(e: Exception) -> str:
     "auth"      a key or token was rejected (401): stop the pass, log once
     "permanent" GitHub refused this item for a lasting reason: park it
     "gone"      Plane itself says the work item doesn't exist: park it
+    "no_credentials" nothing can sign GitHub calls for that repo (no app
+                installation, no token): skip the repo for the rest of the pass,
+                don't park (it must sync as soon as credentials arrive)
     "transient" anything else: retry next pass
     """
+    if isinstance(e, NoGitHubCredentials):
+        return "no_credentials"
     if isinstance(e, httpx.HTTPStatusError):
         status, host = e.response.status_code, e.request.url.host
         if status == 429:
@@ -138,6 +144,7 @@ class Bridge:
         self._locks: dict[str, threading.RLock] = defaultdict(threading.RLock)
         self._locks_guard = threading.Lock()
         self.clock = time.time
+        self._no_cred_logged: dict[str, float] = {}     # repo -> when "no credentials" was last logged
         now = lambda: self.clock()          # noqa: E731  (tests swap self.clock)
         # Failed actions wait here and are retried within minutes (see run_queue).
         self.queue = RetryQueue(store, clock=now, max_age=getattr(settings, "queue_max_age", 300),
@@ -361,6 +368,7 @@ class Bridge:
         failed = repaired = skipped_projects = 0
         stopped = ""
         logged_repos: set[str] = set()      # parked repos already logged in this pass
+        no_credentials: set[str] = set()    # repos nothing can sign for: skipped for this pass
         try:
             repaired = self._repair_plane_links()
             try:
@@ -380,7 +388,7 @@ class Bridge:
                 linked = self._linked_modules(ident, modules)
                 if not linked:
                     continue                # nothing linked here: no item listings at all
-                c, f = self._sync_project(pid, ident, linked, logged_repos)
+                c, f = self._sync_project(pid, ident, linked, logged_repos, no_credentials)
                 created += c
                 failed += f
         except _StopPass as e:
@@ -426,8 +434,15 @@ class Bridge:
         return [t for t in out if self.s.owner_allowed(t[1])]
 
     def _sync_project(self, pid: str, ident: str, linked: list[tuple[dict, str, bool]],
-                      logged_repos: set[str] | None = None) -> tuple[list[str], int]:
+                      logged_repos: set[str] | None = None,
+                      no_credentials: set[str] | None = None) -> tuple[list[str], int]:
         logged_repos = set() if logged_repos is None else logged_repos
+        no_credentials = set() if no_credentials is None else no_credentials
+
+        def skip_repo(repo: str, e: Exception) -> None:
+            """No credential can reach this repo: skip it for the rest of the pass, one log line."""
+            no_credentials.add(repo.lower())
+            log.warning("sync: skipping %s for this pass: %s", repo, e)
         # item id -> (module, repo, pinned): the first linked module listing it wins.
         targets: dict[str, tuple[dict, str, bool]] = {}
         for mod, repo, pinned in linked:
@@ -452,12 +467,17 @@ class Bridge:
             past = self.store.failure(item_id)
             if past and past[0].lower() == repo.lower() and now - past[2] < PERMANENT_RETRY_SECONDS:
                 continue        # parked for this repo; a different repo means the module was relinked
+            if repo.lower() in no_credentials:
+                continue        # checked before reading the item: no Plane calls for it this pass
             if not pinned and mod["id"] not in tidied:
                 tidied.add(mod["id"])
                 try:
                     self.tidy_module_description(pid, mod)
                 except Exception as e:
                     _stop_if_pass_ending(e)
+                    if _failure_kind(e) == "no_credentials":
+                        skip_repo(repo, e)
+                        continue
                     log.warning("sync: couldn't tidy module %s (%s)", mod.get("id"), _short_reason(e))
             try:
                 with self._lock(item_id):
@@ -469,7 +489,9 @@ class Bridge:
                 kind = _failure_kind(e)
                 failed += 1
                 reason = _short_reason(e)
-                if kind == "gone":
+                if kind == "no_credentials":
+                    skip_repo(repo, e)          # not parked: it syncs once credentials arrive
+                elif kind == "gone":
                     # Listed in the module but deleted (or unreadable) in Plane: don't
                     # read it every pass. Editing it, or a restart, tries again.
                     self.store.record_failure(item_id, repo, reason, now)
@@ -720,6 +742,15 @@ class Bridge:
             self._refused(kind, payload, fk, reason)
             return f"refused: {reason}"
         self._queue_put(kind, key, payload, reason)
+        if fk == "no_credentials":
+            # Nothing can sign GitHub calls for this repo yet (no app installation, no
+            # token): retried until it can, but logged once per repo every 10 minutes.
+            repo = (payload.get("repo") or "").lower()
+            now = self.clock()
+            if now - self._no_cred_logged.get(repo, float("-inf")) >= 600:
+                self._no_cred_logged[repo] = now
+                log.warning("%s for %s queued: %s", kind, payload.get("repo") or key, e)
+            return "queued: no GitHub credentials for this repo yet"
         log.warning("%s for %s failed (%s); queued for retry", kind, key, reason)
         return f"queued: {reason}"
 

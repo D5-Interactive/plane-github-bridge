@@ -11,6 +11,8 @@ from email.utils import parsedate_to_datetime
 
 import httpx
 
+from .github_auth import GitHubAuth
+
 log = logging.getLogger("bridge")
 
 # Longest single wait for a rate limit, and the wait when the server gives no hint.
@@ -578,15 +580,16 @@ def _github_rate_limited(r: httpx.Response) -> bool:
 
 
 class GitHubClient:
-    def __init__(self, token: str, transport: httpx.BaseTransport | None = None,
+    def __init__(self, auth: "str | GitHubAuth", transport: httpx.BaseTransport | None = None,
                  sleep=time.sleep, clock=time.monotonic, wall=time.time,
                  reserve_share: float = 0.3):
+        """auth: a GitHubAuth (app and/or token), or a plain personal access token."""
+        self.auth = auth if isinstance(auth, GitHubAuth) else GitHubAuth(pat=auth)
         self.http = httpx.Client(
             base_url="https://api.github.com",
-            headers={"Authorization": f"Bearer {token}",
-                     "Accept": "application/vnd.github+json",
+            headers={"Accept": "application/vnd.github+json",
                      "X-GitHub-Api-Version": "2022-11-28"},
-            timeout=20, transport=transport)
+            auth=self.auth, timeout=20, transport=transport)
         self.sleep = sleep
         # No configured pace: GitHub's x-ratelimit-* headers (core resource) set it.
         self.pacer = Pacer(0, clock=clock, sleep=sleep, wall=wall, reserve_share=reserve_share)
@@ -599,7 +602,13 @@ class GitHubClient:
 
     def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         """Send a request, paced by GitHub's rate-limit headers; on a rate limit, wait
-        as GitHub says (capped) and retry once. Other threads wait out the same window."""
+        as GitHub says (capped) and retry once. Other threads wait out the same window.
+
+        The auth flow (self.auth) runs inside each send: it picks the app's
+        installation token or the personal token, re-mints once on a 401 and
+        falls back to the token where the app can't reach a repo. So a rate-limit
+        retry here is a fresh send that goes through the same auth decisions.
+        """
         r = self._send(method, path, **kwargs)
         if _github_rate_limited(r):
             wait = server_wait(r)

@@ -146,6 +146,15 @@ class Store:
             self._db.commit()
             return cur.rowcount
 
+    def clear_failures_for_owner(self, owner: str) -> int:
+        """Forget parked items for one GitHub account's repos (after an installation change)."""
+        prefix = owner.lower() + "/"
+        with self._lock:
+            cur = self._db.execute("DELETE FROM sync_failures WHERE lower(substr(repo, 1, ?)) = ?",
+                                   (len(prefix), prefix))
+            self._db.commit()
+            return cur.rowcount
+
     def clear_failure(self, item_id: str) -> None:
         with self._lock:
             self._db.execute("DELETE FROM sync_failures WHERE plane_item_id = ?", (item_id,))

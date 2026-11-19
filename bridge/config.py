@@ -21,8 +21,14 @@ class Settings:
     plane_workspace: str       # workspace slug, e.g. "your-workspace"
     plane_api_key: str
     plane_webhook_secret: str
-    github_token: str
-    github_webhook_secret: str
+    github_token: str = ""         # personal access token; fallback when no GitHub App is set up
+    github_webhook_secret: str = ""
+    # Bring your own GitHub App. Without these, /setup can create one.
+    github_app_id: str = ""
+    github_app_private_key_path: str = ""
+    # The bridge's own public address (https://hooks.example.com). Optional: /setup
+    # works it out from the request when this is empty; sync-problem labels point here.
+    public_url: str = ""
     db_path: str = "/data/bridge.db"
     mappings: list[Mapping] = field(default_factory=list)
     # GitHub owners the bridge may create issues for. Empty = any the token can reach.
@@ -40,8 +46,6 @@ class Settings:
     # Share of the learned rate budget kept for webhooks and retries, so background
     # scans can't slow instant sync down (BRIDGE_RATE_RESERVE_SHARE).
     rate_reserve_share: float = 0.3
-    # The bridge's own public address, used in the sync-problem label descriptions.
-    public_url: str = ""
     # Seconds to wait after the last edit of a module or repo before checking it,
     # so a burst of edits is checked once (BRIDGE_RECONCILE_DELAY).
     reconcile_delay: float = 30
@@ -55,6 +59,10 @@ class Settings:
     first_contact_fix: bool = False     # fix open/closed on pairs with no snapshot yet
     trust_proxy_headers: bool = False   # take client addresses from CF-Connecting-IP / X-Forwarded-For
 
+    @property
+    def data_dir(self) -> str:
+        return os.path.dirname(os.path.abspath(self.db_path))
+
     def owner_allowed(self, repo: str) -> bool:
         if not self.allowed_owners:
             return True
@@ -67,6 +75,9 @@ class Settings:
     def mapping_for_repo(self, repo: str) -> list[Mapping]:
         r = repo.lower()
         return [m for m in self.mappings if m.repo.lower() == r]
+
+
+DEFAULT_KEY_PATH = "/app/secrets/github-app.pem"
 
 
 def _need(name: str) -> str:
@@ -121,8 +132,15 @@ def load_settings(config_path: str | None = None) -> Settings:
         # Optional at startup: Plane only shows this secret after the webhook exists,
         # and the webhook needs the bridge running. Plane webhooks are refused until set.
         plane_webhook_secret=os.environ.get("PLANE_WEBHOOK_SECRET", "").strip(),
-        github_token=_need("GITHUB_TOKEN"),
-        github_webhook_secret=_need("GITHUB_WEBHOOK_SECRET"),
+        # All optional: a GitHub App made through /setup brings its own key and
+        # webhook secret. Without an app, GITHUB_TOKEN and GITHUB_WEBHOOK_SECRET are used.
+        github_token=os.environ.get("GITHUB_TOKEN", "").strip(),
+        github_webhook_secret=os.environ.get("GITHUB_WEBHOOK_SECRET", "").strip(),
+        github_app_id=os.environ.get("GITHUB_APP_ID", "").strip(),
+        # Only read when GITHUB_APP_ID is set. The default matches docker-compose.yml.
+        github_app_private_key_path=(os.environ.get("GITHUB_APP_PRIVATE_KEY_PATH", "").strip()
+                                     or DEFAULT_KEY_PATH),
+        public_url=os.environ.get("BRIDGE_PUBLIC_URL", "").strip().rstrip("/"),
         db_path=os.environ.get("BRIDGE_DB", "/data/bridge.db"),
         mappings=mappings,
         allowed_owners=[o.strip() for o in os.environ.get("GITHUB_ALLOWED_OWNERS", "").split(",") if o.strip()],
@@ -133,7 +151,6 @@ def load_settings(config_path: str | None = None) -> Settings:
         recheck_links=os.environ.get("BRIDGE_RECHECK_LINKS", "").strip().lower() in ("1", "true", "yes"),
         plane_rate_limit=float(os.environ.get("PLANE_RATE_LIMIT", "50") or 0),
         rate_reserve_share=min(max(float(os.environ.get("BRIDGE_RATE_RESERVE_SHARE") or "0.3"), 0.0), 0.9),
-        public_url=os.environ.get("BRIDGE_PUBLIC_URL", "").strip().rstrip("/"),
         reconcile_delay=float(os.environ.get("BRIDGE_RECONCILE_DELAY", "30") or 0),
         queue_max_age=float(os.environ.get("BRIDGE_QUEUE_MAX_AGE", "300") or 300),
         org_scan=_on(os.environ.get("BRIDGE_ORG_SCAN")),
