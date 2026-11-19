@@ -217,6 +217,7 @@ docker compose logs --tail 30 bridge
 |---|---|
 | `Missing required environment variable ...` | That line in `.env` is empty or misspelled |
 | `IsADirectoryError` or a YAML error | `config.yaml` is missing, so Docker created a folder in its place. Run `docker compose down && rmdir config.yaml && cp config.example.yaml config.yaml`, fill it in, then start again |
+| `Can't read GITHUB_APP_PRIVATE_KEY_PATH ...: Permission denied` | The key isn't readable by the container's user: `sudo chown 10001 secrets/github-app.pem` |
 
 ### 4. Give it a public address
 
@@ -344,30 +345,45 @@ the permissions and events above, and its webhook pointed at
 `application/json` and a webhook secret.
 
 1. From the app's page, note the **App ID** and generate a **private key**
-   (a `.pem` file). Copy the key to the server, next to `.env`:
+   (a `.pem` file). Copy the key to the server into a `secrets` folder next to
+   `.env`, and let the container's user read it:
 
    ```bash
-   chmod 600 github-app.pem
-   sudo chown 10001 github-app.pem    # the container's user
+   mkdir -p secrets
+   mv ~/your-app.private-key.pem secrets/github-app.pem
+   chmod 600 secrets/github-app.pem
+   sudo chown 10001 secrets/github-app.pem    # the container's user
    ```
 
-2. In `docker-compose.yml`, uncomment the line that mounts it:
+   `docker-compose.yml` already mounts `./secrets` read-only at
+   `/app/secrets`, and git ignores the folder. If the bridge ran before, Docker
+   may have created an empty `secrets` folder owned by root; take it over
+   first with `sudo chown $USER secrets`.
 
-   ```yaml
-         - ./github-app.pem:/app/github-app.pem:ro
-   ```
-
-3. Add to `.env`:
+2. Add to `.env`:
 
    ```bash
    GITHUB_APP_ID=123456
-   GITHUB_APP_PRIVATE_KEY_PATH=/app/github-app.pem
+   GITHUB_APP_PRIVATE_KEY_PATH=/app/secrets/github-app.pem    # the default; can be left out
    GITHUB_WEBHOOK_SECRET=<the app's webhook secret>
    GITHUB_ALLOWED_OWNERS=your-org
    ```
 
-4. Recreate the container: `docker compose up -d --force-recreate`.
-5. Install the app on `your-org` if it isn't already.
+3. Install the app on `your-org` (**All repositories**, or the repos you'll
+   link), then recreate the container:
+
+   ```bash
+   docker compose up -d --force-recreate
+   sleep 5 && curl http://127.0.0.1:8095/health
+   ```
+
+   Look for `"github_auth":"app"` and no `github_problem`.
+
+**Moving from a token and org webhook to your own app?** Give the app the same
+webhook secret as the org webhook, so `GITHUB_WEBHOOK_SECRET` stays as it is.
+After step 3, turn on the app's webhook (**Active**) and delete the org webhook
+at the same time, so each event arrives once. Once activity shows up as the
+app's bot, remove `GITHUB_TOKEN` from `.env` and revoke the token.
 
 An app set in `.env` takes priority over one made with `/setup`.
 

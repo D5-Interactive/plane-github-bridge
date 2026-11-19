@@ -56,6 +56,9 @@ class Settings:
         return [m for m in self.mappings if m.repo.lower() == r]
 
 
+DEFAULT_KEY_PATH = "/app/secrets/github-app.pem"
+
+
 def _need(name: str) -> str:
     v = os.environ.get(name, "").strip()
     if not v:
@@ -78,10 +81,6 @@ def load_settings(config_path: str | None = None) -> Settings:
             raise RuntimeError(f"repo must look like owner/name: {m['repo']!r}")
         mappings.append(Mapping(project=m["project"], repo=m["repo"], module=m.get("module")))
 
-    if bool(os.environ.get("GITHUB_APP_ID", "").strip()) != bool(
-            os.environ.get("GITHUB_APP_PRIVATE_KEY_PATH", "").strip()):
-        raise RuntimeError("Set both GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY_PATH, or neither")
-
     return Settings(
         plane_base_url=_need("PLANE_BASE_URL").rstrip("/"),
         plane_public_url=_need("PLANE_PUBLIC_URL").rstrip("/"),
@@ -95,7 +94,9 @@ def load_settings(config_path: str | None = None) -> Settings:
         github_token=os.environ.get("GITHUB_TOKEN", "").strip(),
         github_webhook_secret=os.environ.get("GITHUB_WEBHOOK_SECRET", "").strip(),
         github_app_id=os.environ.get("GITHUB_APP_ID", "").strip(),
-        github_app_private_key_path=os.environ.get("GITHUB_APP_PRIVATE_KEY_PATH", "").strip(),
+        # Only read when GITHUB_APP_ID is set. The default matches docker-compose.yml.
+        github_app_private_key_path=(os.environ.get("GITHUB_APP_PRIVATE_KEY_PATH", "").strip()
+                                     or DEFAULT_KEY_PATH),
         public_url=os.environ.get("BRIDGE_PUBLIC_URL", "").strip().rstrip("/"),
         db_path=os.environ.get("BRIDGE_DB", "/data/bridge.db"),
         mappings=mappings,

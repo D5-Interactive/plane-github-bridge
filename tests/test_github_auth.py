@@ -188,16 +188,19 @@ def test_app_from_env_beats_saved_app_beats_token(keypair, tmp_path):
     assert env.app.creds.app_id == "123" and env.app.creds.source == "env"
 
 
-def test_config_needs_both_app_settings(monkeypatch, tmp_path):
+def test_config_github_is_optional_and_key_path_has_a_default(monkeypatch, tmp_path):
     from bridge.config import load_settings
     for k, v in {"PLANE_BASE_URL": "http://p", "PLANE_PUBLIC_URL": "https://p",
                  "PLANE_WORKSPACE": "w", "PLANE_API_KEY": "k"}.items():
         monkeypatch.setenv(k, v)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     assert load_settings(str(tmp_path / "none.yaml")).github_token == ""   # nothing GitHub is required
+    monkeypatch.delenv("GITHUB_APP_PRIVATE_KEY_PATH", raising=False)
     monkeypatch.setenv("GITHUB_APP_ID", "123")
-    with pytest.raises(RuntimeError, match="both"):
-        load_settings(str(tmp_path / "none.yaml"))
+    s = load_settings(str(tmp_path / "none.yaml"))
+    assert s.github_app_private_key_path == "/app/secrets/github-app.pem"
+    with pytest.raises(RuntimeError, match="Can't read GITHUB_APP_PRIVATE_KEY_PATH"):
+        github_auth_for(s)
 
 
 def test_saved_credentials_are_private(keypair, tmp_path):

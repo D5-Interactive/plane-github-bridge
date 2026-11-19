@@ -10,8 +10,9 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - bridge-data:/data
-      # Only for your own GitHub App (README step 5B):
-      # - ./github-app.pem:/app/github-app.pem:ro
+      # Your own GitHub App's private key goes in ./secrets (README step 5B).
+      # Empty or missing is fine for every other setup.
+      - ./secrets:/app/secrets:ro
 
 volumes:
   bridge-data:
