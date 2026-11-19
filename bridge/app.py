@@ -7,6 +7,8 @@ import os
 import threading
 from contextlib import asynccontextmanager
 
+import anyio
+
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
 from .clients import GitHubClient, PlaneClient
@@ -28,7 +30,9 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
                                     rate_limit=s.plane_rate_limit),
                         GitHubClient(s.github_token))
     settings = bridge.s
-    state = {"plane_problem": None}
+    # plane_problem: why Plane's API isn't usable, or None. temporary: a rate limit or
+    # outage (the sync runs anyway and clears it), as opposed to a setup mistake.
+    state = {"plane_problem": None, "temporary": False}
 
     stop = threading.Event()
 
@@ -38,6 +42,9 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
                 result = bridge.sync_linked_modules()
                 if result != "nothing new":
                     log.info("sync: %s", result)
+                if state["temporary"] and not result.startswith("stopped"):
+                    log.info("Plane's API is answering again")
+                    state["plane_problem"], state["temporary"] = None, False
             except Exception:
                 log.exception("sync failed")
             if stop.wait(settings.sync_interval):
@@ -56,13 +63,19 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app):
-        state["plane_problem"] = bridge.plane.check_workspace()
-        if state["plane_problem"]:
-            log.error("PLANE SETUP PROBLEM: %s", state["plane_problem"])
+        # One attempt, in a worker thread: a rate-limited Plane must not hold up startup.
+        problem, setup_problem = await anyio.to_thread.run_sync(bridge.plane.workspace_status)
+        state["temporary"] = bool(problem) and not setup_problem
+        state["plane_problem"] = f"temporary: {problem}" if state["temporary"] else problem
+        if problem and setup_problem:
+            log.error("PLANE SETUP PROBLEM: %s", problem)
+        elif problem:
+            log.warning("Plane isn't answering normally at startup (%s); starting the catch-up "
+                        "sync anyway, it will retry", problem)
         else:
             log.info("Plane workspace '%s' is reachable", settings.plane_workspace)
         prepare_store()
-        if settings.sync_interval > 0 and not state["plane_problem"]:
+        if settings.sync_interval > 0 and not (problem and setup_problem):
             threading.Thread(target=sync_loop, name="module-sync", daemon=True).start()
             log.info("catch-up sync of linked modules every %ss", settings.sync_interval)
         yield
@@ -87,6 +100,8 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
                "plane_api_ok": state["plane_problem"] is None}
         if state["plane_problem"]:
             out["plane_problem"] = state["plane_problem"]
+            if state["temporary"]:
+                out["plane_problem_temporary"] = True
         return out
 
     @app.post("/plane/webhook", status_code=202)

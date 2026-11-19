@@ -63,16 +63,28 @@ class Pacer:
         self._next = 0.0
         self._hold_until = 0.0      # after a 429: nobody sends before this
 
-    def hold(self, seconds: float) -> None:
+    def hold(self, seconds: float) -> float:
         """After a 429, make every caller wait until the server's window has passed,
-        not just the thread that got it."""
+        not just the thread that got it. Returns the end of this hold."""
         with self._lock:
-            self._hold_until = max(self._hold_until, self.clock() + seconds)
+            until = self.clock() + seconds
+            self._hold_until = max(self._hold_until, until)
+            return until
 
-    def wait(self, honor_hold: bool = True) -> float:
+    def wait(self, honor_hold: bool = True, own_hold: float | None = None) -> float:
+        """Wait for this caller's slot.
+
+        own_hold: the end of a hold this caller set and has already slept through.
+        It still waits for any longer hold another thread set since.
+        """
         with self._lock:
             now = self.clock()
-            start = max(now, self._hold_until) if honor_hold else now
+            if not honor_hold:
+                start = now
+            elif own_hold is not None and self._hold_until <= own_hold:
+                start = now
+            else:
+                start = max(now, self._hold_until)
             if self.interval:
                 start = max(start, self._next)
                 self._next = start + self.interval
@@ -95,6 +107,16 @@ def _check(r: httpx.Response) -> None:
                       r.text.strip().replace("\n", " ")[:500] or "(no body)")
         raise httpx.HTTPStatusError(f"{r.status_code} from {r.request.method} {r.request.url.path}",
                                     request=r.request, response=r)
+
+
+def plane_not_found(r: httpx.Response) -> bool:
+    """A 404 that came from Plane's API (a JSON error body), not from a proxy in front of it."""
+    if r.status_code != 404:
+        return False
+    try:
+        return isinstance(r.json(), dict)
+    except ValueError:
+        return False
 
 
 def _results(data):
@@ -136,11 +158,15 @@ class PlaneClient:
         and the caller (for example the catch-up sync) can stop for now. Retrying a
         write is safe: Plane rejected it without doing anything.
         """
-        honor_hold = True
+        own_hold = None
         for attempt in range(self.max_retries + 1):
-            self.pacer.wait(honor_hold=honor_hold)
+            self.pacer.wait(own_hold=own_hold)
             r = self.http.request(method, path, **kwargs)
-            if r.status_code != 429 or attempt == self.max_retries:
+            if r.status_code != 429:
+                return r
+            if attempt == self.max_retries:
+                # Giving up, but the window is still closed: hold the others too.
+                self.pacer.hold(retry_after(r))
                 return r
             wait = server_wait(r)
             if wait > MAX_WAIT:
@@ -151,9 +177,8 @@ class PlaneClient:
                 return r
             log.warning("Plane rate limit: %s %s answered 429; waiting %.0fs (retry %d of %d)",
                         method, r.request.url.path, wait, attempt + 1, self.max_retries)
-            self.pacer.hold(wait)        # other threads wait out the same window
-            self.sleep(wait)
-            honor_hold = False           # this thread already waited it out
+            own_hold = self.pacer.hold(wait)   # other threads wait out the same window
+            self.sleep(wait)                   # this thread waits it out here, once
         return r  # not reached
 
     def _get(self, path: str, **params):
@@ -173,20 +198,51 @@ class PlaneClient:
                 break
         return out
 
-    def check_workspace(self) -> str | None:
-        """None if the API key can see the workspace; otherwise a message saying why not."""
+    def workspace_status(self) -> tuple[str | None, bool]:
+        """Check, once, that the API key can see the workspace: (problem, setup_problem).
+
+        problem is None when all is well. setup_problem is True for mistakes in the
+        configuration (wrong key or slug), which a retry won't fix, and False for
+        temporary trouble (rate limit, Plane down or unreachable). One attempt only:
+        this runs at startup, so it must not sit out rate-limit retries.
+        """
         try:
-            r = self._request("GET", "/projects/", params={"per_page": 1})
+            self.pacer.wait()
+            r = self.http.request("GET", "/projects/", params={"per_page": 1})
         except httpx.HTTPError as e:
-            return f"can't reach Plane's API ({e}); check PLANE_BASE_URL"
-        if r.status_code in (401,):
-            return "Plane rejected PLANE_API_KEY (401); check the token"
+            return (f"can't reach Plane's API ({type(e).__name__}); check PLANE_BASE_URL "
+                    f"if this lasts", False)
+        if r.status_code == 401:
+            return "Plane rejected PLANE_API_KEY (401); check the token", True
         if r.status_code in (403, 404):
             return (f"Plane refused workspace '{self.ws}' ({r.status_code}). PLANE_WORKSPACE must match "
-                    f"the slug in your Plane URL: https://<plane>/<slug>/projects/...")
+                    f"the slug in your Plane URL: https://<plane>/<slug>/projects/...", True)
+        if r.status_code == 429:
+            self.pacer.hold(retry_after(r))
+            return "Plane is rate-limiting this API key (429)", False
+        if r.status_code >= 500:
+            return f"Plane's API answered {r.status_code}", False
         if r.is_error:
-            return f"Plane's API answered {r.status_code} for workspace '{self.ws}'"
-        return None
+            return f"Plane's API answered {r.status_code} for workspace '{self.ws}'", True
+        return None, False
+
+    def check_workspace(self) -> str | None:
+        """None if the API key can see the workspace; otherwise a message saying why not."""
+        return self.workspace_status()[0]
+
+    def item_gone(self, project_id: str, item_id: str) -> bool:
+        """True only if Plane itself says the work item doesn't exist.
+
+        A 404 from a proxy (an HTML page while Plane restarts) doesn't count; nor
+        does any other answer. Rate limits and other errors raise as usual.
+        """
+        r = self._request("GET", f"/projects/{project_id}/issues/{item_id}/")
+        if plane_not_found(r):
+            return True
+        if r.status_code == 404:
+            return False
+        _check(r)
+        return False
 
     def projects(self) -> list[dict]:
         return self._paged("/projects/")
@@ -316,6 +372,8 @@ class GitHubClient:
     def get_repo(self, repo: str) -> dict | None:
         """Repo metadata (name, description, html_url), or None if the token can't see it."""
         r = self._request("GET", f"/repos/{repo}")
+        if _github_rate_limited(r):
+            _check(r)           # a rate limit isn't "can't see the repo": raise, so the pass stops
         if r.status_code in (403, 404):
             return None
         _check(r)

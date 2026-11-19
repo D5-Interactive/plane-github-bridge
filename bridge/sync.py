@@ -28,13 +28,14 @@ GitHub -> Plane: activity (posted as comments on the work item, each once)
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections import defaultdict
 
 import httpx
 
-from .clients import GitHubClient, PlaneClient, _github_rate_limited
+from .clients import GitHubClient, PlaneClient, _github_rate_limited, plane_not_found
 from .config import Settings
 from .render import (branch_issue_number, closing_refs, esc, github_repo_in, issue_body,
                      mention_refs, normalize_plane_event, plain_text, plane_html_to_markdown,
@@ -60,6 +61,10 @@ PERMANENT_RETRY_SECONDS = 6 * 3600
 LINK_REPAIRS_PER_PASS = 10
 
 
+# GET .../issues/<id>/ : reading one work item (not its links or comments).
+_WORK_ITEM_PATH = re.compile(r"/issues/[^/]+/$")
+
+
 class _StopPass(Exception):
     """End this catch-up pass and let the next one resume.
 
@@ -76,6 +81,7 @@ def _failure_kind(e: Exception) -> str:
     "rate"      a rate limit: stop the pass, the next one resumes
     "auth"      a key or token was rejected (401): stop the pass, log once
     "permanent" GitHub refused this item for a lasting reason: park it
+    "gone"      Plane itself says the work item doesn't exist: park it
     "transient" anything else: retry next pass
     """
     if isinstance(e, httpx.HTTPStatusError):
@@ -84,6 +90,9 @@ def _failure_kind(e: Exception) -> str:
             return "rate"
         if status == 401:
             return "auth"
+        if (not host.endswith("github.com") and e.request.method == "GET"
+                and _WORK_ITEM_PATH.search(e.request.url.path) and plane_not_found(e.response)):
+            return "gone"
         if host.endswith("github.com"):
             if _github_rate_limited(e.response):
                 return "rate"
@@ -383,7 +392,13 @@ class Bridge:
                 kind = _failure_kind(e)
                 failed += 1
                 reason = _short_reason(e)
-                if kind == "permanent":
+                if kind == "gone":
+                    # Listed in the module but deleted (or unreadable) in Plane: don't
+                    # read it every pass. Editing it, or a restart, tries again.
+                    self.store.record_failure(item_id, repo, reason, now)
+                    log.warning("sync: %s item %s is listed in a module but Plane says it doesn't "
+                                "exist; parked for %dh", ident, item_id, PERMANENT_RETRY_SECONDS // 3600)
+                elif kind == "permanent":
                     self.store.record_failure(item_id, repo, reason, now)
                     if repo.lower() not in logged_repos:     # one line per repo per pass
                         logged_repos.add(repo.lower())
@@ -408,9 +423,10 @@ class Bridge:
             except Exception as e:
                 _stop_if_pass_ending(e)
                 status = e.response.status_code if isinstance(e, httpx.HTTPStatusError) else None
-                if status == 404:
-                    # The work item is gone (deleted, or its project is no longer readable):
-                    # stop trying instead of spending a call on it every pass.
+                if status == 404 and self._confirm_gone(link):
+                    # Plane says the work item doesn't exist: stop trying instead of
+                    # spending a call on it every pass. A 404 from anything else (a proxy
+                    # page while Plane restarts) is temporary, and the row stays queued.
                     self.store.mark_plane_linked(link.plane_item_id)
                     log.warning("sync: work item %s is gone from Plane; not adding the link for %s#%s",
                                 link.plane_item_id, link.repo, link.issue_number)
@@ -421,6 +437,14 @@ class Bridge:
             self.store.mark_plane_linked(link.plane_item_id)
             repaired += 1
         return repaired
+
+    def _confirm_gone(self, link: Link) -> bool:
+        """After a 404 adding a link: is the work item really deleted? Asks Plane directly."""
+        try:
+            return self.plane.item_gone(link.plane_project_id, link.plane_item_id)
+        except Exception as e:
+            _stop_if_pass_ending(e)
+            return False
 
     def _maybe_create_issue(self, project_id: str, item_id: str, repo: str | None = None) -> str:
         """Create the item's issue. repo: already known (catch-up sync), so skip the module lookup."""

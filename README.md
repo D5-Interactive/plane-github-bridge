@@ -249,7 +249,11 @@ You should see:
 `mappings` counts admin overrides in `config.yaml`, so `0` is normal.
 `plane_api_ok` is checked once at startup: `false` comes with a
 `plane_problem` message saying what's wrong (usually the workspace slug or the
-API token). `plane_webhook_ready`
+API token). A setup mistake like that keeps the catch-up sync off until you fix
+it and restart. Temporary trouble (Plane rate-limiting the key, answering 5xx,
+or unreachable) is shown as `"plane_problem": "temporary: ..."` with
+`"plane_problem_temporary": true`; the catch-up sync starts anyway and clears it
+after its first pass that gets through. `plane_webhook_ready`
 stays `false` until step 6. The log also warns that `PLANE_WEBHOOK_SECRET` is not
 set; that's expected for now.
 
@@ -526,7 +530,8 @@ When something goes wrong:
 | Any other error (Plane errors other than 429 and 401, GitHub 5xx, timeouts, network) | Retries the item next pass |
 | Plane or GitHub rate-limits the bridge (429, or GitHub's secondary rate limit), anywhere in the pass | Stops the pass at once instead of hammering the API; the next pass picks up where it left off |
 | Plane or GitHub rejects the key or token (401) | Stops the pass with one log line; nothing is parked, so fixing the credential and waiting a pass is enough |
-| The issue was created but adding its link to the Plane item failed | The link is recorded as missing and added by a later pass, so the issue is never created twice. If the work item has since been deleted (Plane answers 404), the bridge stops trying |
+| The issue was created but adding its link to the Plane item failed | The link is recorded as missing and added by a later pass, so the issue is never created twice. If adding it answers 404, the bridge asks Plane for the work item itself, and stops trying only if Plane says it doesn't exist. A 404 page from a proxy (while Plane restarts) counts as temporary |
+| An item is listed in a linked module but Plane says it doesn't exist | Parks it like a lasting refusal (6 hours, or until it's edited or the bridge restarts), so it isn't read every pass |
 
 The log gets one summary line per pass, and only when the pass did something.
 
@@ -686,20 +691,36 @@ or rebuilt. Rows that existed before the upgrade count as linked in Plane.
 **Rolling back** to a version from before these columns existed is **not
 safe** as it is: the older code saves links with five values, the table now has
 seven columns, and every save fails *after* the GitHub issue was created, so
-each event makes another duplicate issue. If you must roll back, stop the
-bridge, back up the database, and remove the new columns first (SQLite 3.35 or
-newer):
+each event makes another duplicate issue. If you must roll back, run these steps
+from a checkout of **this** version, before switching, so the image is the one
+that knows the new columns:
 
-```bash
-docker compose stop bridge
-docker run --rm -v plane-github-bridge_bridge-data:/data alpine sh -c \
-  'apk add --no-cache sqlite >/dev/null && cp /data/bridge.db /data/bridge.db.bak && \
-   sqlite3 /data/bridge.db "ALTER TABLE links DROP COLUMN last_link_attempt; \
-     ALTER TABLE links DROP COLUMN plane_linked; DROP TABLE IF EXISTS sync_failures;"'
-```
+1. **Let pending link repairs finish.** Dropping the columns makes every row
+   look linked, so a link still waiting to be added would never be. This
+   prints how many are waiting; go on when it says `0`:
 
-Then check out the older version and start it as usual. The volume name is
-`<folder>_bridge-data`; `docker volume ls` shows yours.
+   ```bash
+   docker compose run --rm bridge python -c \
+     "import sqlite3; print(sqlite3.connect('/data/bridge.db').execute('SELECT COUNT(*) FROM links WHERE plane_linked = 0').fetchone()[0])"
+   ```
+
+2. **Stop the bridge, back up the database and remove the new columns.** This
+   uses the bridge's own image (its Python includes SQLite), so it needs no
+   internet access. The backup is `bridge.db.bak` in the same volume:
+
+   ```bash
+   docker compose stop bridge
+   docker compose run --rm bridge python -c "
+   import shutil, sqlite3
+   shutil.copy('/data/bridge.db', '/data/bridge.db.bak')
+   db = sqlite3.connect('/data/bridge.db')
+   db.execute('ALTER TABLE links DROP COLUMN last_link_attempt')
+   db.execute('ALTER TABLE links DROP COLUMN plane_linked')
+   db.execute('DROP TABLE IF EXISTS sync_failures')
+   db.commit()"
+   ```
+
+3. Check out the older version and start it as usual.
 
 **Re-checking issue links.** Links lost before this version (when a pass died
 between creating the issue and adding its link) aren't known to the database.
@@ -752,6 +773,9 @@ and recreate the container again, or the next restart re-checks everything.
 | `... failed` followed by a traceback | Something errored; the event is skipped and the bridge keeps running |
 | `WARNING PLANE_WEBHOOK_SECRET is not set` | Expected until setup step 6 is done |
 | `PLANE SETUP PROBLEM: Plane refused workspace '...'` | `PLANE_WORKSPACE` doesn't match the slug in your Plane URL |
+| `Plane isn't answering normally at startup (...); starting the catch-up sync anyway` | Plane was rate-limiting, down or unreachable at startup; the sync retries every pass |
+| `Plane's API is answering again` | The temporary startup problem cleared; `/health` shows `plane_api_ok: true` again |
+| `sync: API item ... is listed in a module but Plane says it doesn't exist; parked for 6h` | A deleted work item is still in a module's list; harmless |
 | `... -> 403: You do not have permission to perform this action.` | The token's account isn't a member of that project, or the slug is wrong |
 | `Plane rate limit: GET /... answered 429; waiting 10s (retry 1 of 3)` | Plane's per-key limit was hit; the bridge waits and retries. If it's frequent, lower `PLANE_RATE_LIMIT` |
 | `GitHub rate limit: POST /repos/... answered 403; waiting 60s and retrying once` | GitHub's secondary rate limit, usually from creating many issues quickly; harmless |
@@ -775,10 +799,17 @@ bridge keeps itself under the limit and recovers when it hits it anyway:
 - **Backoff.** A request answered `429` waits as long as Plane's `Retry-After`
   (or `X-RateLimit-Reset`) header says, at most 60 seconds, then is sent again,
   up to 3 times. Every other request waits out the same window, so one 429
-  doesn't turn into many. If Plane asks for more than 60 seconds, the bridge
-  doesn't wait at all and fails the request at once. A failed request is
+  doesn't turn into many. If Plane asks for more than 60 seconds, the request
+  that got the 429 fails at once instead of sleeping, and every other Plane
+  call is held for 60 seconds. When a request gives up after its last retry,
+  the others are still held for its window. A failed request is
   logged; the catch-up sync retries missing issues and links on its next pass,
   but a webhook's edit or state change isn't replayed (edit the item again).
+
+**At startup** the bridge checks Plane once, with no retries, so a
+rate-limited Plane can't hold up startup. A 429, a 5xx or an unreachable Plane
+is logged as a warning and shown as temporary in `/health`, and the catch-up
+sync starts anyway; a wrong key or workspace slug keeps it off.
 
 **GitHub's rate limits.** A `429`, or a `403` that is GitHub's secondary rate
 limit, is retried once after the wait GitHub asks for, if that's 60 seconds or

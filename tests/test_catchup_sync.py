@@ -25,10 +25,12 @@ class Plane:
         self.calls: Counter = Counter()
         self.links: list[tuple[str, str]] = []
         self.fail_link_for: set[str] = set()     # add_link answers 500 for these items
-        self.gone: set[str] = set()              # add_link answers 404 (item deleted)
+        self.gone: set[str] = set()              # deleted: Plane answers 404 (JSON) for the item and its links
+        self.proxy_404: set[str] = set()         # a proxy answers 404 (HTML page) for these, as while Plane restarts
         self.already_linked: set[str] = set()    # add_link answers Plane's duplicate-URL 400
         self.module_patch_status: int | None = None
         self.rate_limited_after: int | None = None  # answer 429 once this many calls were made
+        self.projects_status: int | None = None     # answer this status for the project list
         self.total = 0
 
     def handler(self, req: httpx.Request) -> httpx.Response:
@@ -38,6 +40,8 @@ class Plane:
             return httpx.Response(429, json={"error_code": 5900, "error_message": "RATE_LIMIT_EXCEEDED"})
         key = re.sub(r"/[0-9a-z-]+-\d+/|/item-[^/]+/|/mod-[^/]+/", "/*/", p)
         self.calls[(req.method, key)] += 1
+        if req.method == "GET" and p == "/projects/" and self.projects_status:
+            return httpx.Response(self.projects_status, json={"detail": "nope"})
         if req.method == "GET" and p == "/projects/":
             return httpx.Response(200, json={"results": [{"id": PROJ, "identifier": "API"}]})
         if req.method == "GET" and p == f"/projects/{PROJ}/":
@@ -58,6 +62,10 @@ class Plane:
             return httpx.Response(200, json={})
         m = re.fullmatch(rf"/projects/{PROJ}/issues/([^/]+)/", p)
         if m and req.method == "GET":
+            if m.group(1) in self.gone:
+                return httpx.Response(404, json={"error": "Issue does not exist"})
+            if m.group(1) in self.proxy_404:
+                return httpx.Response(404, text="<html><body>404 Not Found</body></html>")
             n = int(m.group(1).rsplit("-", 1)[1])
             return httpx.Response(200, json={"id": m.group(1), "name": f"Item {n}", "sequence_id": n,
                                              "description_html": "<p>x</p>"})
@@ -67,6 +75,8 @@ class Plane:
                 return httpx.Response(500, json={"error": "boom"})
             if m.group(1) in self.gone:
                 return httpx.Response(404, json={"error": "Issue does not exist"})
+            if m.group(1) in self.proxy_404:
+                return httpx.Response(404, text="<html><body>404 Not Found</body></html>")
             if m.group(1) in self.already_linked:
                 return httpx.Response(400, json={"error": "URL already exists for this Issue"})
             self.links.append((m.group(1), json.loads(req.content)["url"]))
@@ -80,11 +90,15 @@ class GitHub:
         self.refuse: dict[str, int] = {}     # repo -> status for issue creation
         self.refuse_headers: dict[str, str] = {}
         self.refuse_message = "Issues are disabled for this repo"
+        self.repo_status: int | None = None  # answer this status for repo metadata
+        self.repo_message = "Not Found"
 
     def handler(self, req: httpx.Request) -> httpx.Response:
         m = re.fullmatch(r"/repos/([^/]+/[^/]+)", req.url.path)
         if m and req.method == "GET":
             repo = m.group(1)
+            if self.repo_status:
+                return httpx.Response(self.repo_status, json={"message": self.repo_message})
             return httpx.Response(200, json={"full_name": repo, "name": repo.split("/")[1],
                                              "html_url": f"https://github.com/{repo}",
                                              "description": "", "created_at": "2026-01-01T00:00:00Z"})
