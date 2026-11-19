@@ -157,14 +157,14 @@ def test_queued_entries_without_credentials_back_off_without_reading_plane(env):
     app = FakeApp(missing=["acme"])
     no_creds(bridge, app)
     assert bridge.handle_plane(created()) == "queued: no GitHub credentials for this repo yet"
-    assert bridge.queue.get("create_issue", "item-1").payload["repo"] == REPO
+    assert bridge.queue.get("create_issue", "item-1").payload["cred_repo"] == REPO
     plane_reads = world.calls[("plane", "GET")]
     bridge.queue.max_age = 10_000                  # keep the stuck flag (Plane label calls) out of the count
-    for _ in range(5):
-        run_queue_after(bridge, clock, 130)        # every retry falls due
+    for _ in range(4):
+        run_queue_after(bridge, clock, 130)        # every retry falls due (within 10 minutes)
     assert world.calls[("plane", "GET")] == plane_reads     # no Plane calls while it can't sign
     entry = bridge.queue.get("create_issue", "item-1")
-    assert entry.attempts == 5 and entry.next_at > clock.t
+    assert entry.attempts == 4 and entry.next_at > clock.t
     # The app is installed on acme: the installation event makes the entry due now
     app.missing.clear()
     app.tokens["acme"] = "A"
@@ -190,3 +190,63 @@ def test_stuck_label_isnt_retried_against_github_without_credentials(env):
     no_creds(bridge, FakeApp({"acme": "A"}))       # credentials arrive
     bridge.diag.reflag_pending()
     assert "plane-sync-problem" in world.issues[1]["labels"]
+
+
+def _queue_for_repo_a(bridge, world, monkeypatch):
+    world.add_item(1)
+    where = {"repo": "other/api"}
+    monkeypatch.setattr(bridge, "_repo_for", lambda pid, item: where["repo"])
+    no_creds(bridge, FakeApp({"acme": "A"}, missing=["other", "third"]))
+    assert bridge.handle_plane(created()).startswith("queued: no GitHub credentials")
+    entry = bridge.queue.get("create_issue", "item-1")
+    assert entry.payload["cred_repo"] == "other/api" and "repo" not in entry.payload
+    return where
+
+
+def _watch_github(bridge, world):
+    paths = []
+    orig = world.github
+
+    def github(req):
+        paths.append(req.url.path)
+        return orig(req)
+    bridge.gh.http._transport = httpx.MockTransport(github)
+    return paths
+
+
+def test_item_moved_while_queued_gets_its_issue_in_the_new_repo(env, monkeypatch):
+    """Queued with no credentials for repo A, then moved to a module for repo B
+    (which has credentials): the issue is made in B, nothing in A. The retry backs
+    off on A without Plane reads, and re-resolves the item's repo every 10 minutes."""
+    bridge, world, clock = env
+    where = _queue_for_repo_a(bridge, world, monkeypatch)
+    paths = _watch_github(bridge, world)
+    where["repo"] = REPO                                   # moved to the acme/api module
+    run_queue_after(bridge, clock, 6)
+    assert bridge.queue.get("create_issue", "item-1").attempts == 1 and not world.issues
+    clock.t += 601                                         # time to look the repo up again
+    bridge.run_queue()
+    assert bridge.queue.get("create_issue", "item-1") is None
+    assert bridge.store.by_plane_item("item-1").repo == REPO and len(world.issues) == 1
+    assert not any("/other/" in p for p in paths)
+
+
+def test_membership_pass_notices_a_queued_item_moved_to_another_repo(env, monkeypatch):
+    bridge, world, clock = env
+    _queue_for_repo_a(bridge, world, monkeypatch)
+    monkeypatch.undo()                                     # the real module lookup: acme/api
+    no_creds(bridge, FakeApp({"acme": "A"}, missing=["other"]))
+    paths = _watch_github(bridge, world)
+    assert bridge.sync_linked_modules() == f"created {REPO}#1"
+    run_queue_after(bridge, clock, 601)                    # the queued entry finds it, adds nothing
+    assert len(world.issues) == 1 and bridge.queue.stats()["length"] == 0
+    assert not any("/other/" in p for p in paths)
+
+
+def test_moved_to_another_repo_without_credentials_updates_the_check(env, monkeypatch):
+    bridge, world, clock = env
+    where = _queue_for_repo_a(bridge, world, monkeypatch)
+    where["repo"] = "third/api"
+    run_queue_after(bridge, clock, 601)
+    entry = bridge.queue.get("create_issue", "item-1")
+    assert entry.payload["cred_repo"] == "third/api" and not world.issues

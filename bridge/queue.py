@@ -118,8 +118,10 @@ class RetryQueue:
         prefix = owner.lower() + "/"
         with self.store._lock:
             cur = self.store._db.execute(
-                "UPDATE retry_queue SET next_at = ? WHERE substr(lower(json_extract(payload, '$.repo')), 1, ?) = ?",
-                (self.clock(), len(prefix), prefix))
+                "UPDATE retry_queue SET next_at = ? WHERE "
+                "substr(lower(json_extract(payload, '$.repo')), 1, ?) = ? OR "
+                "substr(lower(json_extract(payload, '$.cred_repo')), 1, ?) = ?",
+                (self.clock(), len(prefix), prefix, len(prefix), prefix))
             self.store._db.commit()
             return cur.rowcount
 

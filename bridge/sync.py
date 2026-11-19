@@ -76,6 +76,10 @@ ECHO_WINDOW = 600
 # Debounced checks list issues changed since the last check, minus this margin
 # for clock differences.
 SINCE_SKEW = 120
+# A queued action whose repo has no credentials re-resolves the item's repo (in
+# case it moved to another module) at most this often; between, it backs off
+# without reading Plane.
+RESOLVE_AGAIN_SECONDS = 600
 
 
 # GET .../issues/<id>/ : reading one work item (not its links or comments).
@@ -464,8 +468,11 @@ class Bridge:
             if self.store.by_plane_item(item_id):
                 continue
             queued = self.queue.get("create_issue", item_id)
-            if queued and queued.next_at > now:
+            moved = queued is not None and (queued.payload.get("cred_repo") or repo).lower() != repo.lower()
+            if queued and queued.next_at > now and not moved:
                 continue        # waiting in the retry queue, which will run it when it's due
+            # (moved: it waits for credentials for its old repo, but its module now links
+            # another repo; this pass creates it there, and the queued entry then finds it.)
             past = self.store.failure(item_id)
             if past and past[0].lower() == repo.lower() and now - past[2] < PERMANENT_RETRY_SECONDS:
                 continue        # parked for this repo; a different repo means the module was relinked
@@ -741,8 +748,10 @@ class Bridge:
 
     def _action_failed(self, kind: str, key: str, payload: dict, e: Exception) -> str:
         fk, reason = _failure_kind(e), _short_reason(e)
-        if getattr(e, "repo", None) and not payload.get("repo"):
-            payload = {**payload, "repo": e.repo}      # lets the retry check credentials cheaply
+        if getattr(e, "repo", None):
+            # Only for the retry's cheap credentials check; the action itself
+            # re-resolves the item's repo when it runs.
+            payload = {**payload, "cred_repo": e.repo, "resolved_at": self.clock()}
         if fk in ("permanent", "gone"):
             self._refused(kind, payload, fk, reason)
             return f"refused: {reason}"
@@ -796,8 +805,9 @@ class Bridge:
                     try:
                         self.handlers[kind](payload)
                     except Exception as e:
-                        if getattr(e, "repo", None) and not payload.get("repo"):
-                            self.queue.set_payload_field(kind, payload.get("_key", ""), "repo", e.repo)
+                        if getattr(e, "repo", None) and e.repo != payload.get("cred_repo"):
+                            # The item's repo (re-resolved just now) has no credentials either.
+                            self.queue.set_payload_field(kind, payload.get("_key", ""), "cred_repo", e.repo)
                         fk = _failure_kind(e)
                         if fk not in ("permanent", "gone"):
                             raise
@@ -826,10 +836,14 @@ class Bridge:
         """Before a queued GitHub-bound action re-reads anything from Plane: if nothing
         can sign for the repo's owner right now (known cheaply, no network), fail it
         straight away so it backs off, instead of spending Plane calls each retry."""
-        repo = payload.get("repo") or ""
+        repo = payload.get("cred_repo") or payload.get("repo") or ""
         can_sign = getattr(getattr(self.gh, "auth", None), "can_sign", None)
         if kind in self._GITHUB_BOUND and "/" in repo and can_sign and not can_sign(repo.split("/", 1)[0]):
-            raise NoGitHubCredentials(f"no GitHub credentials for {repo.split('/', 1)[0]} yet")
+            if self.clock() - (payload.get("resolved_at") or 0) < RESOLVE_AGAIN_SECONDS:
+                raise NoGitHubCredentials(f"no GitHub credentials for {repo.split('/', 1)[0]} yet")
+            # Now and then, run it fully anyway: the item may have moved to a module
+            # whose repo does have credentials (the membership pass also notices that).
+            self.queue.set_payload_field(kind, payload.get("_key", ""), "resolved_at", self.clock())
 
     def github_account_changed(self, owner: str) -> int:
         """An installation changed on a GitHub account: forget cached answers and make
@@ -854,7 +868,10 @@ class Bridge:
         if not p.get("_retry") and self.queue.get("create_issue", p["item_id"]) is not None:
             # An earlier attempt is waiting in the queue: it finds or makes the issue.
             return "queued: already waiting to be created"
-        return self._maybe_create_issue(p["project_id"], p["item_id"], repo=p.get("repo"))
+        # A retry looks the item's module up again: it may have moved to another repo
+        # while it waited.
+        return self._maybe_create_issue(p["project_id"], p["item_id"],
+                                        repo=None if p.get("_retry") else p.get("repo"))
 
     def _act_push_edit(self, p: dict) -> str:
         link = self.store.by_plane_item(p["item_id"])
