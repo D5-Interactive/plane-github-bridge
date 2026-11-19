@@ -480,9 +480,9 @@ def test_no_credentials_at_all_fails_fast():
         gh.get_repo("acme/one")
 
 
-def test_the_sync_treats_missing_credentials_as_temporary():
+def test_the_sync_has_its_own_kind_for_missing_credentials():
     from bridge.sync import _failure_kind
-    assert _failure_kind(NoGitHubCredentials("x")) == "transient"
+    assert _failure_kind(NoGitHubCredentials("x")) == "no_credentials"   # skipped, never parked
 
 
 def test_github_unreachable_during_minting_falls_back(keypair):
@@ -1263,3 +1263,23 @@ def test_missing_credentials_on_a_webhook_log_one_line(bare, keypair, caplog):
     hits = [r for r in caplog.records if "NoGitHubCredentials" in r.getMessage() or "skipped" in r.getMessage()]
     assert len(hits) == 1 and hits[0].levelno == logging.WARNING and hits[0].exc_info is None
     assert "isn't installed on acme" in hits[0].getMessage()
+
+
+@pytest.mark.parametrize("path", ["/bridge/setup?token=abc", "/bridge/setup/callback?code=abc&state=x",
+                                  "/setup?token=abc"])
+def test_setup_query_strings_are_hidden_under_a_root_path(path):
+    import logging
+    from bridge.app import _HideSetupQuery
+    rec = logging.LogRecord("uvicorn.access", logging.INFO, "", 0, '%s - "%s %s HTTP/%s" %d',
+                            ("1.2.3.4:5", "GET", path, "1.1", 200), None)
+    _HideSetupQuery().filter(rec)
+    assert "abc" not in rec.getMessage() and path.split("?")[0] + "?..." in rec.getMessage()
+
+
+def test_paths_merely_containing_setup_keep_their_query():
+    import logging
+    from bridge.app import _HideSetupQuery
+    rec = logging.LogRecord("uvicorn.access", logging.INFO, "", 0, "%s %s %s",
+                            ("c", "GET", "/setupx?keep=1"), None)
+    _HideSetupQuery().filter(rec)
+    assert "keep=1" in rec.getMessage()

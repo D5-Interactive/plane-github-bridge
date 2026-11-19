@@ -519,7 +519,8 @@ message, as `github_problem`):
 The startup check of the app runs in the background, so GitHub being slow or
 down never delays startup, and a failed check is retried every few minutes.
 Without `GITHUB_TOKEN`, a request the app can't sign right now isn't sent at
-all; the catch-up sync tries the item again next pass instead of parking it.
+all; the catch-up sync skips that repo for the rest of the pass (one log line,
+no Plane reads for its items) and tries again next pass instead of parking it.
 When an installation event arrives (the app installed, or repos added to it),
 items parked for that account's repos are tried again on the next pass.
 
@@ -991,7 +992,7 @@ and recreate the container again, or the next restart re-checks everything.
 | `GITHUB APP PROBLEM: the app's private key can't be used to sign requests` | The saved or configured key is damaged; calls use `GITHUB_TOKEN` meanwhile. Replace the key |
 | `GITHUB APP PROBLEM: GitHub answered 403 ("This installation has been suspended") ...` | GitHub refuses the app on that account; only that account falls back to `GITHUB_TOKEN`. Unsuspend or reinstall the app there |
 | `GITHUB APP PROBLEM: ... isn't JSON ...` | Something between the bridge and GitHub (a proxy) answered instead of GitHub |
-| `sync: ... failed, retrying next pass (NoGitHubCredentials)` | No app token for that repo right now and no `GITHUB_TOKEN` to fall back to; nothing was sent. See `github_problem` in `/health` |
+| `sync: skipping owner/repo for this pass: not sending ...` | No app token for that repo right now and no `GITHUB_TOKEN` to fall back to; nothing was sent and the repo's items aren't read from Plane this pass. They aren't parked: they sync once the app is installed there or a token is set. See `github_problem` in `/health` |
 | `sync: GitHub App installation changed on owner; cleared N parked item(s)` | Items parked for that account's repos are tried again next pass |
 | `GITHUB APP PROBLEM: ...` (any other reason) | The app can't be used right now; calls fall back to `GITHUB_TOKEN` if set. Shown live in `/health` as `github_problem` |
 | `GitHub App working again` | The problem above cleared itself |

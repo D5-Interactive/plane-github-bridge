@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 from contextlib import asynccontextmanager
 
@@ -30,15 +31,20 @@ if logging.getLogger().getEffectiveLevel() > logging.DEBUG:
         logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 
+_SETUP_SEGMENT = re.compile(r"(^|/)setup(/|$)")
+
+
 class _HideSetupQuery(logging.Filter):
     """Keep /setup's query strings (the setup token, GitHub's one-time code) out of
     uvicorn's access log. uvicorn's access records carry the path as args[2]."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
-        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str) \
-                and args[2].startswith("/setup") and "?" in args[2]:
-            record.args = args[:2] + (args[2].split("?", 1)[0] + "?...",) + args[3:]
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+            path, sep, _query = args[2].partition("?")
+            # Any "/setup" path segment, so a root_path prefix ("/bridge/setup") is covered too.
+            if sep and _SETUP_SEGMENT.search(path):
+                record.args = args[:2] + (path + "?...",) + args[3:]
         return True
 
 
