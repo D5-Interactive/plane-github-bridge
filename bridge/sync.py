@@ -36,13 +36,15 @@ from collections import defaultdict
 
 import httpx
 
-from . import guards
-from .clients import (LANE_BACKGROUND, GitHubClient, PlaneClient, _github_rate_limited, lane,
+from . import guards, listing
+from .clients import (LANE_BACKGROUND, LANE_INTERACTIVE, GitHubClient, PlaneClient,
+                      _github_rate_limited, current_lane, lane,
                       plane_not_found)
 from .config import Settings
 from .diagnostics import Diagnostics, fingerprint
 from .queue import RetryQueue, run_due
-from .reconcile import CLOSED_GROUPS, Reconciler, get_snapshot, record_snapshot
+from .reconcile import (CLOSED_GROUPS, Reconciler, decide, get_snapshot, github_side, item_group,
+                        last_checked, plane_side, record_snapshot)
 from .scheduler import Debouncer, ScanScheduler
 from .render import (branch_issue_number, closing_refs, esc, github_repo_in, issue_body,
                      mention_refs, normalize_plane_event, plain_text, plane_html_to_markdown,
@@ -66,6 +68,13 @@ TARGETS = {
 PERMANENT_RETRY_SECONDS = 6 * 3600
 # Missing Plane links repaired per catch-up pass, so a backlog can't eat the rate limit.
 LINK_REPAIRS_PER_PASS = 10
+
+# A webhook that only reports a value the bridge itself wrote this recently is the
+# bridge's own change coming back, and is ignored.
+ECHO_WINDOW = 600
+# Debounced checks list issues changed since the last check, minus this margin
+# for clock differences.
+SINCE_SKEW = 120
 
 
 # GET .../issues/<id>/ : reading one work item (not its links or comments).
@@ -126,7 +135,7 @@ def _short_reason(e: Exception) -> str:
 class Bridge:
     def __init__(self, settings: Settings, store: Store, plane: PlaneClient, github: GitHubClient):
         self.s, self.store, self.plane, self.gh = settings, store, plane, github
-        self._locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
+        self._locks: dict[str, threading.RLock] = defaultdict(threading.RLock)
         self._locks_guard = threading.Lock()
         self.clock = time.time
         now = lambda: self.clock()          # noqa: E731  (tests swap self.clock)
@@ -137,27 +146,26 @@ class Bridge:
         self.diag = Diagnostics(store, plane, github, public_url=getattr(settings, "public_url", ""),
                                 clock=now)
         # Module/repo checks: one per burst of edits, plus the self-scheduling org scan.
-        self.reconciler = Reconciler(plane, github, store, apply_fix=self._apply_fix,
-                                     report_problem=self._report_problem, clock=now)
-        self.debounce = Debouncer(getattr(settings, "reconcile_delay", 30), clock=now)
+        self.reconciler = Reconciler(
+            plane, github, store, apply_fix=self._apply_fix, report_problem=self._report_problem,
+            resolve_problem=self._resolve_problem,
+            in_progress=lambda item_id: self.queue.get("create_issue", item_id) is not None,
+            first_contact_fix=getattr(settings, "first_contact_fix", False), clock=now)
+        # Pending checks and the scan schedule are kept in the database across restarts.
+        self.debounce = Debouncer(getattr(settings, "reconcile_delay", 30), clock=now, store=store)
         self.scheduler = ScanScheduler(clock=now, tz=getattr(settings, "timezone", "UTC"),
-                                       quiet_hours=getattr(settings, "quiet_hours", (1, 5)))
+                                       quiet_hours=getattr(settings, "quiet_hours", (1, 5)), store=store)
         self.handlers = {
             "create_issue": self._act_create_issue,
             "push_edit": self._act_push_edit,
-            "move": self._act_move,
+            "sync_item": self._act_sync_item,
             "comment": self._act_comment,
             "add_link": self._act_add_link,
             "tidy_module": self._act_tidy_module,
-            # reconcile fixes
             "add_plane_link": self._act_add_plane_link,
-            "push_title_to_github": self._act_title_to_github,
-            "push_title_to_plane": self._act_title_to_plane,
-            "push_state_to_github": self._act_state_to_github,
-            "push_state_to_plane": self._act_state_to_plane,
         }
 
-    def _lock(self, key: str) -> threading.Lock:
+    def _lock(self, key: str) -> threading.RLock:
         with self._locks_guard:
             return self._locks[key]
 
@@ -193,15 +201,37 @@ class Bridge:
             return "ignored: payload has no work item or project id"
 
         with self._lock(item_id):
+            # Edited: a refusal recorded for it may be fixed now, and gets a fresh try.
+            self.diag.resolve(kind="refused", plane_item_id=item_id)
             link = self.store.by_plane_item(item_id)
-            if link:
-                changed = self._changed_fields(payload) & {"name", "description_html", "description"}
-                if not changed:
-                    return "ignored: linked item, no title/description change"
-                return self._do("push_edit", item_id, {"project_id": project_id, "item_id": item_id,
-                                                        "repo": link.repo, "issue_number": link.issue_number,
-                                                        "only_name": changed == {"name"}})
-            return self._do("create_issue", item_id, {"project_id": project_id, "item_id": item_id})
+            if not link:
+                return self._do("create_issue", item_id, {"project_id": project_id, "item_id": item_id})
+            changed = self._drop_plane_echoes(item_id, data, self._changed_fields(payload))
+            text = changed & {"name", "description_html", "description"}
+            results = []
+            if text:
+                results.append(self._do("push_edit", item_id, {
+                    "project_id": project_id, "item_id": item_id, "repo": link.repo,
+                    "issue_number": link.issue_number, "only_name": text == {"name"}}))
+            if changed & {"state", "state_id"}:
+                # Moved in Plane: push open/closed to GitHub now (the event is the latest change).
+                results.append(self._sync_item(link, {"reconcile": True, "prefer": {"closed": "plane"}}))
+            if not results:
+                return "ignored: linked item, no title/description/state change"
+            return "; ".join(results)
+
+    def _drop_plane_echoes(self, item_id: str, data: dict, changed: set[str]) -> set[str]:
+        """Leave out changes that only report what the bridge itself just wrote."""
+        changed = set(changed)
+        if "name" in changed and data.get("name") is not None and \
+                self._own(item_id, "plane_title", data["name"]):
+            changed.discard("name")
+        state = data.get("state") or data.get("state_id")
+        if isinstance(state, dict):
+            state = state.get("id")
+        if changed & {"state", "state_id"} and state and self._own(item_id, "plane_state", state):
+            changed -= {"state", "state_id"}
+        return changed
 
     def _changed_fields(self, payload: dict) -> set[str]:
         prev = payload.get("previous_attributes")
@@ -493,12 +523,11 @@ class Bridge:
             _stop_if_pass_ending(e)
             return False
 
-    def _maybe_create_issue(self, project_id: str, item_id: str, repo: str | None = None,
-                            check_similar: bool = False) -> str:
+    def _maybe_create_issue(self, project_id: str, item_id: str, repo: str | None = None) -> str:
         """Create the item's issue. repo: already known (catch-up sync), so skip the module lookup.
 
-        check_similar: this is a retry, and an earlier attempt may have created the issue
-        before its response was lost; look for it among the repo's newest issues first.
+        An earlier attempt may have created the issue before its response was lost, so
+        the repo's newest issues are always searched for it first.
         """
         item = self.plane.work_item(project_id, item_id)
         if repo is None:
@@ -511,12 +540,11 @@ class Bridge:
 
         ref, url = self._item_ref(project_id, item)
         issue, adopted = None, False
-        if check_similar:
-            found = guards.find_similar_issue(self.gh.recent_issues(repo), item.get("name", ""), ref)
-            if found and not self.store.by_issue(repo, found["number"]):
-                issue, adopted = found, True
-                log.info("found %s#%s from an earlier attempt for %s; linking it instead of "
-                         "creating another", repo, found["number"], ref)
+        found = guards.find_similar_issue(self.gh.recent_issues(repo), item.get("name", ""), ref)
+        if found and not self.store.by_issue(repo, found["number"]):
+            issue, adopted = found, True
+            log.info("found %s#%s from an earlier attempt for %s; linking it instead of "
+                     "creating another", repo, found["number"], ref)
         if issue is None:
             body = issue_body(plane_html_to_markdown(item.get("description_html")), ref, url)
             issue = self.gh.create_issue(repo, item["name"], body)
@@ -526,39 +554,55 @@ class Bridge:
         self.store.save(link)
         self.store.clear_failure(item_id)
         self.diag.resolve(kind="refused", plane_item_id=item_id)
-        record_snapshot(self.store, item_id, repo, issue["number"], item.get("name", ""),
-                        self._item_closed(project_id, item), synced_at=self.clock())
+        p = plane_side(item, self._groups(project_id))
+        g = github_side(issue)
+        self._record_pair(link, p.title, p.closed, g.title, g.closed, g_stamp=issue.get("updated_at", ""))
         if not adopted:
             log.info("created %s#%s for %s", repo, issue["number"], ref)
         self._add_issue_link(link)
-        return f"{'linked' if adopted else 'created'} {repo}#{issue['number']}"
+        result = f"{'linked' if adopted else 'created'} {repo}#{issue['number']}"
+        if p.closed and not g.closed:
+            # Already done or cancelled in Plane: close the new issue the same way.
+            result += "; " + self._sync_item(link, {"reconcile": True, "prefer": {"closed": "plane"}})
+        return result
 
     def _add_issue_link(self, link: Link) -> None:
         self.plane.add_link(link.plane_project_id, link.plane_item_id, link.issue_url,
                             f"GitHub {link.repo}#{link.issue_number}")
         self.store.mark_plane_linked(link.plane_item_id)
 
-    def _item_closed(self, project_id: str, item: dict) -> bool:
-        state = item.get("state") or item.get("state_id")
-        if isinstance(state, dict):
-            return state.get("group") in CLOSED_GROUPS
-        try:
-            groups = {st["id"]: st.get("group") for st in self.plane.states(project_id)}
-        except Exception as e:
-            _stop_if_pass_ending(e)
-            return False
-        return groups.get(state) in CLOSED_GROUPS
+    def _groups(self, project_id: str) -> dict[str, str]:
+        return {st["id"]: st.get("group", "") for st in self.plane.states(project_id)}
 
-    def _snap(self, link: Link, *, title: str | None = None, closed: bool | None = None) -> None:
-        """Remember what was last synced for a pair, so a later check can tell which side
-        changed. A pair with no snapshot yet only gets one when both values are known."""
-        snap = get_snapshot(self.store, link.plane_item_id)
-        if snap is None and (title is None or closed is None):
-            return
+    def _record_pair(self, link: Link, p_title: str, p_closed: bool, g_title: str, g_closed: bool,
+                     p_stamp: str | None = None, g_stamp: str | None = None) -> None:
+        """Remember both sides as they really are after a sync of the pair."""
         record_snapshot(self.store, link.plane_item_id, link.repo, link.issue_number,
-                        title if title is not None else snap.title,
-                        closed if closed is not None else snap.closed,
-                        snap.state_group if snap else "", synced_at=self.clock())
+                        p_title=p_title, g_title=g_title, p_closed=p_closed, g_closed=g_closed,
+                        p_stamp=p_stamp, g_stamp=g_stamp, synced_at=self.clock())
+
+    # -------- writes that record themselves, so the webhooks they cause are ignored
+
+    def _gh_update(self, link: Link, **fields) -> dict:
+        out = self.gh.update_issue(link.repo, link.issue_number, **fields)
+        now = self.clock()
+        if "title" in fields:
+            self.store.record_own_write(link.plane_item_id, "gh_title", fields["title"], now)
+        if "state" in fields:
+            self.store.record_own_write(link.plane_item_id, "gh_closed", fields["state"] == "closed", now)
+        return out
+
+    def _plane_update(self, link: Link, **fields) -> dict:
+        out = self.plane.update_work_item(link.plane_project_id, link.plane_item_id, **fields)
+        now = self.clock()
+        if "name" in fields:
+            self.store.record_own_write(link.plane_item_id, "plane_title", fields["name"], now)
+        if "state" in fields:
+            self.store.record_own_write(link.plane_item_id, "plane_state", fields["state"], now)
+        return out
+
+    def _own(self, item_id: str, field: str, value) -> bool:
+        return self.store.is_own_write(item_id, field, value, self.clock() - ECHO_WINDOW)
 
     # ------------------------------------------------------------ actions
     #
@@ -566,7 +610,7 @@ class Bridge:
     # a reason that may pass (rate limit, outage, timeout) it goes into the retry queue
     # instead of being lost. A refusal that won't pass (GitHub 403/404/410/422, an item
     # Plane says is gone) is recorded as a sync problem instead. Handlers don't take
-    # locks themselves: callers hold the lock from _lock_key.
+    # locks themselves: callers hold the lock from _lock_key (re-entrant).
 
     @staticmethod
     def _lock_key(kind: str, payload: dict) -> str:
@@ -579,18 +623,43 @@ class Bridge:
             return f"module:{(payload.get('module') or {}).get('id', '')}"
         return item
 
-    def _do(self, kind: str, key: str, payload: dict) -> str:
+    def _do(self, kind: str, key: str, payload: dict, stop_on_limit: bool = False) -> str:
+        if kind == "sync_item" and self.queue.get(kind, key) is not None:
+            # An earlier change to this item is still waiting: queue behind it, so the
+            # intents run in order and only the latest of them counts.
+            self._queue_put(kind, key, payload, "behind an earlier change")
+            return "queued: behind an earlier change to this item"
         try:
-            return self.handlers[kind](payload)
+            result = self.handlers[kind](payload)
         except Exception as e:
-            return self._action_failed(kind, key, payload, e)
+            result = self._action_failed(kind, key, payload, e)
+            if stop_on_limit and _failure_kind(e) in ("rate", "auth"):
+                raise _StopPass(_short_reason(e), _failure_kind(e)) from None
+            return result
+        if payload.get("item_id") and not result.startswith(("refused", "queued", "ignored")):
+            self.diag.resolve(kind="refused", plane_item_id=payload["item_id"])
+        return result
+
+    def _queue_put(self, kind: str, key: str, payload: dict, reason: str) -> None:
+        payload = {**payload, "_retry": True, "_key": key}
+        if kind == "sync_item":
+            old = self.queue.get(kind, key)
+            if old is not None:
+                prev = dict(old.payload)
+                if "target" in payload:     # a newer move replaces the older one entirely
+                    for k in ("target", "match_group", "gh"):
+                        prev.pop(k, None)
+                payload = {**prev, **payload,
+                           "reconcile": bool(prev.get("reconcile") or payload.get("reconcile")),
+                           "prefer": {**(prev.get("prefer") or {}), **(payload.get("prefer") or {})}}
+        self.queue.put(kind, key, payload, reason)
 
     def _action_failed(self, kind: str, key: str, payload: dict, e: Exception) -> str:
         fk, reason = _failure_kind(e), _short_reason(e)
         if fk in ("permanent", "gone"):
             self._refused(kind, payload, fk, reason)
             return f"refused: {reason}"
-        self.queue.put(kind, key, {**payload, "_retry": True, "_key": key}, reason)
+        self._queue_put(kind, key, payload, reason)
         log.warning("%s for %s failed (%s); queued for retry", kind, key, reason)
         return f"queued: {reason}"
 
@@ -622,10 +691,11 @@ class Bridge:
 
     def run_queue(self, limit: int = 20) -> dict:
         """Retry due queued actions. Each handler re-reads the current state first (guards),
-        so an action that took effect before its response was lost isn't done twice."""
+        so an action that took effect before its response was lost isn't done twice.
+        Each runs in the pacing lane it was queued from."""
         def wrap(kind):
             def run(payload: dict) -> None:
-                with self._lock(self._lock_key(kind, payload)):
+                with self._lock(self._lock_key(kind, payload)), lane(payload.get("lane", LANE_INTERACTIVE)):
                     try:
                         self.handlers[kind](payload)
                     except Exception as e:
@@ -633,6 +703,9 @@ class Bridge:
                         if fk not in ("permanent", "gone"):
                             raise
                         self._refused(kind, payload, fk, _short_reason(e))
+                    else:
+                        if payload.get("item_id"):
+                            self.diag.resolve(kind="refused", plane_item_id=payload["item_id"])
                 self.diag.resolve(self._stuck_fp(kind, payload.get("_key", ""), payload))
                 log.info("retried %s: done", kind)
             return run
@@ -648,8 +721,10 @@ class Bridge:
                 self._add_issue_link(link)
                 return f"linked {link.repo}#{link.issue_number}"
             return f"unchanged: already {link.repo}#{link.issue_number}"
-        return self._maybe_create_issue(p["project_id"], p["item_id"], repo=p.get("repo"),
-                                        check_similar=bool(p.get("_retry")))
+        if not p.get("_retry") and self.queue.get("create_issue", p["item_id"]) is not None:
+            # An earlier attempt is waiting in the queue: it finds or makes the issue.
+            return "queued: already waiting to be created"
+        return self._maybe_create_issue(p["project_id"], p["item_id"], repo=p.get("repo"))
 
     def _act_push_edit(self, p: dict) -> str:
         link = self.store.by_plane_item(p["item_id"])
@@ -657,28 +732,126 @@ class Bridge:
             return "ignored: item has no issue"
         item = self.plane.work_item(link.plane_project_id, link.plane_item_id)
         snap = get_snapshot(self.store, link.plane_item_id)
-        if p.get("only_name") and snap and snap.title == item.get("name"):
+        if p.get("only_name") and snap and snap.g_title == item.get("name"):
             return "unchanged: title already synced"     # our own push coming back
         ref, url = self._item_ref(link.plane_project_id, item)
-        self.gh.update_issue(link.repo, link.issue_number, title=item["name"],
-                             body=issue_body(plane_html_to_markdown(item.get("description_html")), ref, url))
-        self._snap(link, title=item["name"])
+        out = self._gh_update(link, title=item["name"],
+                              body=issue_body(plane_html_to_markdown(item.get("description_html")), ref, url))
+        p_side = plane_side(item, self._groups(link.plane_project_id))
+        self._record_pair(link, p_side.title, p_side.closed, out.get("title", item["name"]),
+                          out.get("state") == "closed" if out else (snap.g_closed if snap else False),
+                          g_stamp=out.get("updated_at", ""))
         self.diag.resolve(kind="title_differs", plane_item_id=link.plane_item_id)
         return f"updated {link.repo}#{link.issue_number}"
 
-    def _act_move(self, p: dict) -> str:
+    def _sync_item(self, link: Link, extra: dict) -> str:
+        payload = {"project_id": link.plane_project_id, "item_id": link.plane_item_id,
+                   "repo": link.repo, "issue_number": link.issue_number, **extra}
+        with self._lock(link.plane_item_id):
+            return self._do("sync_item", link.plane_item_id, payload)
+
+    def _act_sync_item(self, p: dict) -> str:
+        """Bring one pair in line. target: a state a GitHub event asks for (move the
+        item there). reconcile: re-read both sides and decide what to sync (titles and
+        open/closed), the same way a check does. Both re-read at run time, so a queued
+        intent never applies a stale decision."""
         link = self.store.by_plane_item(p["item_id"])
         if not link:
             return "ignored: item has no issue"
-        result = self._move(link, p["target"])
-        if not result.startswith("skipped"):
-            self._snap(link, closed=TARGETS[p["target"]][1] in CLOSED_GROUPS)
+        results = []
+        if p.get("target"):
+            results.append(self._sync_target(link, p))
+        if p.get("reconcile"):
+            results.append(self._sync_reconcile(link, p.get("prefer") or {}))
+        return "; ".join(results) or "unchanged"
+
+    def _sync_target(self, link: Link, p: dict) -> str:
+        target = p["target"]
+        want_closed = TARGETS[target][1] in CLOSED_GROUPS
+        item = self.plane.work_item(link.plane_project_id, link.plane_item_id)
+        groups = self._groups(link.plane_project_id)
+        if p.get("match_group") and (item_group(item, groups) in CLOSED_GROUPS) == want_closed:
+            # An issue closed or reopened while the item already is: nothing to move.
+            # (Often the webhook for the bridge's own write.)
+            result = f"unchanged: already {'closed' if want_closed else 'open'} in Plane"
+            p_closed = want_closed
+        else:
+            result = self._move(link, target, item=item)
+            p_closed = want_closed if not result.startswith("skipped") else \
+                item_group(item, groups) in CLOSED_GROUPS
+        gh = p.get("gh")
+        if gh is None:
+            issue, _ = listing.issue(self.gh, link.repo, link.issue_number)
+            gh = {"title": issue.get("title", ""), "closed": issue.get("state") == "closed"} if issue else None
+        if gh is not None:
+            self._record_pair(link, item.get("name", ""), p_closed, gh["title"], gh["closed"])
         return result
+
+    def _sync_reconcile(self, link: Link, prefer: dict) -> str:
+        item = self.plane.work_item(link.plane_project_id, link.plane_item_id)
+        groups = self._groups(link.plane_project_id)
+        issue, _ = listing.issue(self.gh, link.repo, link.issue_number)
+        where = {"project_id": link.plane_project_id, "item_id": link.plane_item_id,
+                 "repo": link.repo, "issue_number": link.issue_number}
+        if issue is None:
+            self._report_problem({"kind": "issue_missing", **where})
+            return "skipped: issue is gone"
+        p, g = plane_side(item, groups), github_side(issue)
+        d = decide(get_snapshot(self.store, link.plane_item_id), p, g, prefer=prefer,
+                   first_contact_fix=getattr(self.s, "first_contact_fix", False))
+        for kind in d.resolved:
+            self._resolve_problem(kind, link.plane_item_id)
+        for problem in d.problems:
+            self._report_problem({**problem, **where})
+        for note in d.notes:
+            self._report_problem({**note, **where})
+        done = []
+        p_title, g_title, p_closed, g_closed = p.title, g.title, p.closed, g.closed
+        p_stamp = g_stamp = None
+        if d.title_to == "github":
+            g_stamp = self._gh_update(link, title=p.title).get("updated_at", "")
+            g_title = p.title
+            done.append("title to GitHub")
+        elif d.title_to == "plane":
+            p_stamp = self._plane_update(link, name=g.title).get("updated_at", "")
+            p_title = g.title
+            done.append("title to Plane")
+        if d.closed_to == "github":
+            fields: dict = {"state": "closed" if p.closed else "open"}
+            if p.closed:
+                # Cancelled in Plane: closed as not planned, so it doesn't come back as Done.
+                fields["state_reason"] = "not_planned" if item_group(item, groups) == "cancelled" else "completed"
+            out = self._gh_update(link, **fields)
+            g_stamp = out.get("updated_at", "") or g_stamp
+            g_closed = p.closed
+            done.append(f"{fields['state']} on GitHub")
+        elif d.closed_to == "plane":
+            target = ("cancelled" if g.state_reason == "not_planned" else "done") if g.closed else "todo"
+            result = self._move(link, target, item=item)
+            if not result.startswith("skipped"):
+                p_closed = g.closed
+            done.append(result)
+        if d.title_to:
+            self.diag.resolve(kind="title_differs", plane_item_id=link.plane_item_id)
+        if d.closed_to:
+            self.diag.resolve(kind="state_differs", plane_item_id=link.plane_item_id)
+        self._record_pair(link, p_title, p_closed, g_title, g_closed, p_stamp=p_stamp, g_stamp=g_stamp)
+        if done:
+            log.info("synced %s#%s: %s", link.repo, link.issue_number, ", ".join(done))
+        return ("synced " + ", ".join(done)) if done else (
+            "reported: " + ", ".join(pr["kind"] for pr in d.problems) if d.problems else "unchanged: in sync")
 
     def _act_comment(self, p: dict) -> str:
         keys = p.get("keys") or []
         if keys and all(guards.comment_already_posted(self.store, p["item_id"], k) for k in keys):
             return "unchanged: already posted"
+        if p.get("_retry"):
+            # The first attempt may have posted it and lost the answer: look first.
+            want = plain_text(p["html"])
+            if any(plain_text(c) == want for c in self.plane.item_comments_html(p["project_id"], p["item_id"])):
+                for k in keys:
+                    self.store.post_is_new(p["item_id"], k)
+                return "unchanged: already posted"
         self.plane.add_comment(p["project_id"], p["item_id"], p["html"])
         for k in keys:
             self.store.post_is_new(p["item_id"], k)      # recorded only once it's posted
@@ -703,13 +876,8 @@ class Bridge:
                 return "ignored: module is gone"
         return self.tidy_module_description(p["project_id"], module)
 
-    # -------- reconcile fixes (see reconcile.py)
-
-    def _linked(self, p: dict) -> Link | None:
-        return self.store.by_plane_item(p["item_id"])
-
     def _act_add_plane_link(self, p: dict) -> str:
-        link = self._linked(p)
+        link = self.store.by_plane_item(p["item_id"])
         if not link:
             return "ignored: item has no issue"
         if link.plane_linked:
@@ -717,68 +885,33 @@ class Bridge:
         self._add_issue_link(link)
         return f"linked {link.repo}#{link.issue_number}"
 
-    def _act_title_to_github(self, p: dict) -> str:
-        link = self._linked(p)
-        if not link:
-            return "ignored: item has no issue"
-        self.gh.update_issue(link.repo, link.issue_number, title=p["title"])
-        self._snap(link, title=p["title"])
-        self.diag.resolve(kind="title_differs", plane_item_id=link.plane_item_id)
-        return f"title pushed to {link.repo}#{link.issue_number}"
-
-    def _act_title_to_plane(self, p: dict) -> str:
-        link = self._linked(p)
-        if not link:
-            return "ignored: item has no issue"
-        self.plane.update_work_item(link.plane_project_id, link.plane_item_id, name=p["title"])
-        self._snap(link, title=p["title"])
-        self.diag.resolve(kind="title_differs", plane_item_id=link.plane_item_id)
-        return "title pushed to Plane"
-
-    def _act_state_to_github(self, p: dict) -> str:
-        link = self._linked(p)
-        if not link:
-            return "ignored: item has no issue"
-        fields: dict = {"state": "closed" if p["closed"] else "open"}
-        if p["closed"]:
-            # Closed as cancelled in Plane: say so, so GitHub's webhook doesn't move it to Done.
-            item = self.plane.work_item(link.plane_project_id, link.plane_item_id)
-            state = item.get("state") or item.get("state_id")
-            groups = {st["id"]: st.get("group") for st in self.plane.states(link.plane_project_id)}
-            fields["state_reason"] = "not_planned" if groups.get(state) == "cancelled" else "completed"
-        self.gh.update_issue(link.repo, link.issue_number, **fields)
-        self._snap(link, closed=p["closed"])
-        return f"{fields['state']} {link.repo}#{link.issue_number}"
-
-    def _act_state_to_plane(self, p: dict) -> str:
-        if p["closed"]:
-            target = "cancelled" if p.get("state_reason") == "not_planned" else "done"
-        else:
-            target = "todo"
-        return self._act_move({**p, "target": target})
-
     # ------------------------------------------------------------ checks (reconcile)
 
     def _apply_fix(self, kind: str, key: str, payload: dict) -> None:
+        """A check wants a change: run it now as an action, in the check's (background)
+        lane. A rate limit or rejected key queues it and ends the check."""
+        payload = {**payload, "lane": current_lane()}
         with self._lock(self._lock_key(kind, payload)):
-            result = self._do(kind, key, payload)
-        log.info("reconcile fix %s for %s: %s", kind, key, result)
+            result = self._do(kind, key, payload, stop_on_limit=True)
+        log.info("check fix %s for %s: %s", kind, key, result)
 
     def _report_problem(self, problem: dict) -> None:
         kind = problem.get("kind", "problem")
         where = dict(plane_project_id=problem.get("project_id"), plane_item_id=problem.get("item_id"),
                      repo=problem.get("repo"), issue_number=problem.get("issue_number"))
         if kind == "conflict":
-            # Settled by "most recent change wins": kept for /status, no label.
-            field = problem.get("field", "")
-            detail = {"field": field, "winner": problem.get("winner"),
-                      "plane_updated": problem.get("plane_updated"),
-                      "github_updated": problem.get("github_updated")}
-            if field == "closed":       # booleans, not work item text
-                detail.update(plane_value=problem.get("plane_value"), github_value=problem.get("github_value"))
-            self.diag.note("conflict", **where, detail=detail, key=field)
-        else:
-            self.diag.report(kind, **where, detail={"field": problem.get("field", "")} if problem.get("field") else {})
+            # Settled by the side whose change is known to be more recent: kept for /status, no label.
+            self.diag.note("conflict", **where, detail={"field": problem.get("field", ""),
+                                                        "winner": problem.get("winner")},
+                           key=problem.get("field", ""))
+            return
+        detail = {"field": problem["field"]} if problem.get("field") else {}
+        if problem.get("first_contact"):
+            detail["first_contact"] = True
+        self.diag.report(kind, **where, detail=detail)
+
+    def _resolve_problem(self, kind: str, item_id: str) -> None:
+        self.diag.resolve(kind=kind, plane_item_id=item_id)
 
     def _note_unlinked(self, repo: str, issues: list[dict]) -> None:
         """Issues in a linked repo with no Plane item: one repo-level problem, no label."""
@@ -788,9 +921,16 @@ class Bridge:
         else:
             self.diag.resolve(kind="unlinked_issues", repo=repo)
 
-    def _reconcile(self, project_id: str, module: dict, repo: str):
-        report = self.reconciler.reconcile_pair(project_id, module, repo)
-        self._note_unlinked(repo, report.unlinked_issues)
+    def _reconcile(self, project_id: str, module: dict, repo: str, full: bool = True):
+        """Check one pair. full=False (a debounced check): only issues changed since the
+        last check of the repo are listed."""
+        since = None
+        if not full:
+            last = last_checked(self.store, repo)
+            since = last - SINCE_SKEW if last is not None else None
+        report = self.reconciler.reconcile_pair(project_id, module, repo, since=since)
+        if report.complete:
+            self._note_unlinked(repo, report.unlinked_issues)
         if report.fixed or report.conflicts:
             log.info("checked %s: %d item(s), %d fix(es), %d conflict(s)", repo, report.checked,
                      len(report.fixed), len(report.conflicts))
@@ -805,10 +945,11 @@ class Bridge:
                 with lane(LANE_BACKGROUND):
                     done += self._reconcile_key(key)
             except Exception as e:
-                if _failure_kind(e) in ("rate", "auth"):
+                kind = e.kind if isinstance(e, _StopPass) else _failure_kind(e)
+                if kind in ("rate", "auth"):
                     for later in keys[i:]:          # this one and the rest: after the delay
                         self.debounce.touch(later)
-                    log.warning("checks postponed (%s)", _short_reason(e))
+                    log.warning("checks postponed (%s)", e if isinstance(e, _StopPass) else _short_reason(e))
                     break
                 log.warning("check of %s failed (%s)", key.split(":", 1)[0], _short_reason(e))
         return done
@@ -821,7 +962,7 @@ class Bridge:
             mod = next((m for m in self.plane.modules(pid) if m["id"] == mid), None)
             if mod is not None:
                 for m, repo, _ in self._linked_modules(project.get("identifier", ""), [mod]):
-                    self._reconcile(pid, m, repo)
+                    self._reconcile(pid, m, repo, full=False)
                     out.append(repo)
         elif key.startswith("repo:"):
             want = key[len("repo:"):].lower()
@@ -833,13 +974,14 @@ class Bridge:
                     continue
                 for m, repo, _ in self._linked_modules(project.get("identifier", ""), modules):
                     if repo.lower() == want:
-                        self._reconcile(project["id"], m, repo)
+                        self._reconcile(project["id"], m, repo, full=False)
                         out.append(repo)
         return out
 
-    def run_org_scan(self) -> str:
+    def run_org_scan(self, stop=None) -> str:
         """Check every linked module against its repo, measure the cost, and let the
-        scheduler pick when to run next (light: often; heavy: set times; slow: at night)."""
+        scheduler pick when to run next (light: often; heavy: set times; slow: at night).
+        stop: called between pairs; True ends the scan (shutdown) without recording it."""
         t0, cpu0 = time.monotonic(), time.process_time()
         calls = pairs = checked = fixed = conflicts = 0
         stopped = ""
@@ -860,8 +1002,12 @@ class Bridge:
                         continue
                     calls += 1
                     for mod, repo, _ in self._linked_modules(project.get("identifier", ""), modules):
+                        if stop is not None and stop():
+                            raise _StopPass("shutting down", "shutdown")
                         try:
                             report = self._reconcile(pid, mod, repo)
+                        except _StopPass:
+                            raise
                         except Exception as e:
                             _stop_if_pass_ending(e)
                             log.warning("scan: couldn't check %s (%s)", repo, _short_reason(e))
@@ -881,8 +1027,10 @@ class Bridge:
             load = os.getloadavg()[0]
         except OSError:
             load = 0.0
-        if stopped:
-            self.scheduler.next_run = self.clock() + 15 * 60     # try again soon
+        if stopped == "shutdown":
+            summary = f"stopped for shutdown after {pairs} pair(s)"
+        elif stopped:
+            self.scheduler.retry_in(15 * 60)     # try again soon
             summary = f"stopped early ({stopped}) after {pairs} pair(s)"
         else:
             self.scheduler.record(duration, calls, cpu, load)
@@ -957,10 +1105,7 @@ class Bridge:
             return self._do("add_link", f"{link.plane_item_id}:{url}", payload)
 
     def _move_item(self, link: Link, target: str) -> str:
-        with self._lock(link.plane_item_id):
-            return self._do("move", link.plane_item_id,
-                            {"project_id": link.plane_project_id, "item_id": link.plane_item_id,
-                             "repo": link.repo, "issue_number": link.issue_number, "target": target})
+        return self._sync_item(link, {"target": target})
 
     def _pr_html(self, repo: str, pr: dict) -> str:
         return (f'PR <a href="{esc(pr.get("html_url"))}">{esc(repo)}#{esc(pr.get("number"))}</a> '
@@ -1048,13 +1193,29 @@ class Bridge:
         link = self.store.by_issue(repo, issue.get("number", -1))
         if not link:
             return "ignored: issue not linked to Plane"
-        if action == "closed":
-            target = "cancelled" if issue.get("state_reason") == "not_planned" else "done"
-        elif action == "reopened":
-            target = "todo"
-        else:
-            return f"ignored: issue {action}"
-        return self._move_item(link, target)
+        item_id = link.plane_item_id
+        if action in ("closed", "reopened"):
+            closed = action == "closed"
+            if self._own(item_id, "gh_closed", closed):
+                return "ignored: the bridge's own change"
+            if closed:
+                target = "cancelled" if issue.get("state_reason") == "not_planned" else "done"
+            else:
+                target = "todo"
+            # match_group: an item already closed (or open) in Plane isn't moved again.
+            return self._sync_item(link, {"target": target, "match_group": True,
+                                          "gh": {"title": issue.get("title", ""), "closed": closed}})
+        if action == "edited":
+            if "title" not in (p.get("changes") or {}):
+                return "ignored: issue edited (not the title)"
+            title = issue.get("title", "")
+            if self._own(item_id, "gh_title", title):
+                return "ignored: the bridge's own change"
+            snap = get_snapshot(self.store, item_id)
+            if snap and snap.g_title == title and snap.p_title == title:
+                return "unchanged: title already synced"
+            return self._sync_item(link, {"reconcile": True, "prefer": {"title": "github"}})
+        return f"ignored: issue {action}"
 
     def _links_for_pr(self, repo: str, pr: dict) -> list[Link]:
         refs = closing_refs(f"{pr.get('title', '')}\n{pr.get('body') or ''}", repo)
@@ -1117,14 +1278,17 @@ class Bridge:
                 return st["id"]
         return None
 
-    def _move(self, link: Link, target: str) -> str:
+    def _move(self, link: Link, target: str, item: dict | None = None) -> str:
         state_id = self._state_id(link.plane_project_id, target)
         if not state_id:
             return f"skipped: project has no state for '{target}'"
-        item = self.plane.work_item(link.plane_project_id, link.plane_item_id)
+        if item is None:
+            item = self.plane.work_item(link.plane_project_id, link.plane_item_id)
         current = item.get("state") or item.get("state_id")
+        if isinstance(current, dict):
+            current = current.get("id")
         if current == state_id:
             return f"unchanged: already {target}"
-        self.plane.set_state(link.plane_project_id, link.plane_item_id, state_id)
+        self._plane_update(link, state=state_id)
         log.info("moved %s#%s's work item to %s", link.repo, link.issue_number, target)
         return f"moved to {target}"

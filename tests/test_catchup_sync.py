@@ -44,6 +44,8 @@ class Plane:
             return httpx.Response(self.projects_status, json={"detail": "nope"})
         if req.method == "GET" and p == "/projects/":
             return httpx.Response(200, json={"results": [{"id": PROJ, "identifier": "API"}]})
+        if req.method == "GET" and p == f"/projects/{PROJ}/states/":
+            return httpx.Response(200, json={"results": [{"id": "st-todo", "name": "Todo", "group": "unstarted"}]})
         if req.method == "GET" and p == f"/projects/{PROJ}/":
             return httpx.Response(200, json={"id": PROJ, "identifier": "API"})
         if req.method == "GET" and p == f"/projects/{PROJ}/modules/":
@@ -103,6 +105,8 @@ class GitHub:
                                              "html_url": f"https://github.com/{repo}",
                                              "description": "", "created_at": "2026-01-01T00:00:00Z"})
         m = re.fullmatch(r"/repos/([^/]+/[^/]+)/issues", req.url.path)
+        if m and req.method == "GET":
+            return httpx.Response(200, json=[])          # newest issues: none from an earlier try
         if m and req.method == "POST":
             repo = m.group(1)
             if repo in self.refuse:

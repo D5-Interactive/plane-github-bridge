@@ -83,7 +83,7 @@ class FakePlane:
         if req.method == "PATCH" and p == f"/projects/{PROJ}/issues/{ITEM}/":
             body = json.loads(req.content)
             self.patches.append(body)
-            self.item["state"] = body["state"]
+            self.item.update(body)
             return httpx.Response(200, json=self.item)
         if req.method == "POST" and p == f"/projects/{PROJ}/issues/{ITEM}/comments/":
             self.comments.append(json.loads(req.content)["comment_html"])
@@ -110,6 +110,11 @@ class FakeGitHub:
             return httpx.Response(200, json=meta) if meta else httpx.Response(404, json={})
         m = re.fullmatch(r"/repos/([^/]+/[^/]+)/issues(?:/(\d+))?", req.url.path)
         assert m, req.url.path
+        if req.method == "GET" and not m.group(2):
+            return httpx.Response(200, json=[])          # newest issues: none from an earlier try
+        if req.method == "GET":
+            return httpx.Response(200, json={"number": int(m.group(2)), "title": "Scan command",
+                                             "state": "open"})
         body = json.loads(req.content)
         if req.method == "POST":
             n = 40 + len(self.created) + 2
@@ -287,7 +292,7 @@ def test_pr_and_issue_lifecycle(env):
     assert bridge.handle_github("pull_request", gh_pr("closed", merged=True, state="closed")) == "moved to done"
     issue_closed = {"action": "closed", "repository": {"full_name": "acme/auth-service"},
                     "issue": {"number": 42, "state_reason": "completed"}}
-    assert bridge.handle_github("issues", issue_closed) == "unchanged: already done"
+    assert bridge.handle_github("issues", issue_closed) == "unchanged: already closed in Plane"
 
     reopened = {**issue_closed, "action": "reopened"}
     assert bridge.handle_github("issues", reopened) == "moved to todo"

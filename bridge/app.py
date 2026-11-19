@@ -72,12 +72,13 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
         last_reflag = 0.0
         while not stop.wait(CHECK_TICK):
             try:
-                bridge.run_reconciles()
-                if settings.org_scan and bridge.scheduler.due():
+                if settings.reconcile:
+                    bridge.run_reconciles()
+                if settings.reconcile and settings.org_scan and bridge.scheduler.due():
                     if bridge.scheduler.defer():
                         log.info("org scan postponed 15 minutes: the host is busy")
                     else:
-                        bridge.run_org_scan()
+                        bridge.run_org_scan(stop=stop.is_set)
                 if time.monotonic() - last_reflag >= REFLAG_EVERY:
                     last_reflag = time.monotonic()
                     bridge.diag.reflag_pending()
@@ -109,12 +110,16 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
         else:
             log.info("Plane workspace '%s' is reachable", settings.plane_workspace)
         prepare_store()
-        if settings.sync_interval > 0 and not (problem and setup_problem):
-            threading.Thread(target=sync_loop, name="module-sync", daemon=True).start()
-            log.info("catch-up sync of linked modules every %ss", settings.sync_interval)
-        if settings.sync_interval > 0:
+        if not (problem and setup_problem):
+            # BRIDGE_MEMBERSHIP_INTERVAL=0 turns off only the membership pass; the retry
+            # queue always runs, and checks unless BRIDGE_RECONCILE=0.
+            if settings.sync_interval > 0:
+                threading.Thread(target=sync_loop, name="module-sync", daemon=True).start()
+                log.info("catch-up sync of linked modules every %ss", settings.sync_interval)
             threading.Thread(target=queue_loop, name="retry-queue", daemon=True).start()
             threading.Thread(target=check_loop, name="checks", daemon=True).start()
+            if not settings.reconcile:
+                log.info("BRIDGE_RECONCILE is off: no module/repo checks or org scan")
         yield
         stop.set()
 
@@ -142,7 +147,8 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
         out["queue"] = bridge.queue.stats()
         out["plane_pacer"] = bridge.plane.pacer.snapshot()
         out["github_pacer"] = bridge.gh.pacer.snapshot()
-        out["scheduler"] = bridge.scheduler.snapshot() if settings.org_scan else {"enabled": False}
+        out["scheduler"] = (bridge.scheduler.snapshot() if settings.reconcile and settings.org_scan
+                            else {"enabled": False})
         out["problems"] = bridge.diag.counts()
         out["reconcile_pending"] = bridge.debounce.pending()
         return out

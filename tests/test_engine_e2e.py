@@ -49,6 +49,11 @@ class World:
         self.fail: dict[tuple[str, str], list[int]] = {}   # (method, path regex) -> statuses to answer
         self.lose_create_response = 0                     # create the issue, then answer 502
         self.calls: Counter = Counter()
+        self.tick = 0                                     # fake time for updated_at stamps
+
+    def stamp(self) -> str:
+        self.tick += 1
+        return f"2026-11-19T12:{self.tick // 60:02d}:{self.tick % 60:02d}Z"
 
     def add_item(self, n: int, name: str | None = None, state: str = "st-todo", in_module=True):
         item_id = f"item-{n}"
@@ -101,6 +106,10 @@ class World:
                 return httpx.Response(404, json={"error": "Issue does not exist"})
             if req.method == "PATCH":
                 item.update(body)
+                item["updated_at"] = self.stamp()
+                if "state" in body:
+                    done = body["state"] == "st-done"
+                    item["completed_at"] = item["updated_at"] if done else None
             return httpx.Response(200, json=dict(item))
         m = re.fullmatch(rf"/projects/{PROJ}/issues/([^/]+)/links/", p)
         if m:
@@ -115,6 +124,9 @@ class World:
         if m and req.method == "POST":
             self.comments.setdefault(m.group(1), []).append(body.get("comment_html", ""))
             return httpx.Response(201, json={})
+        if m and req.method == "GET":
+            return httpx.Response(200, json={"results": [{"comment_html": c}
+                                                         for c in self.comments.get(m.group(1), [])]})
         return httpx.Response(404, json={"path": p})
 
     # ------------------------------------------------------------ GitHub
@@ -133,6 +145,7 @@ class World:
             n = len(self.issues) + 1
             self.issues[n] = {"number": n, "title": body["title"], "body": body.get("body", ""),
                               "state": "open", "html_url": f"https://github.com/{REPO}/issues/{n}",
+                              "created_at": "2026-11-19T10:00:00Z", "closed_at": None,
                               "updated_at": "2026-11-19T10:00:00Z", "labels": []}
             if self.lose_create_response:
                 self.lose_create_response -= 1
@@ -140,6 +153,8 @@ class World:
             return httpx.Response(201, json=dict(self.issues[n]))
         if p == f"/repos/{REPO}/issues" and req.method == "GET":
             out = [dict(i) for i in self.issues.values()]
+            if "since" in req.url.params:
+                out = [i for i in out if i["updated_at"] >= req.url.params["since"]]
             if req.url.params.get("direction") == "desc":
                 out.reverse()
             return httpx.Response(200, json=out)
@@ -149,7 +164,10 @@ class World:
             if issue is None:
                 return httpx.Response(404, json={"message": "Not Found"})
             if req.method == "PATCH":
+                if body.get("state") == "closed" and issue["state"] != "closed":
+                    issue["closed_at"] = self.stamp()
                 issue.update(body)
+                issue["updated_at"] = self.stamp()
             return httpx.Response(200, json=dict(issue))
         m = re.fullmatch(rf"/repos/{REPO}/labels/(.+)", p)
         if m:
@@ -378,18 +396,22 @@ def test_unlinked_issues_are_one_repo_problem_that_clears(env):
     assert bridge.diag.open_problems(kind="unlinked_issues") == []
 
 
-def test_conflict_is_noted_without_a_label(env):
+def test_title_conflict_is_reported_not_guessed(env):
     bridge, world, clock = env
     world.add_item(1)
     bridge.handle_plane(created())
-    bridge.run_org_scan()                       # baseline snapshot
     world.items["item-1"].update(name="Plane title", updated_at="2026-11-19T12:00:00Z")
-    world.issues[1].update(title="GitHub title", updated_at="2026-11-19T11:00:00Z")
+    world.issues[1].update(title="GitHub title", updated_at="2026-11-19T13:00:00Z")
     bridge.run_org_scan()
-    assert world.issues[1]["title"] == "Plane title"          # most recent change wins
-    assert bridge.diag.open_problems(kind="conflict") == []   # noted, already settled
-    assert bridge.diag.open_problems(kind="conflict", include_resolved_since=0)
-    assert not world.issues[1]["labels"]
+    assert world.items["item-1"]["name"] == "Plane title"      # nothing overwritten
+    assert world.issues[1]["title"] == "GitHub title"
+    (problem,) = bridge.diag.open_problems(kind="title_differs")
+    assert problem.plane_item_id == "item-1"
+    assert "plane-sync-problem" in world.issues[1]["labels"]
+    world.issues[1]["title"] = "Plane title"                    # someone settles it
+    bridge.run_org_scan()
+    assert bridge.diag.open_problems(kind="title_differs") == []
+    assert "plane-sync-problem" not in world.issues[1]["labels"]
 
 
 # ---------------------------------------------------------------- scans
