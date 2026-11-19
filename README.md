@@ -406,6 +406,7 @@ Anyone who can edit a module in Plane can link it. No server access is needed.
    - **Name** becomes the repo's name, e.g. `auth-service`.
    - **Links** gets the repo, titled `GitHub: your-org/auth-service` (see the
      note below on Plane versions).
+   - **Start date** becomes the day the repo was created on GitHub.
    - **Description** becomes the repo link and the repo's GitHub description:
 
      ```
@@ -592,7 +593,13 @@ the token can see and the owner is allowed:
 2. **Description** → the repo link, then the repo's GitHub description (its
    **About** text). No About text, just the link.
 
-3. **Links** → the repo URL, titled `GitHub: owner/repo`, added once. Plane's
+3. **Start date** → the day the repo was created on GitHub (its `created_at`,
+   in UTC). This is the repo's creation date, not its first commit: reading
+   commits would need a token that can read code. For a repo created on GitHub
+   they're normally the same day; for one pushed from older local history,
+   the first commit can be earlier. Plane refuses a start date after the
+   module's target date; then the start date is left as it was.
+4. **Links** → the repo URL, titled `GitHub: owner/repo`, added once. Plane's
    public API doesn't document module links, so this is best effort: if your
    Plane version doesn't accept it, the bridge logs
    `this Plane's API has no module links endpoint` once, stops trying, and the

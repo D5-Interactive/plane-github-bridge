@@ -40,6 +40,8 @@ class FakePlane:
         self.module_name = "Auth"
         self.module_patches = []
         self.reject_rename = False
+        self.reject_start = False
+        self.module_start = None
         self.module_links, self.module_links_supported = [], True
         self.project_desc = ""
         self.links, self.patches, self.comments = [], [], []
@@ -69,9 +71,12 @@ class FakePlane:
             body = json.loads(req.content)
             if "name" in body and self.reject_rename:
                 return httpx.Response(400, json={"error": "module with this name already exists"})
+            if "start_date" in body and self.reject_start:
+                return httpx.Response(400, json={"error": "start date after target date"})
             self.module_patches.append(body)
             self.module_desc = body.get("description_html", self.module_desc)
             self.module_name = body.get("name", self.module_name)
+            self.module_start = body.get("start_date", self.module_start)
             return httpx.Response(200, json={})
         if req.method == "PATCH" and p == f"/projects/{PROJ}/issues/{ITEM}/":
             body = json.loads(req.content)
@@ -91,6 +96,7 @@ class FakeGitHub:
     def __init__(self):
         self.created, self.updated = [], []
         self.repos = {"acme/from-plane": {"full_name": "acme/from-plane", "name": "from-plane",
+                                          "created_at": "2026-10-12T18:04:55Z",
                                           "html_url": "https://github.com/acme/from-plane",
                                           "description": "Tools <for> testing"}}
 
@@ -403,9 +409,10 @@ def test_pr_linked_by_branch_name_without_closes(env):
 
 # ---------------------------------------------------------------- module description tidy-up
 
-def module_event(desc, eid="m1", name="Auth"):
+def module_event(desc, eid="m1", name="Auth", start=None):
     return {"event": "module.updated", "event_id": eid, "entity_type": "module", "entity_id": MOD,
-            "data": {"id": MOD, "project_id": PROJ, "name": name, "description_html": desc}}
+            "data": {"id": MOD, "project_id": PROJ, "name": name, "description_html": desc,
+                     "start_date": start}}
 
 
 def test_module_link_anywhere_is_rewritten_to_link_plus_description(env):
@@ -424,7 +431,8 @@ def test_tidy_is_idempotent_so_our_own_edit_does_not_loop(env):
     bridge, fp, fg = env
     bridge.handle_plane(module_event("https://github.com/acme/from-plane"))
     # Plane fires module.updated for our own edit; it must be a no-op
-    assert bridge.handle_plane(module_event(fp.module_desc, "m2", fp.module_name)) == "unchanged: module already tidy"
+    assert bridge.handle_plane(module_event(fp.module_desc, "m2", fp.module_name, fp.module_start)) == \
+        "unchanged: module already tidy"
     assert len(fp.module_patches) == 1
 
 
@@ -477,7 +485,7 @@ def test_tidy_adds_repo_to_module_links_once(env):
     bridge, fp, fg = env
     bridge.handle_plane(module_event("https://github.com/acme/from-plane"))
     assert fp.module_links == [{"url": "https://github.com/acme/from-plane", "title": "GitHub: acme/from-plane"}]
-    bridge.handle_plane(module_event(fp.module_desc, "m2", fp.module_name))
+    bridge.handle_plane(module_event(fp.module_desc, "m2", fp.module_name, fp.module_start))
     assert len(fp.module_links) == 1
 
 
@@ -487,3 +495,24 @@ def test_tidy_still_works_when_plane_has_no_module_links_api(env):
     assert bridge.handle_plane(module_event("https://github.com/acme/from-plane")) == "module tidied for acme/from-plane"
     assert fp.module_name == "from-plane"
     assert bridge.plane.module_links_supported is False
+
+
+def test_tidy_sets_start_date_to_repo_creation_day(env):
+    bridge, fp, fg = env
+    bridge.handle_plane(module_event("https://github.com/acme/from-plane"))
+    assert fp.module_start == "2026-10-12"
+
+
+def test_refused_start_date_does_not_block_the_rest(env):
+    bridge, fp, fg = env
+    fp.reject_start = True
+    assert bridge.handle_plane(module_event("https://github.com/acme/from-plane")) == "module tidied for acme/from-plane"
+    assert fp.module_start is None and fp.module_name == "from-plane"
+
+
+def test_refused_name_and_start_still_update_description(env):
+    bridge, fp, fg = env
+    fp.reject_start = fp.reject_rename = True
+    bridge.handle_plane(module_event("see https://github.com/acme/from-plane"))
+    assert fp.module_desc.startswith('<p><a href="https://github.com/acme/from-plane">')
+    assert fp.module_name == "Auth" and fp.module_start is None

@@ -6,8 +6,9 @@ Plane -> GitHub
     in config.yaml, which wins). Items in unlinked modules, and items in no module at
     all, stay in Plane: that's where admin and organisational work lives.
   * A linked module is tidied: renamed to the repo's name, its description set to
-    the repo link plus the repo's GitHub description, and the repo added to its
-    Links section (where this Plane's API supports module links).
+    the repo link plus the repo's GitHub description, its start date set to the
+    day the repo was created, and the repo added to its Links section (where this
+    Plane's API supports module links).
   * A synced work item gets a GitHub issue, once, and the issue link is added to it.
   * Later edits to the item's title or description are copied to the issue.
 
@@ -159,6 +160,9 @@ class Bridge:
         name = meta.get("name") or repo.split("/", 1)[1]
         if name and (module.get("name") or "") != name:
             changes["name"] = name
+        created = (meta.get("created_at") or "")[:10]          # "2026-10-12T..." -> "2026-10-12"
+        if created and (module.get("start_date") or "")[:10] != created:
+            changes["start_date"] = created
 
         try:
             link = self.plane.ensure_module_link(project_id, module["id"], url,
@@ -169,18 +173,26 @@ class Bridge:
 
         if not changes:
             return "unchanged: module already tidy" + (" (repo link added)" if link == "added" else "")
+        # Plane can refuse a name (already taken in the project) or a start date
+        # (after the module's target date). If the combined update fails, send the
+        # description on its own and then try each of those separately.
         try:
             self.plane.update_module(project_id, module["id"], **changes)
         except Exception:
-            if "name" not in changes:
+            optional = {f: changes.pop(f) for f in ("name", "start_date") if f in changes}
+            if not optional:
                 raise
-            # Usually another module in the project already has that name.
-            log.warning("couldn't rename module %r to %r; updating its description only",
-                        module.get("name"), name)
-            changes.pop("name")
+            if changes:
+                self.plane.update_module(project_id, module["id"], **changes)
+            for field, value in optional.items():
+                try:
+                    self.plane.update_module(project_id, module["id"], **{field: value})
+                    changes[field] = value
+                except Exception:
+                    log.warning("Plane refused module %r's %s=%r; left as is",
+                                module.get("name"), field, value)
             if not changes:
-                return f"unchanged: couldn't rename module to {name}"
-            self.plane.update_module(project_id, module["id"], **changes)
+                return "unchanged: Plane refused the module update"
         log.info("tidied module %r for %s (%s; link %s)", module.get("name", module["id"]), repo,
                  ", ".join(changes), link)
         return f"module tidied for {meta.get('full_name', repo)}"
