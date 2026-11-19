@@ -31,7 +31,8 @@ from collections import defaultdict
 from .clients import GitHubClient, PlaneClient
 from .config import Settings
 from .render import (branch_issue_number, closing_refs, esc, github_repo_in, issue_body,
-                     mention_refs, normalize_plane_event, plane_html_to_markdown)
+                     mention_refs, normalize_plane_event, plain_text, plane_html_to_markdown,
+                     repo_description_html)
 from .store import Link, Store
 
 log = logging.getLogger("bridge")
@@ -60,12 +61,19 @@ class Bridge:
 
     def handle_plane(self, payload: dict) -> str:
         kind, action = normalize_plane_event(payload)
-        if kind != "workitem" or action == "deleted":
-            return "ignored: not a work item create/update"
+        if kind is None or action == "deleted":
+            return "ignored: not a work item or module create/update"
         if not self.store.first_time(payload.get("event_id", "")):
             return "ignored: duplicate delivery"
 
         data = payload.get("data") or {}
+        if kind == "module":
+            project_id = data.get("project") or data.get("project_id")
+            if not project_id or not data.get("id"):
+                return "ignored: payload has no module or project id"
+            with self._lock(f"module:{data['id']}"):
+                return self.tidy_module_description(project_id, data)
+
         item_id = data.get("id") or payload.get("entity_id")
         project_id = data.get("project") or data.get("project_id")
         if not item_id or not project_id:
@@ -118,9 +126,37 @@ class Bridge:
         for mod in self.plane.modules(project_id):
             repo = self._described_repo(mod)
             if repo and self.plane.item_in_module(project_id, mod["id"], item):
+                try:
+                    self.tidy_module_description(project_id, mod)
+                except Exception:
+                    log.exception("couldn't tidy the description of module %s", mod.get("id"))
                 return repo
         # 3. A github.com URL in the project's description.
         return self._described_repo(project)
+
+    def tidy_module_description(self, project_id: str, module: dict) -> str:
+        """If a module's description mentions a repo, rewrite it to:
+
+            https://github.com/owner/repo
+            <the repo's GitHub description>
+        """
+        repo = self._described_repo(module)
+        if not repo:
+            return "ignored: module description has no GitHub repo link"
+        if not self.s.owner_allowed(repo):
+            return f"ignored: {repo} is not in GITHUB_ALLOWED_OWNERS"
+        meta = self.gh.get_repo(repo)
+        if meta is None:
+            log.warning("module links %s, but the GitHub token can't see that repo", repo)
+            return f"ignored: token can't see {repo}"
+        url = meta.get("html_url") or f"https://github.com/{repo}"
+        wanted = repo_description_html(url, meta.get("description"))
+        current = module.get("description_html") or module.get("description") or ""
+        if plain_text(current) == plain_text(wanted):
+            return "unchanged: module description already tidy"
+        self.plane.update_module_description(project_id, module["id"], wanted, plain_text(wanted))
+        log.info("rewrote description of module %s for %s", module.get("name", module["id"]), repo)
+        return f"module description set for {meta.get('full_name', repo)}"
 
     def _maybe_create_issue(self, project_id: str, item_id: str) -> str:
         item = self.plane.work_item(project_id, item_id)

@@ -37,6 +37,7 @@ class FakePlane:
                      "description_html": DESC, "project": PROJ}
         self.module_members = {ITEM}
         self.module_desc = ""
+        self.module_patches = []
         self.project_desc = ""
         self.links, self.patches, self.comments = [], [], []
 
@@ -54,6 +55,11 @@ class FakePlane:
                                                           "description_html": self.module_desc}]})
         if req.method == "GET" and p == f"/projects/{PROJ}/modules/{MOD}/module-issues/":
             return httpx.Response(200, json={"results": [{"id": i} for i in self.module_members]})
+        if req.method == "PATCH" and p == f"/projects/{PROJ}/modules/{MOD}/":
+            body = json.loads(req.content)
+            self.module_patches.append(body)
+            self.module_desc = body["description_html"]
+            return httpx.Response(200, json={})
         if req.method == "PATCH" and p == f"/projects/{PROJ}/issues/{ITEM}/":
             body = json.loads(req.content)
             self.patches.append(body)
@@ -71,9 +77,16 @@ class FakePlane:
 class FakeGitHub:
     def __init__(self):
         self.created, self.updated = [], []
+        self.repos = {"acme/from-plane": {"full_name": "acme/from-plane",
+                                          "html_url": "https://github.com/acme/from-plane",
+                                          "description": "Tools <for> testing"}}
 
     def handler(self, req: httpx.Request) -> httpx.Response:
         assert req.headers["Authorization"] == "Bearer gh-token"
+        repo_get = re.fullmatch(r"/repos/([^/]+/[^/]+)", req.url.path)
+        if req.method == "GET" and repo_get:
+            meta = self.repos.get(repo_get.group(1))
+            return httpx.Response(200, json=meta) if meta else httpx.Response(404, json={})
         m = re.fullmatch(r"/repos/([^/]+/[^/]+)/issues(?:/(\d+))?", req.url.path)
         assert m, req.url.path
         body = json.loads(req.content)
@@ -372,3 +385,56 @@ def test_pr_linked_by_branch_name_without_closes(env):
     ev = gh_pr("opened", body="no keywords here")
     ev["pull_request"]["head"] = {"ref": "42-scan-command"}
     assert bridge.handle_github("pull_request", ev) == "moved to review"
+
+
+# ---------------------------------------------------------------- module description tidy-up
+
+def module_event(desc, eid="m1"):
+    return {"event": "module.updated", "event_id": eid, "entity_type": "module", "entity_id": MOD,
+            "data": {"id": MOD, "project_id": PROJ, "name": "Auth", "description_html": desc}}
+
+
+def test_module_link_anywhere_is_rewritten_to_link_plus_description(env):
+    bridge, fp, fg = env
+    out = bridge.handle_plane(module_event("<p>We keep the code over at "
+                                           "https://github.com/acme/from-plane, ping Zep with questions</p>"))
+    assert out == "module description set for acme/from-plane"
+    html = fp.module_patches[-1]["description_html"]
+    assert html == ('<p><a href="https://github.com/acme/from-plane">https://github.com/acme/from-plane</a></p>'
+                    "<p>Tools &lt;for&gt; testing</p>")
+    assert fp.module_patches[-1]["description"] == "https://github.com/acme/from-plane Tools <for> testing"
+
+
+def test_tidy_is_idempotent_so_our_own_edit_does_not_loop(env):
+    bridge, fp, fg = env
+    bridge.handle_plane(module_event("https://github.com/acme/from-plane"))
+    # Plane fires module.updated for our own edit; it must be a no-op
+    assert bridge.handle_plane(module_event(fp.module_desc, "m2")) == "unchanged: module description already tidy"
+    assert len(fp.module_patches) == 1
+
+
+def test_tidy_leaves_module_alone_when_token_cannot_see_repo(env):
+    bridge, fp, fg = env
+    assert bridge.handle_plane(module_event("https://github.com/acme/secret")) == "ignored: token can't see acme/secret"
+    assert not fp.module_patches
+
+
+def test_tidy_respects_allowed_owners(env):
+    bridge, fp, fg = env
+    bridge.s.allowed_owners = ["other-org"]
+    assert "GITHUB_ALLOWED_OWNERS" in bridge.handle_plane(module_event("https://github.com/acme/from-plane"))
+    assert not fp.module_patches
+
+
+def test_new_work_item_also_tidies_its_module(env):
+    bridge, fp, fg = env
+    bridge.s.mappings = []
+    fp.module_desc = "repo: https://github.com/acme/from-plane"
+    assert bridge.handle_plane(plane_event()) == "created acme/from-plane#42"
+    assert fp.module_patches  # description was rewritten on the way
+
+
+def test_normalize_module_events():
+    assert normalize_plane_event({"event": "module.updated"}) == ("module", "updated")
+    assert normalize_plane_event({"event": "module", "action": "update"}) == ("module", "updated")
+    assert normalize_plane_event({"event": "WebhookScope.ScopeChoices.MODULE_CREATED"}) == ("module", "created")

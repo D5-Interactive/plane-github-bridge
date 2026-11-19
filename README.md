@@ -181,7 +181,9 @@ Fine-grained tokens**):
 | Repository access | **All repositories**, or only the repos you'll link |
 | Permissions | **Issues → Read and write** (Metadata → Read is added automatically) |
 
-That one permission is enough. Commits, branches, PRs and reviews reach the
+That one permission is enough. (The automatic Metadata access lets the bridge
+read a repo's description for the module header.) Commits, branches, PRs and
+reviews reach the
 bridge inside GitHub's webhook payloads (step 7), so the token never reads
 them. Keeping it to Issues means a leaked token can't touch your code.
 
@@ -296,7 +298,7 @@ You should get the same `{"ok":true,...}` as in step 4.
    | Field | Value |
    |---|---|
    | URL | `https://hooks.example.com/plane/webhook` |
-   | Events | **Work items** (called Issues in some versions) only. Projects, cycles, modules and comments aren't needed |
+   | Events | **Work items** (called Issues in some versions) and **Modules**. Projects, cycles and comments aren't needed |
 
 3. Save. Plane shows a secret that starts with `plane_wh_`. Copy it; Plane may
    not show it again.
@@ -388,16 +390,26 @@ Anyone who can edit a module in Plane can link it to a repo. No server access
 is needed.
 
 1. In Plane, open the project → **Modules** → the module (or create one).
-2. In the module's **description**, paste the repo's GitHub URL:
+2. Paste the repo's GitHub URL **anywhere** in the module's description, for
+   example `code is at https://github.com/your-org/auth-service, ask Sam`.
+3. Save. Within a few seconds the bridge rewrites the description to a clean
+   header, the repo link and the repo's own GitHub description:
 
    ```
    https://github.com/your-org/auth-service
+   Login, sessions and token refresh for the web app.
    ```
 
-   Any text around it is fine, such as `Code lives at https://github.com/...`.
-
-3. That's it. New work items in that module get an issue in that repo. Existing
+   If the repo has no description on GitHub, only the link is kept. To change
+   that second line, edit the repo's **About** on GitHub, then save the module
+   again.
+4. That's it. New work items in that module get an issue in that repo. Existing
    items get theirs the next time they're edited or moved into the module.
+
+> [!NOTE]
+> The rewrite replaces everything else in the module description, so keep
+> notes in Plane Pages or the work items instead. Nothing is rewritten if the
+> GitHub token can't see the repo or its owner isn't in `GITHUB_ALLOWED_OWNERS`.
 
 To send **every** work item in a project to one repo, put the URL in the
 **project's** description instead (**Project settings → General**). A module

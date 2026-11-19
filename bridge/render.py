@@ -29,28 +29,32 @@ def verify_github_signature(secret: str, body: bytes, header: str | None) -> boo
 
 # ---------- Plane webhook payloads ----------
 
-def normalize_plane_event(payload: dict) -> tuple[str | None, str | None]:
-    """Return (kind, action) for a Plane webhook, or (None, None) if it is not a work item event.
+_KINDS = {"issue": "workitem", "work_item": "workitem", "workitem": "workitem", "module": "module"}
 
-    kind is always "workitem"; action is "created" | "updated" | "deleted".
-    Handles the v2 format ("workitem.created") and the older one
+
+def normalize_plane_event(payload: dict) -> tuple[str | None, str | None]:
+    """Return (kind, action) for a Plane webhook, or (None, None) if it isn't one we handle.
+
+    kind is "workitem" or "module"; action is "created" | "updated" | "deleted".
+    Handles the v2 format ("workitem.created", "module.updated") and the older one
     ({"event": "issue", "action": "create"}).
     """
     event = str(payload.get("event", "")).lower()
     action = str(payload.get("action", "")).lower()
 
-    if event in ("issue", "work_item", "workitem"):
-        kind = "workitem"
-    elif event.startswith(("workitem.", "work_item.", "issue.")):
+    if event in _KINDS:
+        kind = _KINDS[event]
+    elif "." in event and event.split(".")[0] in _KINDS and "scopechoices" not in event:
         parts = event.split(".")
         if len(parts) != 2:          # workitem.comment.created etc. are not ours
             return None, None
-        kind, action = "workitem", parts[1]
-    elif "work_item_" in event:      # e.g. "webhookscope.scopechoices.work_item_updated"
-        tail = event.rsplit("work_item_", 1)[1]
+        kind, action = _KINDS[parts[0]], parts[1]
+    elif "work_item_" in event or "module_" in event:   # "webhookscope.scopechoices.work_item_updated"
+        marker = "work_item_" if "work_item_" in event else "module_"
+        tail = event.rsplit(marker, 1)[1]
         if tail not in ("created", "updated", "deleted"):
             return None, None
-        kind, action = "workitem", tail
+        kind, action = ("workitem" if marker == "work_item_" else "module"), tail
     else:
         return None, None
 
@@ -137,6 +141,20 @@ def github_repo_in(*texts) -> str | None:
 
 def esc(text) -> str:
     return _html.escape(str(text or ""), quote=True)
+
+
+def plain_text(html: str | None) -> str:
+    """Visible text of an HTML fragment, whitespace collapsed."""
+    text = re.sub(r"<[^>]+>", " ", html or "")
+    return re.sub(r"\s+", " ", _html.unescape(text)).strip()
+
+
+def repo_description_html(repo_url: str, description: str | None) -> str:
+    """The module description the bridge writes: the repo link, then the repo's description."""
+    out = f'<p><a href="{esc(repo_url)}">{esc(repo_url)}</a></p>'
+    if description and description.strip():
+        out += f"<p>{esc(description.strip())}</p>"
+    return out
 
 
 def closing_refs(text: str | None, default_repo: str) -> list[tuple[str, int]]:

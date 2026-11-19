@@ -85,6 +85,12 @@ class PlaneClient:
         members = self._paged(f"/projects/{project_id}/modules/{module_id}/module-issues/")
         return any((m.get("id") or m.get("issue")) == item["id"] for m in members)
 
+    def update_module_description(self, project_id: str, module_id: str, html: str, text: str) -> None:
+        r = self.http.patch(f"/projects/{project_id}/modules/{module_id}/",
+                            json={"description_html": html, "description": text})
+        r.raise_for_status()
+        self._modules.pop(project_id, None)
+
     def set_state(self, project_id: str, item_id: str, state_id: str) -> None:
         r = self.http.patch(f"/projects/{project_id}/issues/{item_id}/", json={"state": state_id})
         r.raise_for_status()
@@ -110,6 +116,14 @@ class GitHubClient:
                      "Accept": "application/vnd.github+json",
                      "X-GitHub-Api-Version": "2022-11-28"},
             timeout=20, transport=transport)
+
+    def get_repo(self, repo: str) -> dict | None:
+        """Repo metadata (name, description, html_url), or None if the token can't see it."""
+        r = self.http.get(f"/repos/{repo}")
+        if r.status_code in (403, 404):
+            return None
+        r.raise_for_status()
+        return r.json()
 
     def create_issue(self, repo: str, title: str, body: str) -> dict:
         r = self.http.post(f"/repos/{repo}/issues", json={"title": title, "body": body})
