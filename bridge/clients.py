@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
+from email.utils import parsedate_to_datetime
 
 import httpx
 
@@ -10,14 +12,113 @@ from .github_auth import GitHubAuth
 
 log = logging.getLogger("bridge")
 
+# Longest single wait for a rate limit, and the wait when the server gives no hint.
+MAX_WAIT = 60.0
+DEFAULT_WAIT = 10.0
+
+
+def server_wait(r: httpx.Response, now: float | None = None) -> float:
+    """Seconds the server asks us to wait before retrying, uncapped (never negative).
+
+    Reads Retry-After (seconds or an HTTP date), then X-RateLimit-Reset (an epoch
+    time, or a number of seconds if it's small), else DEFAULT_WAIT.
+    """
+    now = time.time() if now is None else now
+    wait = None
+    value = (r.headers.get("Retry-After") or "").strip()
+    if value:
+        try:
+            wait = float(value)
+        except ValueError:
+            try:
+                wait = parsedate_to_datetime(value).timestamp() - now
+            except (TypeError, ValueError, IndexError):
+                wait = None
+    if wait is None:
+        reset = (r.headers.get("X-RateLimit-Reset") or "").strip()
+        try:
+            n = float(reset)
+            wait = n - now if n > 1_000_000_000 else n
+        except ValueError:
+            wait = None
+    if wait is None:
+        wait = DEFAULT_WAIT
+    return max(0.0, wait)
+
+
+def retry_after(r: httpx.Response, now: float | None = None) -> float:
+    """server_wait, capped at MAX_WAIT."""
+    return min(MAX_WAIT, server_wait(r, now))
+
+
+class Pacer:
+    """Spaces requests evenly so a client stays under a per-minute limit.
+
+    Thread-safe: each caller reserves the next free slot under a lock, then
+    sleeps outside it. per_minute <= 0 turns pacing off.
+    """
+
+    def __init__(self, per_minute: float, clock=time.monotonic, sleep=time.sleep):
+        self.interval = 60.0 / per_minute if per_minute and per_minute > 0 else 0.0
+        self.clock, self.sleep = clock, sleep
+        self._lock = threading.Lock()
+        self._next = 0.0
+        self._hold_until = 0.0      # after a 429: nobody sends before this
+
+    def hold(self, seconds: float) -> float:
+        """After a 429, make every caller wait until the server's window has passed,
+        not just the thread that got it. Returns the end of this hold."""
+        with self._lock:
+            until = self.clock() + seconds
+            self._hold_until = max(self._hold_until, until)
+            return until
+
+    def wait(self, honor_hold: bool = True, own_hold: float | None = None) -> float:
+        """Wait for this caller's slot.
+
+        own_hold: the end of a hold this caller set and has already slept through.
+        It still waits for any longer hold another thread set since.
+        """
+        with self._lock:
+            now = self.clock()
+            if not honor_hold:
+                start = now
+            elif own_hold is not None and self._hold_until <= own_hold:
+                start = now
+            else:
+                start = max(now, self._hold_until)
+            if self.interval:
+                start = max(start, self._next)
+                self._next = start + self.interval
+        delay = start - now
+        if delay > 0:
+            self.sleep(delay)
+        return delay
+
 
 def _check(r: httpx.Response) -> None:
-    """raise_for_status, but put the server's own error message in the exception and the log."""
+    """raise_for_status, logging only the status, method and path.
+
+    Error bodies can echo work item content, so they're logged at DEBUG only and
+    kept out of the exception message (which tracebacks print).
+    """
     if r.is_error:
-        detail = r.text.strip().replace("\n", " ")[:500]
-        log.error("%s %s -> %s: %s", r.request.method, r.request.url, r.status_code, detail or "(no body)")
-        raise httpx.HTTPStatusError(f"{r.status_code} from {r.request.method} {r.request.url.path}: {detail}",
+        log.error("%s %s -> %s", r.request.method, r.request.url.path, r.status_code)
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug("error body for %s %s: %s", r.request.method, r.request.url.path,
+                      r.text.strip().replace("\n", " ")[:500] or "(no body)")
+        raise httpx.HTTPStatusError(f"{r.status_code} from {r.request.method} {r.request.url.path}",
                                     request=r.request, response=r)
+
+
+def plane_not_found(r: httpx.Response) -> bool:
+    """A 404 that came from Plane's API (a JSON error body), not from a proxy in front of it."""
+    if r.status_code != 404:
+        return False
+    try:
+        return isinstance(r.json(), dict)
+    except ValueError:
+        return False
 
 
 def _results(data):
@@ -29,12 +130,19 @@ def _results(data):
 
 class PlaneClient:
     def __init__(self, base_url: str, workspace: str, api_key: str,
-                 transport: httpx.BaseTransport | None = None):
+                 transport: httpx.BaseTransport | None = None,
+                 rate_limit: float = 0, max_retries: int = 3, sleep=time.sleep,
+                 clock=time.monotonic):
+        """rate_limit: requests per minute to stay under (0 = no pacing).
+        max_retries: how often a request answered 429 is retried before giving up."""
         self.ws = workspace
         self.http = httpx.Client(
             base_url=f"{base_url}/api/v1/workspaces/{workspace}",
             headers={"X-API-Key": api_key, "Content-Type": "application/json"},
             timeout=20, transport=transport)
+        self.pacer = Pacer(rate_limit, clock=clock, sleep=sleep)
+        self.max_retries = max_retries
+        self.sleep = sleep
         self._projects: dict[str, tuple[float, dict]] = {}
         self._states: dict[str, list[dict]] = {}
         self._modules: dict[str, tuple[float, list[dict]]] = {}
@@ -45,8 +153,38 @@ class PlaneClient:
         # time the endpoint turns out not to exist, so we stop asking.
         self.module_links_supported: bool | None = None
 
+    def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        """Send a request, paced, retrying on 429 as Plane's headers say.
+
+        After max_retries the 429 response is returned, so _check raises as usual
+        and the caller (for example the catch-up sync) can stop for now. Retrying a
+        write is safe: Plane rejected it without doing anything.
+        """
+        own_hold = None
+        for attempt in range(self.max_retries + 1):
+            self.pacer.wait(own_hold=own_hold)
+            r = self.http.request(method, path, **kwargs)
+            if r.status_code != 429:
+                return r
+            if attempt == self.max_retries:
+                # Giving up, but the window is still closed: hold the others too.
+                self.pacer.hold(retry_after(r))
+                return r
+            wait = server_wait(r)
+            if wait > MAX_WAIT:
+                # Longer than we'd ever sleep: give up now rather than sleep and fail anyway.
+                log.warning("Plane rate limit: %s %s answered 429 and asks for %.0fs; not waiting",
+                            method, r.request.url.path, wait)
+                self.pacer.hold(MAX_WAIT)
+                return r
+            log.warning("Plane rate limit: %s %s answered 429; waiting %.0fs (retry %d of %d)",
+                        method, r.request.url.path, wait, attempt + 1, self.max_retries)
+            own_hold = self.pacer.hold(wait)   # other threads wait out the same window
+            self.sleep(wait)                   # this thread waits it out here, once
+        return r  # not reached
+
     def _get(self, path: str, **params):
-        r = self.http.get(path, params=params or None)
+        r = self._request("GET", path, params=params or None)
         _check(r)
         return r.json()
 
@@ -62,20 +200,51 @@ class PlaneClient:
                 break
         return out
 
-    def check_workspace(self) -> str | None:
-        """None if the API key can see the workspace; otherwise a message saying why not."""
+    def workspace_status(self) -> tuple[str | None, bool]:
+        """Check, once, that the API key can see the workspace: (problem, setup_problem).
+
+        problem is None when all is well. setup_problem is True for mistakes in the
+        configuration (wrong key or slug), which a retry won't fix, and False for
+        temporary trouble (rate limit, Plane down or unreachable). One attempt only:
+        this runs at startup, so it must not sit out rate-limit retries.
+        """
         try:
-            r = self.http.get("/projects/", params={"per_page": 1})
+            self.pacer.wait()
+            r = self.http.request("GET", "/projects/", params={"per_page": 1})
         except httpx.HTTPError as e:
-            return f"can't reach Plane's API ({e}); check PLANE_BASE_URL"
-        if r.status_code in (401,):
-            return "Plane rejected PLANE_API_KEY (401); check the token"
+            return (f"can't reach Plane's API ({type(e).__name__}); check PLANE_BASE_URL "
+                    f"if this lasts", False)
+        if r.status_code == 401:
+            return "Plane rejected PLANE_API_KEY (401); check the token", True
         if r.status_code in (403, 404):
             return (f"Plane refused workspace '{self.ws}' ({r.status_code}). PLANE_WORKSPACE must match "
-                    f"the slug in your Plane URL: https://<plane>/<slug>/projects/...")
+                    f"the slug in your Plane URL: https://<plane>/<slug>/projects/...", True)
+        if r.status_code == 429:
+            self.pacer.hold(retry_after(r))
+            return "Plane is rate-limiting this API key (429)", False
+        if r.status_code >= 500:
+            return f"Plane's API answered {r.status_code}", False
         if r.is_error:
-            return f"Plane's API answered {r.status_code} for workspace '{self.ws}'"
-        return None
+            return f"Plane's API answered {r.status_code} for workspace '{self.ws}'", True
+        return None, False
+
+    def check_workspace(self) -> str | None:
+        """None if the API key can see the workspace; otherwise a message saying why not."""
+        return self.workspace_status()[0]
+
+    def item_gone(self, project_id: str, item_id: str) -> bool:
+        """True only if Plane itself says the work item doesn't exist.
+
+        A 404 from a proxy (an HTML page while Plane restarts) doesn't count; nor
+        does any other answer. Rate limits and other errors raise as usual.
+        """
+        r = self._request("GET", f"/projects/{project_id}/issues/{item_id}/")
+        if plane_not_found(r):
+            return True
+        if r.status_code == 404:
+            return False
+        _check(r)
+        return False
 
     def projects(self) -> list[dict]:
         return self._paged("/projects/")
@@ -129,7 +298,7 @@ class PlaneClient:
         if self.module_links_supported is False:
             return "unsupported"
         path = f"/projects/{project_id}/modules/{module_id}/module-links/"
-        r = self.http.get(path)
+        r = self._request("GET", path)
         if r.status_code in (404, 405):
             self.module_links_supported = False
             log.info("this Plane's API has no module links endpoint; skipping module links")
@@ -139,34 +308,46 @@ class PlaneClient:
         wanted = url.rstrip("/").lower()
         if any((l.get("url") or "").rstrip("/").lower() == wanted for l in _results(r.json())):
             return "exists"
-        r = self.http.post(path, json={"url": url, "title": title})
+        r = self._request("POST", path, json={"url": url, "title": title})
         _check(r)
         return "added"
 
     def update_module(self, project_id: str, module_id: str, **fields) -> None:
-        r = self.http.patch(f"/projects/{project_id}/modules/{module_id}/", json=fields)
+        r = self._request("PATCH", f"/projects/{project_id}/modules/{module_id}/", json=fields)
         _check(r)
         self._modules.pop(project_id, None)
 
     def set_state(self, project_id: str, item_id: str, state_id: str) -> None:
-        r = self.http.patch(f"/projects/{project_id}/issues/{item_id}/", json={"state": state_id})
+        r = self._request("PATCH", f"/projects/{project_id}/issues/{item_id}/", json={"state": state_id})
         _check(r)
 
     def add_comment(self, project_id: str, item_id: str, html: str) -> None:
-        r = self.http.post(f"/projects/{project_id}/issues/{item_id}/comments/",
+        r = self._request("POST", f"/projects/{project_id}/issues/{item_id}/comments/",
                            json={"comment_html": html})
         _check(r)
 
     def add_link(self, project_id: str, item_id: str, url: str, title: str) -> None:
-        r = self.http.post(f"/projects/{project_id}/issues/{item_id}/links/",
+        r = self._request("POST", f"/projects/{project_id}/issues/{item_id}/links/",
                            json={"url": url, "title": title})
         if r.status_code == 400 and "already" in r.text.lower():
             return  # Plane rejects duplicate URLs; that's fine
         _check(r)
 
 
+def _github_rate_limited(r: httpx.Response) -> bool:
+    """A 429, or a 403 that is GitHub's (secondary) rate limit rather than a permission error."""
+    if r.status_code == 429:
+        return True
+    if r.status_code != 403:
+        return False
+    if r.headers.get("Retry-After") or r.headers.get("X-RateLimit-Remaining") == "0":
+        return True
+    return "rate limit" in r.text.lower()
+
+
 class GitHubClient:
-    def __init__(self, auth: "str | GitHubAuth", transport: httpx.BaseTransport | None = None):
+    def __init__(self, auth: "str | GitHubAuth", transport: httpx.BaseTransport | None = None,
+                 sleep=time.sleep):
         """auth: a GitHubAuth (app and/or token), or a plain personal access token."""
         self.auth = auth if isinstance(auth, GitHubAuth) else GitHubAuth(pat=auth)
         self.http = httpx.Client(
@@ -174,20 +355,44 @@ class GitHubClient:
             headers={"Accept": "application/vnd.github+json",
                      "X-GitHub-Api-Version": "2022-11-28"},
             auth=self.auth, timeout=20, transport=transport)
+        self.sleep = sleep
+
+    def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        """Send a request; on a rate limit, wait as GitHub says (capped) and retry once.
+
+        The auth flow (self.auth) runs inside each send: it picks the app's
+        installation token or the personal token, re-mints once on a 401 and
+        falls back to the token where the app can't reach a repo. So a rate-limit
+        retry here is a fresh send that goes through the same auth decisions.
+        """
+        r = self.http.request(method, path, **kwargs)
+        if _github_rate_limited(r):
+            wait = server_wait(r)
+            if wait > MAX_WAIT:     # e.g. the hourly primary limit: don't sleep, fail now
+                log.warning("GitHub rate limit: %s %s answered %s and asks for %.0fs; not waiting",
+                            method, r.request.url.path, r.status_code, wait)
+                return r
+            log.warning("GitHub rate limit: %s %s answered %s; waiting %.0fs and retrying once",
+                        method, r.request.url.path, r.status_code, wait)
+            self.sleep(wait)
+            r = self.http.request(method, path, **kwargs)
+        return r
 
     def get_repo(self, repo: str) -> dict | None:
         """Repo metadata (name, description, html_url), or None if the token can't see it."""
-        r = self.http.get(f"/repos/{repo}")
+        r = self._request("GET", f"/repos/{repo}")
+        if _github_rate_limited(r):
+            _check(r)           # a rate limit isn't "can't see the repo": raise, so the pass stops
         if r.status_code in (403, 404):
             return None
         _check(r)
         return r.json()
 
     def create_issue(self, repo: str, title: str, body: str) -> dict:
-        r = self.http.post(f"/repos/{repo}/issues", json={"title": title, "body": body})
+        r = self._request("POST", f"/repos/{repo}/issues", json={"title": title, "body": body})
         _check(r)
         return r.json()
 
     def update_issue(self, repo: str, number: int, **fields) -> None:
-        r = self.http.patch(f"/repos/{repo}/issues/{number}", json=fields)
+        r = self._request("PATCH", f"/repos/{repo}/issues/{number}", json=fields)
         _check(r)
