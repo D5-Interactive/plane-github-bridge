@@ -1,4 +1,4 @@
-"""HTTP entry point: two webhook endpoints and a health check."""
+"""HTTP entry point: two webhook endpoints, a health check and the GitHub App setup page."""
 from __future__ import annotations
 
 import json
@@ -7,10 +7,13 @@ import os
 import threading
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
 from .clients import GitHubClient, PlaneClient
-from .config import load_settings
+from .config import Settings, load_settings
+from .github_auth import AppCredentials, AppTokens, CredentialFile, GitHubAuth, load_private_key
+from .setup import SetupFlow
 from .render import verify_github_signature, verify_plane_signature
 from .store import Store
 from .sync import Bridge
@@ -20,14 +23,37 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
 log = logging.getLogger("bridge")
 
 
-def build_app(bridge: Bridge | None = None) -> FastAPI:
+def github_auth_for(s: Settings, transport: httpx.BaseTransport | None = None) -> GitHubAuth:
+    """App from .env (bring your own) wins, then the app /setup made, then the token alone."""
+    auth = GitHubAuth(pat=s.github_token)
+    if s.github_app_id:
+        creds = AppCredentials(app_id=s.github_app_id,
+                               private_key=load_private_key(s.github_app_private_key_path),
+                               webhook_secret=s.github_webhook_secret, source="env")
+    else:
+        creds = CredentialFile(s.data_dir).load()
+    if creds:
+        auth.use_app(AppTokens(creds, transport=transport))
+    return auth
+
+
+def build_app(bridge: Bridge | None = None,
+              github_transport: httpx.BaseTransport | None = None) -> FastAPI:
     if bridge is None:
         s = load_settings()
         bridge = Bridge(s, Store(s.db_path),
                         PlaneClient(s.plane_base_url, s.plane_workspace, s.plane_api_key),
-                        GitHubClient(s.github_token))
+                        GitHubClient(github_auth_for(s)))
     settings = bridge.s
-    state = {"plane_problem": None}
+    auth = bridge.gh.auth
+    state = {"plane_problem": None, "github_problem": None}
+    setup = SetupFlow(settings, auth, transport=github_transport)
+
+    def github_secrets() -> list[str]:
+        """Webhook secrets GitHub may sign with: the app's, and the one in .env.
+        Both are accepted so an org webhook keeps working while you move to the app."""
+        out = [auth.app.creds.webhook_secret if auth.app else "", settings.github_webhook_secret]
+        return [x for i, x in enumerate(out) if x and x not in out[:i]]
 
     stop = threading.Event()
 
@@ -49,6 +75,14 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
             log.error("PLANE SETUP PROBLEM: %s", state["plane_problem"])
         else:
             log.info("Plane workspace '%s' is reachable", settings.plane_workspace)
+        if auth.app:
+            state["github_problem"] = auth.app.check()
+            if state["github_problem"]:
+                log.error("GITHUB APP PROBLEM: %s", state["github_problem"])
+            else:
+                log.info("acting on GitHub as the app %s", auth.app.creds.slug or auth.app.creds.app_id)
+        else:
+            setup.announce()
         if settings.sync_interval > 0 and not state["plane_problem"]:
             threading.Thread(target=sync_loop, name="module-sync", daemon=True).start()
             log.info("catch-up sync of linked modules every %ss", settings.sync_interval)
@@ -67,13 +101,22 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
     if not settings.plane_webhook_secret:
         log.warning("PLANE_WEBHOOK_SECRET is not set: Plane webhooks will be refused until it is")
 
+    setup.mount(app)
+    app.state.setup = setup
+
     @app.get("/health")
     def health():
         out = {"ok": True, "mappings": len(settings.mappings),
                "plane_webhook_ready": bool(settings.plane_webhook_secret),
-               "plane_api_ok": state["plane_problem"] is None}
+               "plane_api_ok": state["plane_problem"] is None,
+               "github_auth": auth.mode,
+               "github_webhook_ready": bool(github_secrets())}
+        if auth.app and auth.app.creds.slug:
+            out["github_app"] = auth.app.creds.slug
         if state["plane_problem"]:
             out["plane_problem"] = state["plane_problem"]
+        if state["github_problem"]:
+            out["github_problem"] = state["github_problem"]
         return out
 
     @app.post("/plane/webhook", status_code=202)
@@ -93,11 +136,19 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
     async def github_webhook(request: Request, tasks: BackgroundTasks,
                              x_hub_signature_256: str | None = Header(default=None),
                              x_github_event: str = Header(default="")):
+        secrets = github_secrets()
+        if not secrets:
+            raise HTTPException(503, "no GitHub webhook secret yet: set up the GitHub App or GITHUB_WEBHOOK_SECRET")
         body = await request.body()
-        if not verify_github_signature(settings.github_webhook_secret, body, x_hub_signature_256):
+        if not any(verify_github_signature(k, body, x_hub_signature_256) for k in secrets):
             raise HTTPException(401, "bad signature")
         if x_github_event == "ping":
             return {"pong": True}
+        if x_github_event in ("installation", "installation_repositories") and auth.app:
+            account = ((json.loads(body or b"{}").get("installation") or {}).get("account") or {})
+            if account.get("login"):
+                auth.app.forget(account["login"])   # look the installation up afresh next time
+            return {"accepted": True}
         tasks.add_task(run, f"github:{x_github_event}", bridge.handle_github,
                        x_github_event, json.loads(body or b"{}"))
         return {"accepted": True}

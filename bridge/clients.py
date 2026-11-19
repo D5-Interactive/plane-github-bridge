@@ -6,6 +6,8 @@ import time
 
 import httpx
 
+from .github_auth import GitHubAuth
+
 log = logging.getLogger("bridge")
 
 
@@ -164,13 +166,14 @@ class PlaneClient:
 
 
 class GitHubClient:
-    def __init__(self, token: str, transport: httpx.BaseTransport | None = None):
+    def __init__(self, auth: "str | GitHubAuth", transport: httpx.BaseTransport | None = None):
+        """auth: a GitHubAuth (app and/or token), or a plain personal access token."""
+        self.auth = auth if isinstance(auth, GitHubAuth) else GitHubAuth(pat=auth)
         self.http = httpx.Client(
             base_url="https://api.github.com",
-            headers={"Authorization": f"Bearer {token}",
-                     "Accept": "application/vnd.github+json",
+            headers={"Accept": "application/vnd.github+json",
                      "X-GitHub-Api-Version": "2022-11-28"},
-            timeout=20, transport=transport)
+            auth=self.auth, timeout=20, transport=transport)
 
     def get_repo(self, repo: str) -> dict | None:
         """Repo metadata (name, description, html_url), or None if the token can't see it."""

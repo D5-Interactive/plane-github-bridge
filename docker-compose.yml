@@ -10,6 +10,8 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - bridge-data:/data
+      # Only for your own GitHub App (README step 5B):
+      # - ./github-app.pem:/app/github-app.pem:ro
 
 volumes:
   bridge-data:

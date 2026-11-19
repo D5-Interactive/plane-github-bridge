@@ -124,7 +124,7 @@ The examples below use placeholder names. Replace them with your own:
 |---|---|
 | `your-org` | Your GitHub organization (or username) |
 | `plane.example.com` | The address your team uses to open Plane |
-| `hooks.example.com` | The public address you give the bridge in step 5 |
+| `hooks.example.com` | The public address you give the bridge in step 4 |
 | `your-workspace` | Your Plane workspace slug |
 
 ### 1. Create your config
@@ -168,65 +168,18 @@ PLANE_WORKSPACE=your-workspace                  # the part after plane.example.c
 > A wrong slug makes every write fail with `403 You do not have permission`.
 
 > [!NOTE]
-> The bridge acts as this user. Plane's API only lets it edit projects the user
+> The bridge acts in Plane as whichever user owns this key: its comments, state
+> changes and module edits show that user's name. Your own account works; a
+> separate account just for the bridge is optional, if you'd rather the
+> activity not show a person. Plane's API only lets that user edit projects it
 > is an explicit **member** of (role Member or Admin). Being the workspace
 > owner isn't enough. Add the account to every project whose modules you'll
 > link, under **Project → Settings → Members**.
 
-### 3. GitHub token
+### 3. Start the bridge
 
-Fine-grained tokens are created from a **user account**, then pointed at the
-org. Sign in as the account the issues should come from: your own, or a
-dedicated bot account if you'd rather the issues not show your name.
-
-Create the token at <https://github.com/settings/personal-access-tokens/new>
-(your avatar → **Settings → Developer settings → Personal access tokens →
-Fine-grained tokens**):
-
-| Setting | Value |
-|---|---|
-| Resource owner | `your-org` (not your username) |
-| Repository access | **All repositories**, or only the repos you'll link |
-| Permissions | **Issues → Read and write** (Metadata → Read is added automatically) |
-
-That one permission is enough. (The automatic Metadata access lets the bridge
-read a repo's description for the module header.) Commits, branches, PRs and
-reviews reach the
-bridge inside GitHub's webhook payloads (step 7), so the token never reads
-them. Keeping it to Issues means a leaked token can't touch your code.
-
-**All repositories** means linking a new repo is done entirely in Plane. With
-**Only select repositories**, each new repo also has to be added to the token
-before its issues can be created.
-
-> [!NOTE]
-> If `your-org` doesn't appear under Resource owner, an org owner has to allow
-> fine-grained tokens first: **Org settings → Personal access tokens →
-> Settings**. If the org requires approval, the owner then approves the token
-> under **Pending requests**.
-
-Then make up a secret for the GitHub webhook:
-
-```bash
-openssl rand -hex 32
-```
-
-Put both in `.env`, along with your org name:
-
-```bash
-GITHUB_TOKEN=github_pat_0123456789abcdef
-GITHUB_WEBHOOK_SECRET=<the output of openssl rand -hex 32>
-GITHUB_ALLOWED_OWNERS=your-org
-```
-
-`GITHUB_ALLOWED_OWNERS` limits which GitHub owners anyone in Plane can link to.
-Separate several with commas; leave it empty to allow any repo the token can
-reach.
-
-Leave `PLANE_WEBHOOK_SECRET` empty for now; Plane gives you that one in step 6.
-Until then the bridge starts but turns away Plane webhooks.
-
-### 4. Start the bridge
+GitHub comes in step 5, once the bridge has a public address. Start it now
+without any GitHub settings:
 
 ```bash
 docker compose up -d --build
@@ -243,15 +196,15 @@ curl http://127.0.0.1:8095/health
 You should see:
 
 ```json
-{"ok":true,"mappings":0,"plane_webhook_ready":false,"plane_api_ok":true}
+{"ok":true,"mappings":0,"plane_webhook_ready":false,"plane_api_ok":true,"github_auth":"none","github_webhook_ready":false}
 ```
 
 `mappings` counts admin overrides in `config.yaml`, so `0` is normal.
 `plane_api_ok` is checked once at startup: `false` comes with a
 `plane_problem` message saying what's wrong (usually the workspace slug or the
-API token). `plane_webhook_ready`
-stays `false` until step 6. The log also warns that `PLANE_WEBHOOK_SECRET` is not
-set; that's expected for now.
+API token). `plane_webhook_ready` stays `false` until step 6, and the two
+`github_` fields change in step 5. The log warns about both; that's expected
+for now.
 
 If `curl` can't connect, check that the container is up and read its log:
 
@@ -265,7 +218,7 @@ docker compose logs --tail 30 bridge
 | `Missing required environment variable ...` | That line in `.env` is empty or misspelled |
 | `IsADirectoryError` or a YAML error | `config.yaml` is missing, so Docker created a folder in its place. Run `docker compose down && rmdir config.yaml && cp config.example.yaml config.yaml`, fill it in, then start again |
 
-### 5. Give it a public address
+### 4. Give it a public address
 
 Plane and GitHub need to reach the bridge over HTTPS. Point a hostname such as
 `hooks.example.com` at `http://localhost:8095` on this machine.
@@ -294,12 +247,223 @@ Check it from a **different machine**, such as your laptop:
 curl https://hooks.example.com/health
 ```
 
-You should get the same `{"ok":true,...}` as in step 4.
+You should get the same `{"ok":true,...}` as in step 3.
+
+Then tell the bridge its address, so the GitHub App gets the right webhook URL.
+Add this line to `.env`:
+
+```bash
+BRIDGE_PUBLIC_URL=https://hooks.example.com
+```
+
+and recreate the container so it reads it (a plain `restart` does not reload
+`.env`):
+
+```bash
+docker compose up -d --force-recreate
+```
 
 > [!TIP]
 > The bridge only listens on `127.0.0.1`, so your tunnel or proxy is the only
-> way in. Only `/plane/webhook`, `/github/webhook` and `/health` exist, and both
-> webhooks reject anything without a valid signature.
+> way in. Only `/plane/webhook`, `/github/webhook`, `/health` and the one-time
+> `/setup` page exist. Both webhooks reject anything without a valid signature,
+> and `/setup` needs a token from the log and closes once a GitHub App exists.
+
+### 5. Connect GitHub
+
+The bridge acts on GitHub as a **GitHub App**. Issues and comments then show as
+`your-app[bot]` instead of a person, the app belongs to the org instead of one
+member, its tokens expire after an hour, and GitHub delivers its webhooks
+without a separate org webhook. Pick one:
+
+| Option | When |
+|---|---|
+| **A. One-click app** (recommended) | You're an owner of `your-org`, or can ask one to click a button |
+| **B. Bring your own app** | Your org already has an app it wants the bridge to use |
+| **C. Personal access token** | You can't create or install apps |
+
+Whichever you choose, the app or token gets exactly these permissions and no
+more:
+
+| Permission | Access | Used for |
+|---|---|---|
+| Issues | Read and write | Creating issues and keeping them in step with Plane |
+| Pull requests | Read and write | Reading PRs linked to work items |
+| Checks | Read and write | The "Plane" check on linked commits and PRs |
+| Contents | Read | Seeing branches and commits |
+| Metadata | Read | Reading a repo's name and description (always granted) |
+
+And these webhook events: **Issues, Pull request, Pull request review, Push,
+Create** (branch or tag creation). The bridge never asks for Administration, so
+it can't rename, delete or reconfigure a repo.
+
+#### A. One-click app
+
+1. Find the setup link in the bridge's log:
+
+   ```bash
+   docker compose logs bridge | grep setup
+   ```
+
+   ```text
+   WARNING GitHub App not set up. To create one in a click, open: https://hooks.example.com/setup?token=...
+   ```
+
+   The token changes every time the container starts and stops working once an
+   app exists. Treat the link like a password until then.
+
+2. Open the link. Check the organization (filled in from
+   `GITHUB_ALLOWED_OWNERS` if set) and the app name, which must be unique on
+   all of GitHub. If you change either, click **Update**.
+3. Click **Create the app on GitHub**. GitHub shows the app with every setting
+   already filled in; confirm with **Create GitHub App for your-org**.
+4. GitHub sends you back to the bridge, which saves the app's ID, private key
+   and webhook secret (in `/data/github-app.json`, readable only by the
+   bridge) and starts using them at once. You land on the app's **Install**
+   page.
+5. Install it on `your-org`. Choose **All repositories** so linking a new repo
+   is done entirely in Plane, or **Only select repositories** if you'd rather
+   add each repo to the app as you link it.
+
+`curl http://127.0.0.1:8095/health` should now show `"github_auth":"app"`, the
+app's name in `github_app`, and `"github_webhook_ready":true`. The app's own
+webhook is already set up: skip to step 6.
+
+> [!NOTE]
+> Creating an app on an organization takes an org owner or an **app manager**
+> (Org settings → Developer settings → GitHub Apps → Management). Without that
+> role, GitHub shows a 404 after step 3. Ask an owner to open the setup link,
+> or leave the organization field empty to make the app on your own account,
+> then **transfer** it to the org from the app's settings.
+
+#### B. Bring your own app
+
+Use an existing app (Org settings → **Developer settings → GitHub Apps**) with
+the permissions and events above, and its webhook pointed at
+`https://hooks.example.com/github/webhook` with content type
+`application/json` and a webhook secret.
+
+1. From the app's page, note the **App ID** and generate a **private key**
+   (a `.pem` file). Copy the key to the server, next to `.env`:
+
+   ```bash
+   chmod 600 github-app.pem
+   sudo chown 10001 github-app.pem    # the container's user
+   ```
+
+2. In `docker-compose.yml`, uncomment the line that mounts it:
+
+   ```yaml
+         - ./github-app.pem:/app/github-app.pem:ro
+   ```
+
+3. Add to `.env`:
+
+   ```bash
+   GITHUB_APP_ID=123456
+   GITHUB_APP_PRIVATE_KEY_PATH=/app/github-app.pem
+   GITHUB_WEBHOOK_SECRET=<the app's webhook secret>
+   GITHUB_ALLOWED_OWNERS=your-org
+   ```
+
+4. Recreate the container: `docker compose up -d --force-recreate`.
+5. Install the app on `your-org` if it isn't already.
+
+An app set in `.env` takes priority over one made with `/setup`.
+
+> [!TIP]
+> Webhooks can come through a relay, such as a hub that receives an app's
+> deliveries and fans them out to several services, as long as it forwards
+> the raw body and the `X-Hub-Signature-256` and `X-GitHub-Event` headers
+> unchanged. The bridge checks the signature against the exact bytes it
+> receives, so a relay that re-encodes the JSON breaks it.
+
+#### C. Personal access token
+
+Fine-grained tokens are created from a **user account**, then pointed at the
+org. Issues and comments show as that account: your own, or a separate account
+if you'd rather they didn't show your name.
+
+1. Create the token at <https://github.com/settings/personal-access-tokens/new>
+   (your avatar → **Settings → Developer settings → Personal access tokens →
+   Fine-grained tokens**):
+
+   | Setting | Value |
+   |---|---|
+   | Resource owner | `your-org` (not your username) |
+   | Repository access | **All repositories**, or only the repos you'll link |
+   | Permissions | **Issues → Read and write** (Metadata → Read is added automatically) |
+
+   Issues is all a token needs: commits, branches, PRs and reviews reach the
+   bridge inside webhook payloads. Check runs on commits and PRs only work with
+   an app, since GitHub doesn't let tokens create them. With **Only select
+   repositories**, each new repo also has to be added to the token before its
+   issues can be created.
+
+   > [!NOTE]
+   > If `your-org` doesn't appear under Resource owner, an org owner has to
+   > allow fine-grained tokens first: **Org settings → Personal access tokens →
+   > Settings**. If the org requires approval, the owner then approves the
+   > token under **Pending requests**.
+
+2. Make up a webhook secret:
+
+   ```bash
+   openssl rand -hex 32
+   ```
+
+3. Put both in `.env`, along with your org name, and recreate the container:
+
+   ```bash
+   GITHUB_TOKEN=github_pat_0123456789abcdef
+   GITHUB_WEBHOOK_SECRET=<the output of openssl rand -hex 32>
+   GITHUB_ALLOWED_OWNERS=your-org
+   ```
+
+   ```bash
+   docker compose up -d --force-recreate
+   ```
+
+4. Add an org webhook, since a token gets no webhooks of its own. One webhook
+   on the organization covers every repo, including ones you add later. If you
+   aren't an org owner, add the same webhook to each linked repo under
+   **Repo → Settings → Webhooks** instead.
+
+   On GitHub, open **your-org → Settings → Webhooks → Add webhook** and fill in:
+
+   | Field | Value |
+   |---|---|
+   | Payload URL | `https://hooks.example.com/github/webhook` |
+   | Content type | `application/json` (the default is form-encoded; change it) |
+   | Secret | the `GITHUB_WEBHOOK_SECRET` value from `.env` |
+   | SSL verification | Enable SSL verification (the default) |
+
+   Under **Which events would you like to trigger this webhook?**, choose **Let
+   me select individual events** and make sure exactly these five are ticked
+   (**Pushes** is on by default):
+
+   - ✓ Branch or tag creation
+   - ✓ Issues
+   - ✓ Pull requests
+   - ✓ Pull request reviews
+   - ✓ Pushes
+
+   Keep **Active** ticked and click **Add webhook**.
+
+5. Open the webhook again and select the **Recent Deliveries** tab. GitHub sends
+   a ping as soon as the webhook is created; it should show a green ✓.
+
+The token keeps working alongside an app: for any account the app isn't
+installed on, the bridge falls back to it. To move from a token to an app later,
+do option A, then delete the org webhook (both secrets are accepted in the
+meantime, so nothing is missed).
+
+| Ping shows (any option) | Meaning |
+|---|---|
+| ✓ 202 | Working (202 means "accepted") |
+| ✕ 401 | The secret doesn't match the bridge's. Paste it again, or make a new one in both places |
+| ✕ 503 | The bridge has no GitHub webhook secret yet |
+| ✕ couldn't connect / 502 | GitHub can't reach the bridge. Recheck step 4 |
 
 ### 6. Plane webhook
 
@@ -323,8 +487,7 @@ You should get the same `{"ok":true,...}` as in step 4.
    PLANE_WEBHOOK_SECRET=plane_wh_0123456789abcdef
    ```
 
-5. Recreate the container so it reads the new value. A plain `restart` does not
-   reload `.env`:
+5. Recreate the container so it reads the new value:
 
    ```bash
    docker compose up -d --force-recreate
@@ -333,54 +496,8 @@ You should get the same `{"ok":true,...}` as in step 4.
 
    `plane_webhook_ready` should now be `true`.
 
-### 7. GitHub webhook
+### 7. Try it
 
-One webhook on the organization covers every repo, including ones you add
-later. If you aren't an org owner, add the same webhook to each mapped repo
-under **Repo → Settings → Webhooks** instead.
-
-1. On the server, print the webhook secret you made in step 3:
-
-   ```bash
-   grep '^GITHUB_WEBHOOK_SECRET=' .env
-   ```
-
-   GitHub doesn't generate this one; you give it the same value the bridge has.
-
-2. On GitHub, open **your-org → Settings → Webhooks → Add webhook** and fill in:
-
-   | Field | Value |
-   |---|---|
-   | Payload URL | `https://hooks.example.com/github/webhook` |
-   | Content type | `application/json` (the default is form-encoded; change it) |
-   | Secret | everything after `GITHUB_WEBHOOK_SECRET=` from step 1 |
-   | SSL verification | Enable SSL verification (the default) |
-
-3. Under **Which events would you like to trigger this webhook?**, choose **Let
-   me select individual events**. A long checklist opens. **Push** is ticked by
-   default; leave it ticked, and make sure exactly these five are on:
-
-   - ✓ Branch or tag creation
-   - ✓ Issues
-   - ✓ Pull requests
-   - ✓ Pull request reviews
-   - ✓ Pushes
-
-   Leave every other box unticked. "Send me everything" also works, since the
-   bridge ignores events it doesn't use, but it sends your server a lot of
-   pointless traffic.
-
-4. Keep **Active** ticked and click **Add webhook**.
-5. Open the webhook again and select the **Recent Deliveries** tab. GitHub sends
-   a ping as soon as the webhook is created; it should show a green ✓.
-
-| Ping shows | Meaning |
-|---|---|
-| ✓ 202 | Working (202 means "accepted") |
-| ✕ 401 | The secret doesn't match `.env`. Paste it again, or make a new one in both places |
-| ✕ couldn't connect / 502 | GitHub can't reach the bridge. Recheck step 5 |
-
-### 8. Try it
 
 Link a module to a repo as described in
 [Linking Plane to repos](#-linking-plane-to-repos), then create a work item in
@@ -435,7 +552,7 @@ Anyone who can edit a module in Plane can link it. No server access is needed.
 > The tidy-up replaces everything else in the module's name and description, so
 > keep notes in Plane Pages or the work items instead. If another module in the
 > project already has the repo's name, only the description is updated. Nothing
-> changes if the GitHub token can't see the repo or its owner isn't in
+> changes if the bridge's GitHub app or token can't see the repo or its owner isn't in
 > `GITHUB_ALLOWED_OWNERS`.
 
 Changes take effect within a minute. To unlink a module, remove the URL from
@@ -492,7 +609,8 @@ The exact rules the bridge follows. Everything here matches the code in
 
 Every request is checked against its HMAC-SHA256 signature first:
 `X-Plane-Signature` with `PLANE_WEBHOOK_SECRET`, `X-Hub-Signature-256` with
-`GITHUB_WEBHOOK_SECRET`. A bad or missing signature gets `401` and nothing else
+the GitHub App's webhook secret or `GITHUB_WEBHOOK_SECRET` (either is accepted,
+so an org webhook keeps working while you move to an app). A bad or missing signature gets `401` and nothing else
 happens. A good one gets `202 Accepted` at once and is processed in the
 background, so Plane and GitHub never wait on the bridge.
 
@@ -525,7 +643,7 @@ repo in this order and stops at the first match:
    `kept in Plane: item isn't in a module linked to a repo`.
 
 Then two last checks: the repo's owner must be in `GITHUB_ALLOWED_OWNERS` (when
-that's set), and the token must be able to create issues there.
+that's set), and the bridge's GitHub app or token must be able to create issues there.
 
 Details:
 
@@ -612,7 +730,7 @@ names are HTML-escaped, so nothing in a commit can inject markup into Plane.
 
 Runs when Plane reports a module was created or updated, and whenever a work
 item is synced through a module. If the module's description links a repo that
-the token can see and the owner is allowed:
+the bridge can see and the owner is allowed:
 
 1. **Name** → the repo's name (`auth-service`). If another module in the
    project already has that name, Plane refuses the rename and the rest still
@@ -621,8 +739,8 @@ the token can see and the owner is allowed:
    **About** text). No About text, just the link.
 
 3. **Start date** → the day the repo was created on GitHub (its `created_at`,
-   in UTC). This is the repo's creation date, not its first commit: reading
-   commits would need a token that can read code. For a repo created on GitHub
+   in UTC). This is the repo's creation date, not its first commit, which
+   would cost an extra API call per link. For a repo created on GitHub
    they're normally the same day; for one pushed from older local history,
    the first commit can be earlier. Plane refuses a start date after the
    module's target date; then the start date is left as it was.
@@ -647,6 +765,11 @@ A SQLite database at `/data/bridge.db`, in the `bridge-data` Docker volume:
 | `posted` | Which commits, branches, reviews and PR events were already posted per item |
 | `pr_links` | Which PR links were already added per item |
 
+If the GitHub App was made with `/setup`, its ID, private key and webhook secret
+are in `/data/github-app.json` in the same volume, readable only by the
+container's user. Deleting that file and recreating the container brings
+`/setup` back.
+
 > [!WARNING]
 > Deleting the volume (`docker compose down -v`) forgets every link. The next
 > edit to an already-synced work item would then create a **second** GitHub
@@ -658,8 +781,16 @@ A SQLite database at `/data/bridge.db`, in the `bridge-data` Docker volume:
   only way in.
 - Both webhooks need a valid HMAC signature. An unset `PLANE_WEBHOOK_SECRET`
   rejects every Plane webhook with `503` rather than accepting unsigned ones.
-- The GitHub token needs only **Issues: Read and write** (plus the automatic
-  **Metadata: Read**). It can't read or change code.
+- On GitHub the bridge has Issues, Pull requests and Checks (read and write)
+  and Contents and Metadata (read only). It can read code but never change it,
+  and has no Administration access, so it can't rename, delete or reconfigure
+  a repo. A personal access token needs only Issues.
+- GitHub App installation tokens are minted from the app's private key, cached
+  in memory, and replaced five minutes before their one-hour expiry. The
+  private key never leaves the server.
+- `/setup` only answers while no app is configured, and only with the one-time
+  token printed in the log. The state GitHub sends back is checked and
+  single-use, so nobody else can attach their own app to your bridge.
 - `GITHUB_ALLOWED_OWNERS` stops anyone in Plane from pointing a module at a repo
   outside your org.
 - The container runs as an unprivileged user.
@@ -678,13 +809,17 @@ A SQLite database at `/data/bridge.db`, in the `bridge-data` Docker volume:
 | `plane: module tidied for owner/repo` | Module renamed, description rewritten and/or repo link added |
 | `this Plane's API has no module links endpoint` | Your Plane can't take module links from the API; name and description still update |
 | `plane: unchanged: module already tidy` | The bridge's own edit coming back; harmless |
-| `plane: ignored: token can't see owner/repo` | Add the repo to the GitHub token, or fix the URL |
+| `plane: ignored: token can't see owner/repo` | Install the GitHub App on that repo (or add it to the token), or fix the URL |
 | `plane: ignored: ... GITHUB_ALLOWED_OWNERS` | The module links a repo outside the allowed owners |
 | `plane: ignored: duplicate delivery` | Plane retried an event already handled |
 | `github:push: ignored: commits don't touch a linked issue` | A push unrelated to any synced work item |
 | `github:pull_request: moved to review` | State changed on the work item |
 | `... failed` followed by a traceback | Something errored; the event is skipped and the bridge keeps running |
 | `WARNING PLANE_WEBHOOK_SECRET is not set` | Expected until setup step 6 is done |
+| `GitHub App not set up ... open: .../setup?token=...` | No app yet: the one-time setup link (setup step 5A) |
+| `acting on GitHub as the app ...` | Startup message; the GitHub App is in use |
+| `GITHUB APP PROBLEM: GitHub rejected the app's private key` | Wrong key for that app ID, or the server's clock is off |
+| `GitHub App isn't installed on owner` | Install the app on that account; until then the bridge uses `GITHUB_TOKEN` there if set |
 | `PLANE SETUP PROBLEM: Plane refused workspace '...'` | `PLANE_WORKSPACE` doesn't match the slug in your Plane URL |
 | `... -> 403: You do not have permission to perform this action.` | The token's account isn't a member of that project, or the slug is wrong |
 
@@ -695,7 +830,8 @@ Plane payload as received.
 
 Per Plane event the bridge makes a handful of Plane API calls (the work item,
 plus the project and module list when they're not cached) and at most one or two
-GitHub calls. Plane's API rate limit applies per API key, so a very large import
+GitHub calls. With an app, minting an installation token adds one call per
+account per hour. Plane's API rate limit applies per API key, so a very large import
 of work items into linked modules may hit it; events that fail are logged and
 skipped, and editing the item again retries it.
 
@@ -725,6 +861,8 @@ bridge/
 ├── app.py       # FastAPI app: webhook endpoints + signature checks
 ├── sync.py      # the sync rules (Plane → GitHub, GitHub → Plane)
 ├── clients.py   # Plane and GitHub REST clients
+├── github_auth.py # GitHub App JWTs, installation tokens, token fallback
+├── setup.py     # one-click GitHub App creation (manifest flow)
 ├── render.py    # HTML → Markdown, closing-reference parsing, signatures
 ├── store.py     # SQLite: item ↔ issue links, delivery de-duplication
 └── config.py    # environment settings + optional config.yaml overrides
