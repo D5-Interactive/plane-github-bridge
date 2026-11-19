@@ -503,14 +503,30 @@ Without help, an item created first and then dragged into a linked module would
 never reach GitHub. So every `BRIDGE_SYNC_INTERVAL` seconds (default 120, and
 once at startup) the bridge:
 
-1. lists the workspace's projects and their modules,
-2. picks the modules linked to a repo (description URL or `config.yaml`),
-3. creates an issue for every item in them that doesn't have one yet.
+1. adds any issue links that never reached Plane (up to 10 per pass; see below),
+2. lists the workspace's projects and their modules,
+3. picks the modules linked to a repo (description URL or `config.yaml`) whose
+   owner is allowed; projects with none are skipped without listing anything,
+4. lists each linked module's items once, and creates an issue for every item
+   that doesn't have one yet.
 
 Items that already have an issue are skipped, so it never creates duplicates.
-Projects the token's account can't read are skipped quietly. Each pass costs a
-few Plane API calls per project plus one per linked module. Set
-`BRIDGE_SYNC_INTERVAL=0` to turn it off.
+Projects the token's account can't read are skipped quietly. A pass costs one
+Plane API call for the project list, one per project for its modules, one per
+linked module, and a few per new item, so a quiet pass stays cheap however many
+items your modules hold. Set `BRIDGE_SYNC_INTERVAL=0` to turn it off.
+
+When something goes wrong:
+
+| What happens | What the pass does |
+|---|---|
+| One item fails | Logs one line with the project and item ID and the reason, then carries on with the rest |
+| GitHub refuses the item for a lasting reason (repo gone, Issues disabled, no access: 403, 404, 410, 422) | Remembers it and skips it for 6 hours. Editing the item in Plane retries it at once |
+| A temporary error (5xx, network) | Retries the item next pass |
+| Plane or GitHub rate-limits the bridge (429, or GitHub's secondary rate limit) | Stops the pass at once instead of hammering the API; the next pass picks up where it left off |
+| The issue was created but adding its link to the Plane item failed | The link is recorded as missing and added by a later pass, so the issue is never created twice |
+
+The log gets one summary line per pass, and only when the pass did something.
 
 ### Deciding whether a work item goes to GitHub
 
@@ -642,10 +658,11 @@ A SQLite database at `/data/bridge.db`, in the `bridge-data` Docker volume:
 
 | Table | Holds |
 |---|---|
-| `links` | Work item ↔ GitHub issue pairs. This is what makes "one issue per item" work |
+| `links` | Work item ↔ GitHub issue pairs, and whether the issue link reached the Plane item. This is what makes "one issue per item" work |
 | `seen_events` | Plane event IDs, to drop Plane's retries |
 | `posted` | Which commits, branches, reviews and PR events were already posted per item |
 | `pr_links` | Which PR links were already added per item |
+| `sync_failures` | Items GitHub refused for a lasting reason, and when, so the catch-up sync waits before retrying them |
 
 > [!WARNING]
 > Deleting the volume (`docker compose down -v`) forgets every link. The next
@@ -673,6 +690,10 @@ A SQLite database at `/data/bridge.db`, in the `bridge-data` Docker volume:
 | `plane: created owner/repo#12` | New issue made for a work item |
 | `plane: kept in Plane: ...` | The item isn't in a linked module; working as intended |
 | `sync: created owner/repo#12, ...` | The catch-up sync found items added to linked modules and made their issues |
+| `sync: repaired 2 Plane link(s)` | Issue links that didn't reach Plane earlier were added |
+| `sync: API item ... failed, retrying next pass (...)` | One item hit a temporary error; the rest of the pass went on |
+| `sync: API item ... not sent to owner/repo (...); retrying in 6h or when edited` | GitHub refused the item for a lasting reason, such as Issues being disabled on the repo |
+| `sync: stopped early, will resume next pass (... answered 429 ...)` | Plane or GitHub rate-limited the bridge; nothing is lost |
 | `catch-up sync of linked modules every 120s` | Startup message; the sync is on |
 | `plane: updated owner/repo#12` | Title/description edit pushed to the issue |
 | `plane: module tidied for owner/repo` | Module renamed, description rewritten and/or repo link added |
