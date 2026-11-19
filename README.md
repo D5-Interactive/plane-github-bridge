@@ -862,8 +862,18 @@ the PR says `Closes #12`. When a PR from a branch named after the issue (such
 as `12-scan`) merges and the work item moves to Done through it, the bridge
 closes the issue as completed too, and posts one comment on it saying it was
 closed because PR #N merged and the work item moved to Done, so the issue's
-subscribers are told. The comment is posted once per PR, even if GitHub
-redelivers the event, and the close is recorded as an informational
+subscribers are told. This only applies when all of these hold:
+
+- the PR was merged into the repo's **default branch** (a merge into `develop`
+  moves the work item but leaves the issue open);
+- the PR's title and description have **no closing keyword** for the issue
+  (`Closes #12`, `Fixes #12`, ...); GitHub closes those itself;
+- the branch is in the **same repo**, not a fork that happens to use a name
+  like `12-...`.
+
+The comment is posted once per PR, even if GitHub redelivers the event or
+accepted a post whose answer was lost (the bridge looks at the issue's recent
+comments before retrying), and the close is recorded as an informational
 `closed_by_merge` entry in the item's history on `/status` (no label).
 
 The other way, moving the work item into a completed or cancelled state closes
