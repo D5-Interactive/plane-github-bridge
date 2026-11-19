@@ -46,13 +46,18 @@ class World:
         self.plane_labels: list[dict] = []
         self.issues: dict[int, dict] = {}
         self.gh_labels: set[str] = set()
+        self.gh_comments: dict[int, list[str]] = {}
         self.fail: dict[tuple[str, str], list[int]] = {}   # (method, path regex) -> statuses to answer
         self.lose_create_response = 0                     # create the issue, then answer 502
         self.calls: Counter = Counter()
         self.tick = 0                                     # fake time for updated_at stamps
+        self.clock = None                                 # the bridge's clock, when set
 
     def stamp(self) -> str:
         self.tick += 1
+        if self.clock is not None:
+            from bridge.reconcile import iso
+            return iso(self.clock.t + self.tick)
         return f"2026-11-19T12:{self.tick // 60:02d}:{self.tick % 60:02d}Z"
 
     def add_item(self, n: int, name: str | None = None, state: str = "st-todo", in_module=True):
@@ -143,10 +148,10 @@ class World:
                                              "created_at": "2026-01-01T00:00:00Z"})
         if p == f"/repos/{REPO}/issues" and req.method == "POST":
             n = len(self.issues) + 1
+            made = self.stamp()
             self.issues[n] = {"number": n, "title": body["title"], "body": body.get("body", ""),
                               "state": "open", "html_url": f"https://github.com/{REPO}/issues/{n}",
-                              "created_at": "2026-11-19T10:00:00Z", "closed_at": None,
-                              "updated_at": "2026-11-19T10:00:00Z", "labels": []}
+                              "created_at": made, "closed_at": None, "updated_at": made, "labels": []}
             if self.lose_create_response:
                 self.lose_create_response -= 1
                 return httpx.Response(502, json={"message": "Bad gateway"})
@@ -176,6 +181,10 @@ class World:
         if p == f"/repos/{REPO}/labels" and req.method == "POST":
             self.gh_labels.add(body["name"])
             return httpx.Response(201, json={})
+        m = re.fullmatch(rf"/repos/{REPO}/issues/(\d+)/comments", p)
+        if m and req.method == "POST":
+            self.gh_comments.setdefault(int(m.group(1)), []).append(body["body"])
+            return httpx.Response(201, json={})
         m = re.fullmatch(rf"/repos/{REPO}/issues/(\d+)/labels(?:/(.+))?", p)
         if m:
             labels = self.issues[int(m.group(1))]["labels"]
@@ -200,6 +209,7 @@ def env(tmp_path):
                     GitHubClient("t", transport=httpx.MockTransport(world.github), sleep=lambda _s: None))
     bridge.plane.cache_seconds = 0
     bridge.clock = clock
+    world.clock = clock
     return bridge, world, clock
 
 

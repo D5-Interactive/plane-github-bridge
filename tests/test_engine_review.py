@@ -53,6 +53,19 @@ def issue_event(action, title="Item 1", **issue):
             "issue": {"number": 1, "title": title, "state": "closed" if action == "closed" else "open", **issue}}
 
 
+def gh_does(bridge, world, action, delivery, **issue):
+    """The issue really changes on GitHub, then its webhook arrives."""
+    if action in ("closed", "reopened"):
+        world.issues[1]["state"] = "closed" if action == "closed" else "open"
+        world.issues[1]["state_reason"] = issue.get("state_reason")
+    if action == "edited" and "title" in issue:
+        world.issues[1]["title"] = issue["title"]
+    event = issue_event(action, **issue)
+    if action == "edited":
+        event["changes"] = {"title": {"from": "old"}}
+    return bridge.handle_github("issues", event, delivery)
+
+
 def plane_updated(eid, prev, **data):
     e = created(eid)
     e["event"] = "workitem.updated"
@@ -83,22 +96,58 @@ def test_membership_created_issue_for_done_item_stays_done_after_a_check(env):
     assert world.items["item-1"]["state"] == "st-done"
 
 
-def test_merged_branch_pr_snapshots_github_as_it_is(env):
-    """Chaperone: a merge from branch 1-scan moves Plane to Done but leaves the issue
-    open; the snapshot records GitHub's real state, so a check doesn't reopen Plane."""
+def merged_pr(number=7, branch="1-scan", body=""):
+    pr = {"number": number, "title": "scan", "body": body, "state": "closed", "merged": True, "draft": False,
+          "html_url": f"https://github.com/{REPO}/pull/{number}", "head": {"ref": branch},
+          "base": {"ref": "main"}, "updated_at": "u"}
+    return {"action": "closed", "pull_request": pr, "repository": {"full_name": REPO}, "sender": {"login": "d"}}
+
+
+def test_merged_branch_pr_closes_the_issue_and_says_why_once(env):
+    """Aaban's decision (round 2): a merge from branch 1-scan moves Plane to Done, so
+    the bridge closes issue #1 as completed with one comment, notes it, and records
+    both real sides."""
     bridge, world, clock = env
     world.add_item(1)
     bridge.handle_plane(created())
-    pr = {"number": 7, "title": "scan", "body": "", "state": "closed", "merged": True, "draft": False,
-          "html_url": f"https://github.com/{REPO}/pull/7", "head": {"ref": "1-scan"},
-          "base": {"ref": "main"}, "updated_at": "u"}
-    bridge.handle_github("pull_request", {"action": "closed", "pull_request": pr,
-                                          "repository": {"full_name": REPO}, "sender": {"login": "d"}}, "p1")
+    r = bridge.handle_github("pull_request", merged_pr(), "p1")
+    assert "moved to done" in r and "closed on GitHub" in r and "comment posted" in r
     assert world.items["item-1"]["state"] == "st-done"
+    assert world.issues[1]["state"] == "closed" and world.issues[1]["state_reason"] == "completed"
+    (comment,) = world.gh_comments[1]
+    assert "pull request #7" in comment and "Done" in comment
     s = get_snapshot(bridge.store, "item-1")
-    assert s.p_closed is True and s.g_closed is False
+    assert s.p_closed is True and s.g_closed is True
+    notes = bridge.diag.open_problems(kind="closed_by_merge", include_resolved_since=0)
+    assert len(notes) == 1 and bridge.diag.counts()["open"] == 0      # informational, no label
+    assert world.issues[1]["labels"] == []
+    # GitHub's close webhook is the bridge's own; a redelivered merge doesn't comment again
+    assert gh_does(bridge, world, "closed", "d1", state_reason="completed") == "ignored: the bridge's own change"
+    bridge.handle_github("pull_request", merged_pr(), "p1-again")
+    assert len(world.gh_comments[1]) == 1
     check_module(bridge, clock)
-    assert world.items["item-1"]["state"] == "st-done" and world.issues[1]["state"] == "open"
+    assert world.items["item-1"]["state"] == "st-done" and world.issues[1]["state"] == "closed"
+
+
+def test_merged_pr_with_a_closing_keyword_leaves_closing_to_github(env):
+    bridge, world, clock = env
+    world.add_item(1)
+    bridge.handle_plane(created())
+    bridge.handle_github("pull_request", merged_pr(branch="feature-x", body="Closes #1"), "p1")
+    assert world.items["item-1"]["state"] == "st-done"
+    assert world.issues[1]["state"] == "open" and 1 not in world.gh_comments
+
+
+def test_failed_comment_after_merge_close_is_retried_once(env):
+    bridge, world, clock = env
+    world.add_item(1)
+    bridge.handle_plane(created())
+    world.fail[("POST", rf"github:/repos/{REPO}/issues/1/comments$")] = [503]
+    assert "queued" in bridge.handle_github("pull_request", merged_pr(), "p1")
+    assert world.issues[1]["state"] == "closed" and 1 not in world.gh_comments
+    run_queue_after(bridge, clock, 6)
+    run_queue_after(bridge, clock, 60)
+    assert len(world.gh_comments[1]) == 1
 
 
 # ---------------------------------------------------------------- 2. first contact
@@ -232,7 +281,7 @@ def test_plane_echo_of_the_bridges_own_move_is_ignored(env):
     bridge, world, clock = env
     world.add_item(1)
     bridge.handle_plane(created())
-    bridge.handle_github("issues", issue_event("closed", state_reason="completed"), "d1")
+    gh_does(bridge, world, "closed", "d1", state_reason="completed")
     assert world.items["item-1"]["state"] == "st-done"
     patches = world.calls[("github", "PATCH")]
     echo = plane_updated("e2", {"state": "st-todo"}, state="st-done")
@@ -326,8 +375,8 @@ def test_opposite_intents_coalesce_under_one_key(env):
     world.add_item(1)
     bridge.handle_plane(created())
     world.fail[("PATCH", r"plane:.*/issues/item-1/$")] = [503]
-    bridge.handle_github("issues", issue_event("closed", state_reason="completed"), "d1")
-    assert bridge.handle_github("issues", issue_event("reopened"), "d2").startswith("queued: behind")
+    gh_does(bridge, world, "closed", "d1", state_reason="completed")
+    assert gh_does(bridge, world, "reopened", "d2").startswith("queued: behind")
     entries = [e for e in bridge.queue.due(50) if e.key == "item-1"]
     assert len(entries) == 1 and entries[0].payload["target"] == "todo"
     run_queue_after(bridge, clock, 6)
@@ -508,12 +557,46 @@ def test_status_pages_are_rate_limited_per_address(env):
     from fastapi import FastAPI
     app = FastAPI()
     app.include_router(make_router(bridge.diag, "http://plane.local", "acme", per_minute=3,
+                                   trust_proxy_headers=True,
                                    transport=httpx.MockTransport(lambda r: httpx.Response(404, json={}))))
     with TestClient(app) as client:
         codes = [client.get("/status/API-1", headers={"x-api-key": "k", "cf-connecting-ip": "1.2.3.4"}).status_code
                  for _ in range(4)]
         other = client.get("/status/API-1", headers={"x-api-key": "k", "cf-connecting-ip": "5.6.7.8"})
     assert codes == [404, 404, 404, 429] and other.status_code == 404
+
+
+def test_proxy_headers_are_ignored_unless_trusted(env):
+    bridge, world, clock = env
+    from bridge.diagnostics import make_router
+    from fastapi import FastAPI
+    app = FastAPI()
+    app.include_router(make_router(bridge.diag, "http://plane.local", "acme", per_minute=2,
+                                   transport=httpx.MockTransport(lambda r: httpx.Response(404, json={}))))
+    with TestClient(app) as client:
+        # A caller rotating forged addresses is still one socket address.
+        codes = [client.get("/status/API-1", headers={"x-api-key": "k", "cf-connecting-ip": f"9.9.9.{i}"}).status_code
+                 for i in range(3)]
+    assert codes == [404, 404, 429]
+
+
+def test_remembered_addresses_are_capped(env):
+    bridge, world, clock = env
+    from bridge.diagnostics import make_router
+    from fastapi import FastAPI
+    t = [0.0]
+    router = make_router(bridge.diag, "http://plane.local", "acme", per_minute=1, trust_proxy_headers=True,
+                         max_clients=5, clock=lambda: t[0],
+                         transport=httpx.MockTransport(lambda r: httpx.Response(404, json={})))
+    app = FastAPI()
+    app.include_router(router)
+    with TestClient(app) as client:
+        for i in range(20):
+            t[0] += 0.1
+            client.get("/status/API-1", headers={"x-api-key": "k", "cf-connecting-ip": f"10.0.0.{i}"})
+        # the oldest address was forgotten, so it may ask again; the newest may not
+        assert client.get("/status/API-1", headers={"x-api-key": "k", "cf-connecting-ip": "10.0.0.0"}).status_code == 404
+        assert client.get("/status/API-1", headers={"x-api-key": "k", "cf-connecting-ip": "10.0.0.19"}).status_code == 429
 
 
 def test_org_scan_stops_between_pairs_on_shutdown(env):

@@ -44,7 +44,7 @@ from .config import Settings
 from .diagnostics import Diagnostics, fingerprint
 from .queue import RetryQueue, run_due
 from .reconcile import (CLOSED_GROUPS, Reconciler, decide, get_snapshot, github_side, item_group,
-                        last_checked, plane_side, record_snapshot)
+                        iso, last_checked, plane_side, record_snapshot)
 from .scheduler import Debouncer, ScanScheduler
 from .render import (branch_issue_number, closing_refs, esc, github_repo_in, issue_body,
                      mention_refs, normalize_plane_event, plain_text, plane_html_to_markdown,
@@ -206,7 +206,7 @@ class Bridge:
             link = self.store.by_plane_item(item_id)
             if not link:
                 return self._do("create_issue", item_id, {"project_id": project_id, "item_id": item_id})
-            changed = self._drop_plane_echoes(item_id, data, self._changed_fields(payload))
+            changed = self._drop_plane_echoes(link, data, self._changed_fields(payload))
             text = changed & {"name", "description_html", "description"}
             results = []
             if text:
@@ -220,17 +220,23 @@ class Bridge:
                 return "ignored: linked item, no title/description/state change"
             return "; ".join(results)
 
-    def _drop_plane_echoes(self, item_id: str, data: dict, changed: set[str]) -> set[str]:
+    def _drop_plane_echoes(self, link: Link, data: dict, changed: set[str]) -> set[str]:
         """Leave out changes that only report what the bridge itself just wrote."""
         changed = set(changed)
-        if "name" in changed and data.get("name") is not None and \
-                self._own(item_id, "plane_title", data["name"]):
-            changed.discard("name")
+        item_id = link.plane_item_id
+        snap = get_snapshot(self.store, item_id)
+        if "name" in changed and data.get("name") is not None:
+            holds = snap is not None and snap.p_title == data["name"]
+            if self._echo(item_id, "plane_title", data["name"], holds):
+                changed.discard("name")
         state = data.get("state") or data.get("state_id")
         if isinstance(state, dict):
             state = state.get("id")
-        if changed & {"state", "state_id"} and state and self._own(item_id, "plane_state", state):
-            changed -= {"state", "state_id"}
+        if changed & {"state", "state_id"} and state:
+            closed = self._groups(link.plane_project_id).get(state) in CLOSED_GROUPS
+            holds = snap is not None and snap.p_closed == closed
+            if self._echo(item_id, "plane_state", state, holds):
+                changed -= {"state", "state_id"}
         return changed
 
     def _changed_fields(self, payload: dict) -> set[str]:
@@ -540,7 +546,13 @@ class Bridge:
 
         ref, url = self._item_ref(project_id, item)
         issue, adopted = None, False
-        found = guards.find_similar_issue(self.gh.recent_issues(repo), item.get("name", ""), ref)
+        queued = self.queue.get("create_issue", item_id)
+        if queued is not None:
+            # Look back to the first attempt, however long ago, a few pages at most.
+            recent = self.gh.recent_issues(repo, since=iso(queued.first_seen - SINCE_SKEW))
+        else:
+            recent = self.gh.recent_issues(repo)
+        found = guards.find_similar_issue(recent, item.get("name", ""), ref)
         if found and not self.store.by_issue(repo, found["number"]):
             issue, adopted = found, True
             log.info("found %s#%s from an earlier attempt for %s; linking it instead of "
@@ -601,8 +613,10 @@ class Bridge:
             self.store.record_own_write(link.plane_item_id, "plane_state", fields["state"], now)
         return out
 
-    def _own(self, item_id: str, field: str, value) -> bool:
-        return self.store.is_own_write(item_id, field, value, self.clock() - ECHO_WINDOW)
+    def _echo(self, item_id: str, field: str, value, snapshot_holds: bool) -> bool:
+        """True if a webhook only reports the bridge's last write of this field (and the
+        snapshot still holds it). Each write matches one echo at most."""
+        return self.store.take_echo(item_id, field, value, self.clock() - ECHO_WINDOW, snapshot_holds)
 
     # ------------------------------------------------------------ actions
     #
@@ -643,16 +657,48 @@ class Bridge:
     def _queue_put(self, kind: str, key: str, payload: dict, reason: str) -> None:
         payload = {**payload, "_retry": True, "_key": key}
         if kind == "sync_item":
-            old = self.queue.get(kind, key)
-            if old is not None:
-                prev = dict(old.payload)
-                if "target" in payload:     # a newer move replaces the older one entirely
-                    for k in ("target", "match_group", "gh"):
-                        prev.pop(k, None)
-                payload = {**prev, **payload,
-                           "reconcile": bool(prev.get("reconcile") or payload.get("reconcile")),
-                           "prefer": {**(prev.get("prefer") or {}), **(payload.get("prefer") or {})}}
+            payload = self._merge_intents(self.queue.get(kind, key), payload)
         self.queue.put(kind, key, payload, reason)
+
+    _TARGET_KEYS = ("target", "match_group", "close_on_merge", "target_at")
+
+    def _merge_intents(self, old, new: dict) -> dict:
+        """Merge a newer sync_item intent into a queued one, in arrival order.
+
+        Each part carries the time it arrived (target_at, reconcile_at, prefer_at).
+        A move (target) and a request to sync open/closed (prefer closed, or a plain
+        reconcile) are about the same field: whichever came later wins, the other
+        is dropped. Title preferences are independent of moves."""
+        now = self.clock()
+        new = dict(new)
+        if new.get("target"):
+            new.setdefault("target_at", now)
+        if new.get("reconcile"):
+            new.setdefault("reconcile_at", now)
+        new["prefer_at"] = {f: (new.get("prefer_at") or {}).get(f, now) for f in (new.get("prefer") or {})}
+        if old is None:
+            return new
+        prev = dict(old.payload)
+        prefer, prefer_at = dict(prev.get("prefer") or {}), dict(prev.get("prefer_at") or {})
+        if new.get("target"):
+            # A newer move replaces an older move, and an older open/closed request.
+            for k in self._TARGET_KEYS:
+                prev.pop(k, None)
+            prefer.pop("closed", None)
+            prefer_at.pop("closed", None)
+        if new.get("reconcile"):
+            # A newer request to sync open/closed (from Plane, or a check) drops an older move.
+            if prev.get("target") and ("closed" in (new.get("prefer") or {}) or not new.get("prefer")):
+                for k in self._TARGET_KEYS:
+                    prev.pop(k, None)
+        prefer.update(new.get("prefer") or {})
+        prefer_at.update(new["prefer_at"])
+        merged = {**prev, **{k: v for k, v in new.items() if k not in ("prefer", "prefer_at")}}
+        merged["reconcile"] = bool(prev.get("reconcile") or new.get("reconcile"))
+        if merged["reconcile"]:
+            merged["reconcile_at"] = max(prev.get("reconcile_at") or 0, new.get("reconcile_at") or 0)
+        merged["prefer"], merged["prefer_at"] = prefer, prefer_at
+        return merged
 
     def _action_failed(self, kind: str, key: str, payload: dict, e: Exception) -> str:
         fk, reason = _failure_kind(e), _short_reason(e)
@@ -758,11 +804,13 @@ class Bridge:
         link = self.store.by_plane_item(p["item_id"])
         if not link:
             return "ignored: item has no issue"
-        results = []
+        parts = []
         if p.get("target"):
-            results.append(self._sync_target(link, p))
+            parts.append((p.get("target_at") or 0, 0, lambda: self._sync_target(link, p)))
         if p.get("reconcile"):
-            results.append(self._sync_reconcile(link, p.get("prefer") or {}))
+            parts.append((p.get("reconcile_at") or 0, 1,
+                          lambda: self._sync_reconcile(link, p.get("prefer") or {})))
+        results = [run() for _, _, run in sorted(parts, key=lambda x: (x[0], x[1]))]
         return "; ".join(results) or "unchanged"
 
     def _sync_target(self, link: Link, p: dict) -> str:
@@ -770,6 +818,11 @@ class Bridge:
         want_closed = TARGETS[target][1] in CLOSED_GROUPS
         item = self.plane.work_item(link.plane_project_id, link.plane_item_id)
         groups = self._groups(link.plane_project_id)
+        issue, _ = listing.issue(self.gh, link.repo, link.issue_number)
+        if issue is not None and p.get("match_group") and (issue.get("state") == "closed") != want_closed:
+            # The issue was closed or reopened again since this event: it no longer
+            # says what to do. Bring the pair in line from what both sides show now.
+            return "superseded: " + self._sync_reconcile(link, {"closed": "github"})
         if p.get("match_group") and (item_group(item, groups) in CLOSED_GROUPS) == want_closed:
             # An issue closed or reopened while the item already is: nothing to move.
             # (Often the webhook for the bridge's own write.)
@@ -779,13 +832,35 @@ class Bridge:
             result = self._move(link, target, item=item)
             p_closed = want_closed if not result.startswith("skipped") else \
                 item_group(item, groups) in CLOSED_GROUPS
-        gh = p.get("gh")
-        if gh is None:
+        if issue is not None and p.get("close_on_merge") and p_closed and target == "done":
+            result += "; " + self._close_after_merge(link, issue, p["close_on_merge"])
             issue, _ = listing.issue(self.gh, link.repo, link.issue_number)
-            gh = {"title": issue.get("title", ""), "closed": issue.get("state") == "closed"} if issue else None
-        if gh is not None:
-            self._record_pair(link, item.get("name", ""), p_closed, gh["title"], gh["closed"])
+        if issue is not None:      # GitHub as it is now, never as an old webhook said
+            self._record_pair(link, item.get("name", ""), p_closed, issue.get("title", ""),
+                              issue.get("state") == "closed")
         return result
+
+    def _close_after_merge(self, link: Link, issue: dict, pr_number: int) -> str:
+        """A PR from the issue's own branch merged and the item is Done: close the
+        issue as completed and say why on it, once (GitHub tells its subscribers)."""
+        item_id = link.plane_item_id
+        closed_key, comment_key = f"merge-close:{pr_number}", f"merge-comment:{pr_number}"
+        out = []
+        if issue.get("state") != "closed" and not guards.comment_already_posted(self.store, item_id, closed_key):
+            self._gh_update(link, state="closed", state_reason="completed")
+            self.store.post_is_new(item_id, closed_key)
+            self.diag.note("closed_by_merge", plane_project_id=link.plane_project_id, plane_item_id=item_id,
+                           repo=link.repo, issue_number=link.issue_number, detail={"pr": pr_number},
+                           key=str(pr_number))
+            out.append("closed on GitHub")
+        if guards.comment_already_posted(self.store, item_id, closed_key) and \
+                not guards.comment_already_posted(self.store, item_id, comment_key):
+            self.gh.add_issue_comment(link.repo, link.issue_number,
+                                      f"Closed by the Plane bridge: pull request #{pr_number} from this "
+                                      f"issue's branch was merged and the Plane work item moved to Done.")
+            self.store.post_is_new(item_id, comment_key)
+            out.append("comment posted")
+        return ", ".join(out) or "issue already closed"
 
     def _sync_reconcile(self, link: Link, prefer: dict) -> str:
         item = self.plane.work_item(link.plane_project_id, link.plane_item_id)
@@ -926,7 +1001,7 @@ class Bridge:
         last check of the repo are listed."""
         since = None
         if not full:
-            last = last_checked(self.store, repo)
+            last = last_checked(self.store, repo, module.get("id", ""))
             since = last - SINCE_SKEW if last is not None else None
         report = self.reconciler.reconcile_pair(project_id, module, repo, since=since)
         if report.complete:
@@ -1196,22 +1271,22 @@ class Bridge:
         item_id = link.plane_item_id
         if action in ("closed", "reopened"):
             closed = action == "closed"
-            if self._own(item_id, "gh_closed", closed):
+            snap = get_snapshot(self.store, item_id)
+            if self._echo(item_id, "gh_closed", closed, snap is not None and snap.g_closed == closed):
                 return "ignored: the bridge's own change"
             if closed:
                 target = "cancelled" if issue.get("state_reason") == "not_planned" else "done"
             else:
                 target = "todo"
             # match_group: an item already closed (or open) in Plane isn't moved again.
-            return self._sync_item(link, {"target": target, "match_group": True,
-                                          "gh": {"title": issue.get("title", ""), "closed": closed}})
+            return self._sync_item(link, {"target": target, "match_group": True})
         if action == "edited":
             if "title" not in (p.get("changes") or {}):
                 return "ignored: issue edited (not the title)"
             title = issue.get("title", "")
-            if self._own(item_id, "gh_title", title):
-                return "ignored: the bridge's own change"
             snap = get_snapshot(self.store, item_id)
+            if self._echo(item_id, "gh_title", title, snap is not None and snap.g_title == title):
+                return "ignored: the bridge's own change"
             if snap and snap.g_title == title and snap.p_title == title:
                 return "unchanged: title already synced"
             return self._sync_item(link, {"reconcile": True, "prefer": {"title": "github"}})
@@ -1246,6 +1321,7 @@ class Bridge:
         else:
             return f"ignored: pull_request {action}"
 
+        branch_num = branch_issue_number((pr.get("head") or {}).get("ref"))
         user = (p.get("sender") or {}).get("login", "someone")
         what = {
             "opened": "opened as a draft" if pr.get("draft") else "opened",
@@ -1264,7 +1340,12 @@ class Bridge:
             if what:
                 self._comment(link, f"pr:{pr.get('number')}:{action}:{pr.get('updated_at', '')}",
                               f"{self._pr_html(repo, pr)} {what} by <code>{esc(user)}</code>")
-            results.append(self._move_item(link, target))
+            extra = {}
+            if action == "closed" and pr.get("merged") and pr.get("number") is not None and \
+                    branch_num is not None and link.repo.lower() == repo.lower() and \
+                    link.issue_number == branch_num:
+                extra["close_on_merge"] = int(pr["number"])
+            results.append(self._sync_item(link, {"target": target, **extra}))
         return "; ".join(results)
 
     def _state_id(self, project_id: str, target: str) -> str | None:

@@ -97,6 +97,7 @@ class FakePlane:
 class FakeGitHub:
     def __init__(self):
         self.created, self.updated = [], []
+        self.issue_state = "open"           # what GET /issues/N answers
         self.repos = {"acme/from-plane": {"full_name": "acme/from-plane", "name": "from-plane",
                                           "created_at": "2026-10-12T18:04:55Z",
                                           "html_url": "https://github.com/acme/from-plane",
@@ -114,7 +115,7 @@ class FakeGitHub:
             return httpx.Response(200, json=[])          # newest issues: none from an earlier try
         if req.method == "GET":
             return httpx.Response(200, json={"number": int(m.group(2)), "title": "Scan command",
-                                             "state": "open"})
+                                             "state": self.issue_state})
         body = json.loads(req.content)
         if req.method == "POST":
             n = 40 + len(self.created) + 2
@@ -292,11 +293,14 @@ def test_pr_and_issue_lifecycle(env):
     assert bridge.handle_github("pull_request", gh_pr("closed", merged=True, state="closed")) == "moved to done"
     issue_closed = {"action": "closed", "repository": {"full_name": "acme/auth-service"},
                     "issue": {"number": 42, "state_reason": "completed"}}
+    fg.issue_state = "closed"
     assert bridge.handle_github("issues", issue_closed) == "unchanged: already closed in Plane"
 
     reopened = {**issue_closed, "action": "reopened"}
+    fg.issue_state = "open"
     assert bridge.handle_github("issues", reopened) == "moved to todo"
     not_planned = {**issue_closed, "issue": {"number": 42, "state_reason": "not_planned"}}
+    fg.issue_state = "closed"
     assert bridge.handle_github("issues", not_planned) == "moved to cancelled"
 
 
