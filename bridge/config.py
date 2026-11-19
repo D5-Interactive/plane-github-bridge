@@ -37,6 +37,20 @@ class Settings:
     # Requests per minute the bridge allows itself against Plane's API (0 = no
     # pacing). Plane limits each API key per minute and answers 429 above it.
     plane_rate_limit: float = 50
+    # Share of the learned rate budget kept for webhooks and retries, so background
+    # scans can't slow instant sync down (BRIDGE_RATE_RESERVE_SHARE).
+    rate_reserve_share: float = 0.3
+    # The bridge's own public address, used in the sync-problem label descriptions.
+    public_url: str = ""
+    # Seconds to wait after the last edit of a module or repo before checking it,
+    # so a burst of edits is checked once (BRIDGE_RECONCILE_DELAY).
+    reconcile_delay: float = 30
+    # A queued action older than this (seconds) is flagged as a sync problem.
+    queue_max_age: float = 300
+    # Org-wide check of every linked module and repo, scheduled by its own cost.
+    org_scan: bool = True
+    timezone: str = "UTC"
+    quiet_hours: tuple[int, int] = (1, 5)
 
     def owner_allowed(self, repo: str) -> bool:
         if not self.allowed_owners:
@@ -57,6 +71,17 @@ def _need(name: str) -> str:
     if not v:
         raise RuntimeError(f"Missing required environment variable {name}")
     return v
+
+
+def _hours(value: str) -> tuple[int, int]:
+    """"1-5" -> (1, 5): the local hours the quiet window starts and ends."""
+    try:
+        a, b = (int(x) for x in value.strip().split("-", 1))
+    except ValueError:
+        raise RuntimeError(f"BRIDGE_QUIET_HOURS must look like 1-5, not {value!r}") from None
+    if not (0 <= a <= 23 and 0 <= b <= 23):
+        raise RuntimeError(f"BRIDGE_QUIET_HOURS hours must be 0-23, not {value!r}")
+    return a, b
 
 
 def load_settings(config_path: str | None = None) -> Settings:
@@ -87,7 +112,17 @@ def load_settings(config_path: str | None = None) -> Settings:
         db_path=os.environ.get("BRIDGE_DB", "/data/bridge.db"),
         mappings=mappings,
         allowed_owners=[o.strip() for o in os.environ.get("GITHUB_ALLOWED_OWNERS", "").split(",") if o.strip()],
-        sync_interval=int(os.environ.get("BRIDGE_SYNC_INTERVAL", "120") or 0),
+        # BRIDGE_MEMBERSHIP_INTERVAL: the light pass for items added to linked modules.
+        # BRIDGE_SYNC_INTERVAL is its older name and still works.
+        sync_interval=int(os.environ.get("BRIDGE_MEMBERSHIP_INTERVAL")
+                          or os.environ.get("BRIDGE_SYNC_INTERVAL", "120") or 0),
         recheck_links=os.environ.get("BRIDGE_RECHECK_LINKS", "").strip().lower() in ("1", "true", "yes"),
         plane_rate_limit=float(os.environ.get("PLANE_RATE_LIMIT", "50") or 0),
+        rate_reserve_share=min(max(float(os.environ.get("BRIDGE_RATE_RESERVE_SHARE") or "0.3"), 0.0), 0.9),
+        public_url=os.environ.get("BRIDGE_PUBLIC_URL", "").strip().rstrip("/"),
+        reconcile_delay=float(os.environ.get("BRIDGE_RECONCILE_DELAY", "30") or 0),
+        queue_max_age=float(os.environ.get("BRIDGE_QUEUE_MAX_AGE", "300") or 300),
+        org_scan=os.environ.get("BRIDGE_ORG_SCAN", "1").strip().lower() not in ("0", "false", "no", "off"),
+        timezone=os.environ.get("BRIDGE_TIMEZONE", "UTC").strip() or "UTC",
+        quiet_hours=_hours(os.environ.get("BRIDGE_QUIET_HOURS", "1-5")),
     )

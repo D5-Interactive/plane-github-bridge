@@ -31,7 +31,7 @@ log = logging.getLogger("bridge")
 
 PLANE_LABEL_COLOR = "#E5484D"
 GITHUB_LABEL_COLOR = "E5484D"
-PLANE_ADMIN_ROLE = 20          # Plane workspace roles: 20 admin, 15 member, 5 guest
+PLANE_ADMIN_ROLE = 20          # Plane workspace roles: 20 admin, 15 member, 5 guest (checked live)
 _REF = re.compile(r"^[A-Za-z0-9]{1,12}-\d{1,9}$")
 
 
@@ -164,6 +164,35 @@ class Diagnostics:
                              ("issue", f"{repo}#{issue_number}" if repo and issue_number else repo))
                              if v))
         self._want_flags(plane_project_id, plane_item_id, repo, issue_number)
+        return pid
+
+    def note(self, kind: str, *, plane_project_id: str | None = None,
+             plane_item_id: str | None = None, repo: str | None = None,
+             issue_number: int | None = None, detail: dict | None = None, key: str = "") -> int:
+        """Record something the bridge settled on its own (for example a conflict where the
+        most recent change won). Kept for /status and the admin view as already resolved;
+        no label is added, so nothing flickers on the item."""
+        now = self.clock()
+        fp = fingerprint(kind, plane_project_id, plane_item_id, repo, issue_number, key)
+        det = json.dumps(_short(detail or {}), sort_keys=True)
+        db, lock = self.store._db, self.store._lock
+        with lock:
+            row = db.execute("SELECT id FROM sync_problems WHERE fingerprint = ?", (fp,)).fetchone()
+            if row:
+                db.execute("UPDATE sync_problems SET last_seen = ?, count = count + 1, detail = ?, "
+                           "resolved_at = ? WHERE id = ?", (now, det, now, row[0]))
+                pid = row[0]
+            else:
+                cur = db.execute(
+                    "INSERT INTO sync_problems (fingerprint, kind, plane_project_id, plane_item_id, "
+                    "repo, issue_number, detail, first_seen, last_seen, resolved_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (fp, kind, plane_project_id, plane_item_id, repo, issue_number, det, now, now, now))
+                pid = cur.lastrowid
+            db.commit()
+        log.info("sync note %s: %s", kind,
+                 " ".join(f"{k}={v}" for k, v in (("item", plane_item_id),
+                          ("issue", f"{repo}#{issue_number}" if repo and issue_number else repo)) if v))
         return pid
 
     def resolve(self, fp: str | None = None, *, kind: str | None = None,
@@ -356,7 +385,7 @@ def _reason(e: Exception) -> str:
 
 def make_router(diag: Diagnostics, plane_base_url: str, workspace: str,
                 transport: httpx.BaseTransport | None = None,
-                recent_seconds: float = 7 * 86400) -> APIRouter:
+                recent_seconds: float = 7 * 86400, on_scan=None) -> APIRouter:
     """/status/PROJECT-N and /admin/sync-problems, checked against Plane with the caller's key.
 
     The caller's key is only used for those checks: it's never stored or logged.
@@ -394,6 +423,15 @@ def make_router(diag: Diagnostics, plane_base_url: str, workspace: str,
         problems = diag.open_problems(repo=repo, project=project, kind=kind)
         return {"counts": diag.counts(), "open": [p.as_dict() for p in problems]}
 
+    if on_scan is not None:
+        @router.post("/admin/scan", status_code=202)
+        def scan(x_api_key: str | None = Header(default=None)):
+            """Run the org-wide check at the next opportunity (workspace admins only)."""
+            if not x_api_key or not _is_admin(as_caller, x_api_key, workspace):
+                raise HTTPException(403, "workspace admins only")
+            on_scan()
+            return {"scheduled": True}
+
     return router
 
 
@@ -414,7 +452,10 @@ def _is_admin(as_caller, key: str, workspace: str) -> bool:
     for m in (data if isinstance(data, list) else data.get("results", [])):
         member = m.get("member")
         mid = member.get("id") if isinstance(member, dict) else (member or m.get("id"))
+        is_bot = m.get("is_bot") or (member.get("is_bot") if isinstance(member, dict) else False)
         if mid == my_id:
+            if is_bot:       # Plane's own bot user is role 20 too; it never counts as an admin
+                return False
             try:
                 return int(m.get("role") or 0) >= PLANE_ADMIN_ROLE
             except (TypeError, ValueError):

@@ -160,6 +160,27 @@ class Store:
             self._db.commit()
             return cur.rowcount == 1
 
+    def event_seen(self, event_id: str) -> bool:
+        """True if this webhook event was already handled. Reads only."""
+        if not event_id:
+            return False
+        with self._lock:
+            return self._db.execute("SELECT 1 FROM seen_events WHERE event_id = ?",
+                                    (event_id,)).fetchone() is not None
+
+    def mark_seen(self, event_id: str) -> None:
+        """Record a webhook event as handled (after its actions succeeded or were queued)."""
+        if event_id:
+            with self._lock:
+                self._db.execute("INSERT OR IGNORE INTO seen_events (event_id) VALUES (?)", (event_id,))
+                self._db.commit()
+
+    def pr_link_known(self, item_id: str, pr_url: str) -> bool:
+        """True if this PR link was already added to the item. Reads only."""
+        with self._lock:
+            return self._db.execute("SELECT 1 FROM pr_links WHERE plane_item_id = ? AND pr_url = ?",
+                                    (item_id, pr_url)).fetchone() is not None
+
     def post_is_new(self, item_id: str, key: str) -> bool:
         """True the first time (item, key) is seen; used so GitHub activity is posted to Plane once."""
         with self._lock:

@@ -125,6 +125,7 @@ class Pacer:
         self._hold_until = 0.0      # after a 429: nobody sends before this
         # Learned from headers
         self._limit: int | None = None
+        self._limit_inferred = False             # no limit header: highest remaining + 1
         self._remaining: int | None = None
         self._reset_at: float | None = None      # on self.clock's scale
         self._others: dict[str, dict] = {}       # other GitHub resources, for /health
@@ -148,6 +149,7 @@ class Pacer:
             limit_n = int(float(limit)) if limit else None
         except ValueError:
             limit_n = None
+        from_header = limit_n is not None
         resource = _header(headers, "x-ratelimit-resource") or self.resource
         with self._lock:
             now = self.clock()
@@ -170,6 +172,9 @@ class Pacer:
             self._remaining = max(remaining_n, 0)
             seen = self._limit if same_window else None
             self._limit = limit_n or max(seen or 0, remaining_n + 1)
+            # Plane sends Remaining and Reset but no Limit: the limit is then the
+            # highest remaining value seen in this window, plus the request that used it.
+            self._limit_inferred = not from_header and (not same_window or self._limit_inferred)
 
     def _fresh(self, now: float) -> bool:
         if self._reset_at is not None and now >= self._reset_at:
@@ -284,6 +289,7 @@ class Pacer:
             out = {
                 "source": "headers" if fresh else ("configured" if self.interval else "off"),
                 "limit": self._limit if fresh else None,
+                "limit_source": (("inferred" if self._limit_inferred else "header") if fresh else None),
                 "remaining": self._remaining if fresh else None,
                 "reset_in": round(self._reset_at - now, 1) if fresh else None,
                 "interval": round(interval, 3),
@@ -529,6 +535,14 @@ class PlaneClient:
         r = self._request("PATCH", f"/projects/{project_id}/issues/{item_id}/", json={"state": state_id})
         _check(r)
 
+    def update_work_item(self, project_id: str, item_id: str, **fields) -> None:
+        r = self._request("PATCH", f"/projects/{project_id}/issues/{item_id}/", json=fields)
+        _check(r)
+
+    def item_link_urls(self, project_id: str, item_id: str) -> list[str]:
+        """The URLs already in a work item's Links section."""
+        return [l.get("url") or "" for l in self._paged(f"/projects/{project_id}/issues/{item_id}/links/")]
+
     def add_comment(self, project_id: str, item_id: str, html: str) -> None:
         r = self._request("POST", f"/projects/{project_id}/issues/{item_id}/comments/",
                            json={"comment_html": html})
@@ -605,6 +619,15 @@ class GitHubClient:
         r = self._request("POST", f"/repos/{repo}/issues", json={"title": title, "body": body})
         _check(r)
         return r.json()
+
+    def recent_issues(self, repo: str, count: int = 30) -> list[dict]:
+        """The repo's most recently created issues (open and closed), newest first.
+        Used before re-creating an issue, to find one an earlier attempt made."""
+        r = self._request("GET", f"/repos/{repo}/issues",
+                          params={"state": "all", "sort": "created", "direction": "desc",
+                                  "per_page": count})
+        _check(r)
+        return [i for i in r.json() if "pull_request" not in i]
 
     def update_issue(self, repo: str, number: int, **fields) -> None:
         r = self._request("PATCH", f"/repos/{repo}/issues/{number}", json=fields)
