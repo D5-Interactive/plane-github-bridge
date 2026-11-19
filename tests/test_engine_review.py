@@ -96,11 +96,13 @@ def test_membership_created_issue_for_done_item_stays_done_after_a_check(env):
     assert world.items["item-1"]["state"] == "st-done"
 
 
-def merged_pr(number=7, branch="1-scan", body=""):
+def merged_pr(number=7, branch="1-scan", body="", base="main", head_repo=REPO):
     pr = {"number": number, "title": "scan", "body": body, "state": "closed", "merged": True, "draft": False,
-          "html_url": f"https://github.com/{REPO}/pull/{number}", "head": {"ref": branch},
-          "base": {"ref": "main"}, "updated_at": "u"}
-    return {"action": "closed", "pull_request": pr, "repository": {"full_name": REPO}, "sender": {"login": "d"}}
+          "html_url": f"https://github.com/{REPO}/pull/{number}",
+          "head": {"ref": branch, "repo": {"full_name": head_repo}},
+          "base": {"ref": base}, "updated_at": "u"}
+    return {"action": "closed", "pull_request": pr, "sender": {"login": "d"},
+            "repository": {"full_name": REPO, "default_branch": "main"}}
 
 
 def test_merged_branch_pr_closes_the_issue_and_says_why_once(env):

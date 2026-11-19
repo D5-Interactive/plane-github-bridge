@@ -185,6 +185,8 @@ class World:
         if m and req.method == "POST":
             self.gh_comments.setdefault(int(m.group(1)), []).append(body["body"])
             return httpx.Response(201, json={})
+        if m and req.method == "GET":
+            return httpx.Response(200, json=[{"body": b} for b in self.gh_comments.get(int(m.group(1)), [])])
         m = re.fullmatch(rf"/repos/{REPO}/issues/(\d+)/labels(?:/(.+))?", p)
         if m:
             labels = self.issues[int(m.group(1))]["labels"]

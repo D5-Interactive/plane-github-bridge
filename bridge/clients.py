@@ -655,6 +655,14 @@ class GitHubClient:
                 break
         return out
 
+    def issue_comments(self, repo: str, number: int, count: int = 100) -> list[dict]:
+        """The issue's most recent comments (up to `count`, created in the last day)."""
+        since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.pacer.wall() - 86400))
+        r = self._request("GET", f"/repos/{repo}/issues/{number}/comments",
+                          params={"per_page": count, "since": since})
+        _check(r)
+        return r.json()
+
     def add_issue_comment(self, repo: str, number: int, body: str) -> None:
         r = self._request("POST", f"/repos/{repo}/issues/{number}/comments", json={"body": body})
         _check(r)

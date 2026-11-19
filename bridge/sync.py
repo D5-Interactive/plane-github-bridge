@@ -840,6 +840,29 @@ class Bridge:
                               issue.get("state") == "closed")
         return result
 
+    @staticmethod
+    def _merge_comment(pr_number: int) -> str:
+        return (f"Closed by the Plane bridge: pull request #{pr_number} from this issue's branch "
+                f"was merged and the Plane work item moved to Done.")
+
+    def _closes_on_merge(self, repo: str, p: dict, link: Link, branch_num: int | None) -> bool:
+        """Should the bridge close the issue after this merge? Only for a PR from the
+        issue's own branch in the same repo (not a fork), merged into the default
+        branch, that doesn't already say "Closes #N" (GitHub closes those itself)."""
+        pr = p.get("pull_request") or {}
+        if p.get("action") != "closed" or not pr.get("merged") or pr.get("number") is None:
+            return False
+        if branch_num is None or link.repo.lower() != repo.lower() or link.issue_number != branch_num:
+            return False
+        head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name") or ""
+        if head_repo.lower() != repo.lower():
+            return False
+        default = (p.get("repository") or {}).get("default_branch")
+        if not default or (pr.get("base") or {}).get("ref") != default:
+            return False
+        refs = closing_refs(f"{pr.get('title', '')}\n{pr.get('body') or ''}", repo)
+        return (repo.lower(), branch_num) not in {(r.lower(), n) for r, n in refs}
+
     def _close_after_merge(self, link: Link, issue: dict, pr_number: int) -> str:
         """A PR from the issue's own branch merged and the item is Done: close the
         issue as completed and say why on it, once (GitHub tells its subscribers)."""
@@ -855,11 +878,15 @@ class Bridge:
             out.append("closed on GitHub")
         if guards.comment_already_posted(self.store, item_id, closed_key) and \
                 not guards.comment_already_posted(self.store, item_id, comment_key):
-            self.gh.add_issue_comment(link.repo, link.issue_number,
-                                      f"Closed by the Plane bridge: pull request #{pr_number} from this "
-                                      f"issue's branch was merged and the Plane work item moved to Done.")
+            text = self._merge_comment(pr_number)
+            # A retry may follow a post GitHub accepted but whose answer was lost: look first.
+            if any((c.get("body") or "").strip() == text
+                   for c in self.gh.issue_comments(link.repo, link.issue_number)):
+                out.append("comment already there")
+            else:
+                self.gh.add_issue_comment(link.repo, link.issue_number, text)
+                out.append("comment posted")
             self.store.post_is_new(item_id, comment_key)
-            out.append("comment posted")
         return ", ".join(out) or "issue already closed"
 
     def _sync_reconcile(self, link: Link, prefer: dict) -> str:
@@ -1341,9 +1368,7 @@ class Bridge:
                 self._comment(link, f"pr:{pr.get('number')}:{action}:{pr.get('updated_at', '')}",
                               f"{self._pr_html(repo, pr)} {what} by <code>{esc(user)}</code>")
             extra = {}
-            if action == "closed" and pr.get("merged") and pr.get("number") is not None and \
-                    branch_num is not None and link.repo.lower() == repo.lower() and \
-                    link.issue_number == branch_num:
+            if self._closes_on_merge(repo, p, link, branch_num):
                 extra["close_on_merge"] = int(pr["number"])
             results.append(self._sync_item(link, {"target": target, **extra}))
         return "; ".join(results)

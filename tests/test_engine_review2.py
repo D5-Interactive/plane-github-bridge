@@ -2,6 +2,7 @@
 arrival order, one echo per write, the done() race, the create look-back, per-module
 `since`, and quiet-hours validation. Several tests began as the reviewers' repros
 (auditor test_aud2.py, chaperone test_r2.py / test_r2b.py), turned to assert the fix."""
+import httpx
 import pytest
 
 from bridge.config import load_settings
@@ -227,3 +228,55 @@ def test_trust_proxy_headers_setting_defaults_off(monkeypatch):
     assert load_settings("/nonexistent").trust_proxy_headers is False
     monkeypatch.setenv("BRIDGE_TRUST_PROXY_HEADERS", "1")
     assert load_settings("/nonexistent").trust_proxy_headers is True
+
+
+# ---------------------------------------------------------------- round 3: merge-close limits
+
+from test_engine_review import merged_pr  # noqa: E402
+
+
+def _linked(bridge, world):
+    world.add_item(1)
+    bridge.handle_plane(created())
+
+
+def test_merge_into_a_non_default_branch_doesnt_close_the_issue(env):
+    bridge, world, clock = env
+    _linked(bridge, world)
+    bridge.handle_github("pull_request", merged_pr(base="develop"), "p1")
+    assert world.items["item-1"]["state"] == "st-done"          # the Done move itself is unchanged
+    assert world.issues[1]["state"] == "open" and 1 not in world.gh_comments
+
+
+def test_branch_pr_that_says_closes_is_left_to_github(env):
+    bridge, world, clock = env
+    _linked(bridge, world)
+    bridge.handle_github("pull_request", merged_pr(body="Closes #1"), "p1")
+    assert world.issues[1]["state"] == "open" and 1 not in world.gh_comments
+
+
+def test_fork_pr_with_a_matching_branch_name_doesnt_close_the_issue(env):
+    bridge, world, clock = env
+    _linked(bridge, world)
+    bridge.handle_github("pull_request", merged_pr(head_repo="someone/api-fork"), "p1")
+    assert world.issues[1]["state"] == "open" and 1 not in world.gh_comments
+
+
+def test_merge_comment_accepted_but_answer_lost_isnt_posted_twice(env):
+    bridge, world, clock = env
+    _linked(bridge, world)
+    orig = world.github
+    lost = {"n": 1}
+
+    def github(req):
+        r = orig(req)
+        if req.method == "POST" and req.url.path.endswith("/1/comments") and lost["n"]:
+            lost["n"] -= 1
+            return httpx.Response(502, json={})        # GitHub kept it; the answer was lost
+        return r
+
+    bridge.gh.http._transport = httpx.MockTransport(github)
+    assert "queued" in bridge.handle_github("pull_request", merged_pr(), "p1")
+    assert len(world.gh_comments[1]) == 1
+    run_queue_after(bridge, clock, 6)
+    assert len(world.gh_comments[1]) == 1 and bridge.queue.stats()["length"] == 0
