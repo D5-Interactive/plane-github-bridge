@@ -669,7 +669,7 @@ Anything the bridge can't settle on its own is a **sync problem**:
 |---|---|---|---|
 | `stuck` | A queued action is still failing after `BRIDGE_QUEUE_MAX_AGE` seconds | Item and issue | The action succeeds |
 | `refused` | Plane or GitHub refused an action for a lasting reason | Item and issue | A later action on the item succeeds, or the item is edited in Plane (it's tried again) |
-| `state_differs` | Open on one side, closed on the other, and the bridge can't tell which is right (first contact, or both changed), or a sync left them that way (for example a fork PR merged into the default branch: Done in Plane, issue still open; or a `Closes #N` merge before GitHub has closed the issue) | Item and issue | The two sides match |
+| `state_differs` | Open on one side, closed on the other, and the bridge can't tell which is right (first contact, or both changed), or a sync left them that way (for example a fork PR merged into the default branch: Done in Plane, issue still open) | Item and issue | The two sides match |
 | `title_differs` | The titles differ and the bridge can't tell which side is right | Item and issue | The two sides match |
 | `issue_missing` | The item's linked issue is gone from the repo | Item | A check finds the issue again |
 | `unlinked_issues` | Issues in a linked repo with no Plane item | No | The repo has none |
@@ -860,6 +860,21 @@ sent. A PR event never moves a work item that's already in a completed or
 cancelled state back to In Progress or In Review (for example a branch merged
 into `main` and later into `release/1.x`); only reopening the issue does.
 
+When a PR that says `Closes #12` merges into the default branch, the work item
+moves to Done straight away and GitHub closes the issue a moment later. The
+bridge expects that and doesn't flag the gap; `BRIDGE_RECONCILE_DELAY` seconds
+later it looks again, and only if the issue is still open then is the pair
+flagged `state_differs`. (With `BRIDGE_RECONCILE=0` that second look doesn't
+run; the gap is flagged the next time the pair is synced.)
+
+**Work merged into another branch first.** A PR merged into `develop` (or any
+non-default branch) moves its items to In Review. When that work later reaches
+the default branch through a release PR (`develop` into `main`), the release
+PR isn't linked to the issue, so the items stay In Review until their issues
+are closed; closing an issue moves its item to Done. This matches GitHub, which
+also doesn't close issues on that promotion. Close the issues (or have the
+release PR say `Closes #12` for each) when the release ships.
+
 **Merged PRs from the issue's branch.** GitHub only closes an issue on merge when
 the PR says `Closes #12`. When a PR from a branch named after the issue (such
 as `12-scan`) merges and the work item moves to Done through it, the bridge
@@ -950,6 +965,7 @@ A SQLite database at `/data/bridge.db`, in the `bridge-data` Docker volume:
 | `repo_checks` | When each module was last checked against its repo, for listing only the issues changed since |
 | `pending_checks` | Module and repo checks waiting for their burst of edits to settle |
 | `scan_state` | The org scan's schedule and last measurements |
+| `expected_catch_up` | Items whose other side is about to follow (GitHub closing an issue after a `Closes #N` merge), until the delayed look |
 | `bridge_writes` | The last value the bridge wrote to each field of each item, to recognise the webhook it causes |
 | `sync_problems` | Sync problems, open and resolved, with IDs and short values only |
 | `sync_flags` | Which items and issues carry a sync problem label, and label changes still to retry |

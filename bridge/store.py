@@ -212,6 +212,31 @@ class Store:
             self._db.commit()
         return row[0] == str(value) and row[1] >= since and snapshot_holds
 
+    # -------- the other side is about to catch up (e.g. GitHub closing on "Closes #N")
+
+    def _expect_table(self) -> None:
+        self._db.execute("CREATE TABLE IF NOT EXISTS expected_catch_up (plane_item_id TEXT PRIMARY KEY, "
+                         "until REAL NOT NULL)")
+
+    def expect_catch_up(self, item_id: str, until: float) -> None:
+        with self._lock:
+            self._expect_table()
+            self._db.execute("INSERT OR REPLACE INTO expected_catch_up VALUES (?, ?)", (item_id, until))
+            self._db.commit()
+
+    def catch_up_expected(self, item_id: str, now: float) -> bool:
+        with self._lock:
+            self._expect_table()
+            row = self._db.execute("SELECT until FROM expected_catch_up WHERE plane_item_id = ?",
+                                   (item_id,)).fetchone()
+        return row is not None and row[0] >= now
+
+    def clear_catch_up(self, item_id: str) -> None:
+        with self._lock:
+            self._expect_table()
+            self._db.execute("DELETE FROM expected_catch_up WHERE plane_item_id = ?", (item_id,))
+            self._db.commit()
+
     def pr_link_known(self, item_id: str, pr_url: str) -> bool:
         """True if this PR link was already added to the item. Reads only."""
         with self._lock:

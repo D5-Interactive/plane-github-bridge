@@ -598,7 +598,10 @@ class Bridge:
                         p_title=p_title, g_title=g_title, p_closed=p_closed, g_closed=g_closed,
                         p_stamp=p_stamp, g_stamp=g_stamp, synced_at=self.clock())
         if p_closed == g_closed:
+            self.store.clear_catch_up(link.plane_item_id)
             self.diag.resolve(kind="state_differs", plane_item_id=link.plane_item_id)
+        elif self.store.catch_up_expected(link.plane_item_id, self.clock()):
+            pass        # the other side is about to follow (checked after BRIDGE_RECONCILE_DELAY)
         elif not self.diag.open_problems(kind="state_differs", plane_item_id=link.plane_item_id):
             self._report_problem({"kind": "state_differs", "field": "closed",
                                   "project_id": link.plane_project_id, "item_id": link.plane_item_id,
@@ -851,6 +854,12 @@ class Bridge:
             result = self._move(link, target, item=item)
             p_closed = want_closed if not result.startswith("skipped") else \
                 item_group(item, groups) in CLOSED_GROUPS
+        if p.get("expect_github_close") and p_closed and target == "done" and \
+                issue is not None and issue.get("state") != "closed":
+            # "Closes #N" merged into the default branch: GitHub closes the issue itself,
+            # a moment later. Don't flag that gap; check once the delay has passed.
+            self.store.expect_catch_up(link.plane_item_id, self.clock() + self.debounce.delay + 60)
+            self.debounce.touch(f"item:{link.plane_item_id}")
         if issue is not None and p.get("close_on_merge") and p_closed and target == "done":
             result += "; " + self._close_after_merge(link, issue, p["close_on_merge"])
             issue, _ = listing.issue(self.gh, link.repo, link.issue_number)
@@ -1081,9 +1090,25 @@ class Bridge:
                 log.warning("check of %s failed (%s)", key.split(":", 1)[0], _short_reason(e))
         return done
 
+    def _check_caught_up(self, item_id: str) -> None:
+        """The delay after an expected catch-up has passed: record the pair as it is
+        now, which flags state_differs if the other side still hasn't followed."""
+        self.store.clear_catch_up(item_id)
+        link = self.store.by_plane_item(item_id)
+        if not link:
+            return
+        item = self.plane.work_item(link.plane_project_id, item_id)
+        issue, _ = listing.issue(self.gh, link.repo, link.issue_number)
+        if issue is None:
+            return
+        p = plane_side(item, self._groups(link.plane_project_id))
+        self._record_pair(link, p.title, p.closed, issue.get("title", ""), issue.get("state") == "closed")
+
     def _reconcile_key(self, key: str) -> list[str]:
         out = []
-        if key.startswith("module:"):
+        if key.startswith("item:"):
+            self._check_caught_up(key[len("item:"):])
+        elif key.startswith("module:"):
             _, pid, mid = key.split(":", 2)
             project = self.plane.project(pid)
             mod = next((m for m in self.plane.modules(pid) if m["id"] == mid), None)
@@ -1374,6 +1399,8 @@ class Bridge:
             return f"ignored: pull_request {action}"
 
         branch_num = branch_issue_number((pr.get("head") or {}).get("ref"))
+        keyword_refs = {(r.lower(), n) for r, n in
+                        closing_refs(f"{pr.get('title', '')}\n{pr.get('body') or ''}", repo)}
         user = (p.get("sender") or {}).get("login", "someone")
         what = {
             "opened": "opened as a draft" if pr.get("draft") else "opened",
@@ -1395,6 +1422,9 @@ class Bridge:
             extra, link_target = {}, target
             if self._closes_on_merge(repo, p, link, branch_num):
                 extra["close_on_merge"] = int(pr["number"])
+            elif action == "closed" and pr.get("merged") and self._merged_into_default(p) and \
+                    (link.repo.lower(), link.issue_number) in keyword_refs:
+                extra["expect_github_close"] = True
             elif action == "closed" and pr.get("merged") and not self._merged_into_default(p):
                 # Merged into another branch (develop, a release branch): the work isn't
                 # on the default branch yet, so In Review, and the issue stays open, as

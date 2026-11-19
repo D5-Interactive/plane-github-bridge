@@ -392,16 +392,48 @@ def test_divergent_pair_is_never_recorded_silently(env):
     assert "plane-sync-problem" not in world.issues[1]["labels"]
 
 
-def test_closing_keyword_merge_flags_until_github_closes_the_issue(env):
-    """Default-branch merge with "Closes #1": Done in Plane while GitHub hasn't closed
-    the issue yet is flagged, and the flag clears when GitHub's close arrives."""
+def test_keyword_merge_never_flags_when_github_closes_in_time(env):
+    """Default-branch merge with "Closes #1": Plane moves to Done before GitHub has
+    closed the issue. That gap is expected and never labelled."""
     bridge, world, clock = env
+    bridge.debounce.clock = clock
     _linked(bridge, world)
     bridge.handle_github("pull_request", merged_pr(branch="feature-x", body="Closes #1"), "p1")
-    assert bridge.diag.open_problems(kind="state_differs")
-    gh_does(bridge, world, "closed", "d1", state_reason="completed")
+    assert world.items["item-1"]["state"] == "st-done" and world.issues[1]["state"] == "open"
     assert bridge.diag.open_problems(kind="state_differs") == []
-    assert world.items["item-1"]["state"] == "st-done"
+    assert world.issues[1]["labels"] == []
+    clock.t += 3
+    gh_does(bridge, world, "closed", "d1", state_reason="completed")    # GitHub's own close
+    clock.t += bridge.debounce.delay + 1
+    bridge.run_reconciles()                                             # the delayed check
+    assert bridge.diag.counts()["open"] == 0 and bridge.diag.counts()["flags_pending"] == 0
+    assert world.issues[1]["labels"] == [] and world.items["item-1"]["labels"] == []
+
+
+def test_keyword_merge_still_open_after_the_check_is_flagged(env):
+    bridge, world, clock = env
+    bridge.debounce.clock = clock
+    _linked(bridge, world)
+    bridge.handle_github("pull_request", merged_pr(branch="feature-x", body="Closes #1"), "p1")
+    assert bridge.diag.open_problems(kind="state_differs") == []
+    clock.t += bridge.debounce.delay + 1                                # GitHub never closed it
+    bridge.run_reconciles()
+    (problem,) = bridge.diag.open_problems(kind="state_differs")
+    assert problem.plane_item_id == "item-1" and "plane-sync-problem" in world.issues[1]["labels"]
+    gh_does(bridge, world, "closed", "d1", state_reason="completed")    # someone closes it
+    assert bridge.diag.open_problems(kind="state_differs") == []
+
+
+def test_expected_catch_up_doesnt_hide_other_divergence_after_it_expires(env):
+    bridge, world, clock = env
+    _linked(bridge, world)
+    link = bridge.store.by_plane_item("item-1")
+    bridge.store.expect_catch_up("item-1", clock.t + 10)
+    bridge._record_pair(link, "Item 1", True, "Item 1", False)
+    assert bridge.diag.open_problems(kind="state_differs") == []
+    clock.t += 11
+    bridge._record_pair(link, "Item 1", True, "Item 1", False)
+    assert bridge.diag.open_problems(kind="state_differs")
 
 
 def test_main_then_release_merge_keeps_the_item_done(env):
