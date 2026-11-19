@@ -3,8 +3,8 @@ services:
     build: .
     container_name: plane-github-bridge
     restart: unless-stopped
-    # Host networking: the bridge reaches Plane at localhost:8090 and listens on
-    # 127.0.0.1:8095, which only cloudflared on this machine can reach.
+    # Host networking: the bridge reaches Plane on localhost and listens on
+    # 127.0.0.1:8095, so only a tunnel or reverse proxy on this machine can reach it.
     network_mode: host
     env_file: .env
     volumes:

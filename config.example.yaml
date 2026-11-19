@@ -1,6 +1,6 @@
 # Which Plane work items get a GitHub issue, and in which repo.
 #
-#   project: the Plane project identifier (the prefix in IDs like SECDEV-12)
+#   project: the Plane project identifier (the prefix in IDs like API-12)
 #   module:  optional Plane module name. With it, only items in that module sync.
 #            Without it, every item in the project syncs to that repo.
 #   repo:    the GitHub repository, owner/name
@@ -9,9 +9,10 @@
 # the module mapping wins.
 
 mappings:
-  - project: SECDEV
-    module: DBGC
-    repo: D5-Interactive/DBGC
+  - project: API
+    module: Auth
+    repo: your-org/auth-service
 
-  # - project: WEBDEV
-  #   repo: D5-Interactive/d5i.store
+  # Every work item in the WEB project goes to one repo:
+  # - project: WEB
+  #   repo: your-org/website

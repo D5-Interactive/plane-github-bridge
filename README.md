@@ -43,7 +43,7 @@ Edition the part that matters for a Scrum team:
 sequenceDiagram
     autonumber
     participant P as Plane
-    participant B as Bridge<br/>(hooks.d5i.dev)
+    participant B as Bridge
     participant G as GitHub
 
     P->>B: webhook: work item created / edited
@@ -85,11 +85,24 @@ git clone https://github.com/D5-Interactive/plane-github-bridge.git
 cd plane-github-bridge
 ```
 
-**Requirements:** Docker with Compose v2, a running Plane Community Edition
-instance, and a Cloudflare Tunnel (or any other way to give the bridge a public
-HTTPS address).
+**Requirements:**
+
+- Docker with Compose v2
+- A running Plane Community Edition instance on the same machine
+- A GitHub organization (or personal account) that owns the repos to sync
+- A way to give the bridge a public HTTPS address, such as a Cloudflare Tunnel
+  or a reverse proxy
 
 ## ◆ Setup
+
+The examples below use placeholder names. Replace them with your own:
+
+| Placeholder | Means |
+|---|---|
+| `your-org` | Your GitHub organization (or username) |
+| `plane.example.com` | The address your team uses to open Plane |
+| `hooks.example.com` | The public address you give the bridge in step 5 |
+| `your-workspace` | Your Plane workspace slug |
 
 ### 1. Create your config
 
@@ -110,9 +123,9 @@ Open `config.yaml` (`nano config.yaml`) and map Plane projects and modules to re
 
 ```yaml
 mappings:
-  - project: SECDEV          # Plane project identifier (the prefix in SECDEV-12)
-    module: DBGC             # optional: only items in this module sync
-    repo: D5-Interactive/DBGC
+  - project: API             # Plane project identifier (the prefix in API-12)
+    module: Auth             # optional: only items in this module sync
+    repo: your-org/auth-service
 ```
 
 A module mapping wins over a project-wide one.
@@ -129,14 +142,12 @@ or spaces:
 PLANE_API_KEY=plane_api_0123456789abcdef
 ```
 
-While you're in `.env`, check the three lines above it. The defaults fit a
-standard install; change `PLANE_WORKSPACE` if your workspace URL isn't
-`plane.d5i.dev/d5i`:
+While you're in `.env`, fill in the three lines above it:
 
 ```bash
-PLANE_BASE_URL=http://localhost:8090       # where the bridge reaches Plane on this machine
-PLANE_PUBLIC_URL=https://plane.d5i.dev     # the address people click
-PLANE_WORKSPACE=d5i                        # the part after plane.d5i.dev/ in your browser
+PLANE_BASE_URL=http://localhost:80              # Plane's port on this machine (LISTEN_HTTP_PORT in plane.env)
+PLANE_PUBLIC_URL=https://plane.example.com      # the address your team opens Plane at
+PLANE_WORKSPACE=your-workspace                  # the part after plane.example.com/ in your browser
 ```
 
 > [!NOTE]
@@ -145,18 +156,25 @@ PLANE_WORKSPACE=d5i                        # the part after plane.d5i.dev/ in yo
 
 ### 3. GitHub token
 
-Create a fine-grained token at
-<https://github.com/settings/personal-access-tokens/new>:
+Fine-grained tokens are created from a **user account**, then pointed at the
+org. Sign in as the account the issues should come from: your own, or a
+dedicated bot account if you'd rather the issues not show your name.
+
+Create the token at <https://github.com/settings/personal-access-tokens/new>
+(your avatar → **Settings → Developer settings → Personal access tokens →
+Fine-grained tokens**):
 
 | Setting | Value |
 |---|---|
-| Resource owner | `D5-Interactive` |
+| Resource owner | `your-org` (not your username) |
 | Repository access | Only the repos in `config.yaml` |
 | Permissions | **Issues → Read and write** (Metadata → Read is added automatically) |
 
-If the org requires approval for fine-grained tokens, an owner approves it under
-**Org settings → Personal access tokens → Pending requests**. Issues the bridge
-creates show as opened by the token's owner.
+> [!NOTE]
+> If `your-org` doesn't appear under Resource owner, an org owner has to allow
+> fine-grained tokens first: **Org settings → Personal access tokens →
+> Settings**. If the org requires approval, the owner then approves the token
+> under **Pending requests**.
 
 Then make up a secret for the GitHub webhook:
 
@@ -184,19 +202,30 @@ curl http://127.0.0.1:8095/health
 
 ### 5. Give it a public address
 
-Cloudflare Zero Trust → **Networks → Tunnels** → your tunnel → **Add route →
-Published application**:
+Plane and GitHub need to reach the bridge over HTTPS. Point a hostname such as
+`hooks.example.com` at `http://localhost:8095` on this machine.
+
+**With a Cloudflare Tunnel:** Zero Trust → **Networks → Tunnels** → your tunnel
+→ **Add route → Published application**:
 
 | Field | Value |
 |---|---|
 | Subdomain | `hooks` |
-| Domain | `d5i.dev` |
+| Domain | `example.com` |
 | Service URL | `http://localhost:8095` |
 
+**With a reverse proxy** such as Caddy:
+
+```
+hooks.example.com {
+    reverse_proxy 127.0.0.1:8095
+}
+```
+
 > [!TIP]
-> The bridge only listens on `127.0.0.1`, so the tunnel is the only way in.
-> Only `/plane/webhook`, `/github/webhook` and `/health` exist, and both webhooks
-> reject anything without a valid signature.
+> The bridge only listens on `127.0.0.1`, so your tunnel or proxy is the only
+> way in. Only `/plane/webhook`, `/github/webhook` and `/health` exist, and both
+> webhooks reject anything without a valid signature.
 
 ### 6. Plane webhook
 
@@ -204,7 +233,7 @@ Plane → **Workspace settings → Webhooks → Add webhook**:
 
 | Field | Value |
 |---|---|
-| URL | `https://hooks.d5i.dev/plane/webhook` |
+| URL | `https://hooks.example.com/plane/webhook` |
 | Events | Work items (issues) only |
 
 Plane shows a secret that starts with `plane_wh_`. Put it in `.env`:
@@ -219,13 +248,15 @@ Then restart the bridge so it reads the new value:
 docker compose up -d --force-recreate
 ```
 
-### 7. GitHub org webhook
+### 7. GitHub webhook
 
-GitHub → **D5-Interactive → Settings → Webhooks → Add webhook**:
+GitHub → **your-org → Settings → Webhooks → Add webhook**. One org webhook covers
+every repo, including ones you add later. Without org owner access, add the same
+webhook to each mapped repo under **Repo settings → Webhooks** instead.
 
 | Field | Value |
 |---|---|
-| Payload URL | `https://hooks.d5i.dev/github/webhook` |
+| Payload URL | `https://hooks.example.com/github/webhook` |
 | Content type | `application/json` |
 | Secret | the `GITHUB_WEBHOOK_SECRET` value from `.env` |
 | Events | **Let me select** → ✓ Issues, ✓ Pull requests |

@@ -15,7 +15,7 @@ from bridge.render import (closing_refs, normalize_plane_event, plane_html_to_ma
 from bridge.store import Store
 from bridge.sync import Bridge
 
-PROJ, ITEM, MOD = "proj-1", "item-1", "mod-dbgc"
+PROJ, ITEM, MOD = "proj-1", "item-1", "mod-auth"
 STATES = [
     {"id": "s-backlog", "name": "Backlog", "group": "backlog"},
     {"id": "s-todo", "name": "Todo", "group": "unstarted"},
@@ -40,15 +40,15 @@ class FakePlane:
 
     def handler(self, req: httpx.Request) -> httpx.Response:
         assert req.headers["X-API-Key"] == "plane-key"
-        p = req.url.path.split("/workspaces/d5i", 1)[1]
+        p = req.url.path.split("/workspaces/acme", 1)[1]
         if req.method == "GET" and p == f"/projects/{PROJ}/":
-            return httpx.Response(200, json={"id": PROJ, "identifier": "SECDEV"})
+            return httpx.Response(200, json={"id": PROJ, "identifier": "API"})
         if req.method == "GET" and p == f"/projects/{PROJ}/issues/{ITEM}/":
             return httpx.Response(200, json=self.item)
         if req.method == "GET" and p == f"/projects/{PROJ}/states/":
             return httpx.Response(200, json={"results": STATES, "next_page_results": False})
         if req.method == "GET" and p == f"/projects/{PROJ}/modules/":
-            return httpx.Response(200, json={"results": [{"id": MOD, "name": "DBGC"}]})
+            return httpx.Response(200, json={"results": [{"id": MOD, "name": "Auth"}]})
         if req.method == "GET" and p == f"/projects/{PROJ}/modules/{MOD}/module-issues/":
             return httpx.Response(200, json={"results": [{"id": i} for i in self.module_members]})
         if req.method == "PATCH" and p == f"/projects/{PROJ}/issues/{ITEM}/":
@@ -81,13 +81,13 @@ class FakeGitHub:
 
 @pytest.fixture
 def env(tmp_path):
-    s = Settings(plane_base_url="http://plane.local", plane_public_url="https://plane.d5i.dev",
-                 plane_workspace="d5i", plane_api_key="plane-key", plane_webhook_secret="plane_wh_secret",
+    s = Settings(plane_base_url="http://plane.local", plane_public_url="https://plane.example.com",
+                 plane_workspace="acme", plane_api_key="plane-key", plane_webhook_secret="plane_wh_secret",
                  github_token="gh-token", github_webhook_secret="gh-secret",
-                 mappings=[Mapping(project="SECDEV", module="DBGC", repo="D5-Interactive/DBGC")])
+                 mappings=[Mapping(project="API", module="Auth", repo="acme/auth-service")])
     fp, fg = FakePlane(), FakeGitHub()
     bridge = Bridge(s, Store(str(tmp_path / "b.db")),
-                    PlaneClient(s.plane_base_url, "d5i", "plane-key", transport=httpx.MockTransport(fp.handler)),
+                    PlaneClient(s.plane_base_url, "acme", "plane-key", transport=httpx.MockTransport(fp.handler)),
                     GitHubClient("gh-token", transport=httpx.MockTransport(fg.handler)))
     return bridge, fp, fg
 
@@ -132,21 +132,21 @@ def test_markdown_keeps_checklists():
 
 
 def test_closing_refs():
-    text = "Closes #12, fixes D5-Interactive/Other#3 and resolves: #12. Mentions #99."
-    assert closing_refs(text, "D5-Interactive/DBGC") == [
-        ("D5-Interactive/DBGC", 12), ("D5-Interactive/Other", 3)]
+    text = "Closes #12, fixes acme/other#3 and resolves: #12. Mentions #99."
+    assert closing_refs(text, "acme/auth-service") == [
+        ("acme/auth-service", 12), ("acme/other", 3)]
 
 
 # ---------------------------------------------------------------- flows
 
 def test_created_item_in_module_makes_issue_once(env):
     bridge, fp, fg = env
-    assert bridge.handle_plane(plane_event()).startswith("created D5-Interactive/DBGC#42")
+    assert bridge.handle_plane(plane_event()).startswith("created acme/auth-service#42")
     repo, body = fg.created[0]
-    assert repo == "D5-Interactive/DBGC" and body["title"] == "Scan command"
+    assert repo == "acme/auth-service" and body["title"] == "Scan command"
     assert "- [ ] Scans all maps" in body["body"]
-    assert "https://plane.d5i.dev/d5i/browse/SECDEV-7/" in body["body"]
-    assert fp.links[0]["url"] == "https://github.com/D5-Interactive/DBGC/issues/42"
+    assert "https://plane.example.com/acme/browse/API-7/" in body["body"]
+    assert fp.links[0]["url"] == "https://github.com/acme/auth-service/issues/42"
     # an update afterwards (e.g. our own link being added) must not create a second issue
     bridge.handle_plane(plane_event("workitem.updated", "e2", {"state": "x"}))
     assert len(fg.created) == 1
@@ -164,7 +164,7 @@ def test_item_added_to_module_later(env):
 
 def test_unmapped_project_ignored(env):
     bridge, fp, fg = env
-    bridge.s.mappings = [Mapping(project="WEBDEV", repo="D5-Interactive/d5i.store")]
+    bridge.s.mappings = [Mapping(project="WEB", repo="acme/website")]
     assert "no mapping" in bridge.handle_plane(plane_event())
     assert not fg.created
 
@@ -174,15 +174,15 @@ def test_title_and_description_edits_pushed(env):
     bridge.handle_plane(plane_event())
     fp.item["name"] = "Scan command v2"
     out = bridge.handle_plane(plane_event("workitem.updated", "e3", {"name": "Scan command"}))
-    assert out == "updated D5-Interactive/DBGC#42"
+    assert out == "updated acme/auth-service#42"
     assert fg.updated[-1][2]["title"] == "Scan command v2"
 
 
 def gh_pr(action, number=5, body="Closes #42", draft=False, merged=False, state="open"):
-    return {"action": action, "repository": {"full_name": "D5-Interactive/DBGC"},
+    return {"action": action, "repository": {"full_name": "acme/auth-service"},
             "pull_request": {"number": number, "title": "Add scan", "body": body, "draft": draft,
                              "merged": merged, "state": state,
-                             "html_url": f"https://github.com/D5-Interactive/DBGC/pull/{number}"}}
+                             "html_url": f"https://github.com/acme/auth-service/pull/{number}"}}
 
 
 def test_pr_and_issue_lifecycle(env):
@@ -197,7 +197,7 @@ def test_pr_and_issue_lifecycle(env):
     assert len(pr_links) == 1  # PR link added once, not on every event
 
     assert bridge.handle_github("pull_request", gh_pr("closed", merged=True, state="closed")) == "moved to done"
-    issue_closed = {"action": "closed", "repository": {"full_name": "D5-Interactive/DBGC"},
+    issue_closed = {"action": "closed", "repository": {"full_name": "acme/auth-service"},
                     "issue": {"number": 42, "state_reason": "completed"}}
     assert bridge.handle_github("issues", issue_closed) == "unchanged: already done"
 

@@ -9,16 +9,16 @@ import yaml
 
 @dataclass
 class Mapping:
-    project: str               # Plane project identifier, e.g. "SECDEV"
-    repo: str                  # GitHub "owner/name", e.g. "D5-Interactive/DBGC"
+    project: str               # Plane project identifier, e.g. "API"
+    repo: str                  # GitHub "owner/name", e.g. "your-org/auth-service"
     module: str | None = None  # Plane module name; None = every work item in the project
 
 
 @dataclass
 class Settings:
-    plane_base_url: str        # how the bridge reaches Plane's API, e.g. http://localhost:8090
-    plane_public_url: str      # what humans click, e.g. https://plane.d5i.dev
-    plane_workspace: str       # workspace slug, e.g. "d5i"
+    plane_base_url: str        # how the bridge reaches Plane's API, e.g. http://localhost:80
+    plane_public_url: str      # what humans click, e.g. https://plane.example.com
+    plane_workspace: str       # workspace slug, e.g. "your-workspace"
     plane_api_key: str
     plane_webhook_secret: str
     github_token: str

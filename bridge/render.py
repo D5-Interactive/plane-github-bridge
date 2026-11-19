@@ -97,7 +97,7 @@ _CLOSING = re.compile(
 
 
 def closing_refs(text: str | None, default_repo: str) -> list[tuple[str, int]]:
-    """Issues a PR says it closes: 'Closes #12', 'fixes D5-Interactive/DBGC#3', ..."""
+    """Issues a PR says it closes: 'Closes #12', 'fixes your-org/repo#3', ..."""
     if not text:
         return []
     out: list[tuple[str, int]] = []
