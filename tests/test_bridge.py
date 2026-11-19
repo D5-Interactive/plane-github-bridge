@@ -49,6 +49,8 @@ class FakePlane:
     def handler(self, req: httpx.Request) -> httpx.Response:
         assert req.headers["X-API-Key"] == "plane-key"
         p = req.url.path.split("/workspaces/acme", 1)[1]
+        if req.method == "GET" and p == "/projects/":
+            return httpx.Response(200, json={"results": [{"id": PROJ, "identifier": "API"}]})
         if req.method == "GET" and p == f"/projects/{PROJ}/":
             return httpx.Response(200, json={"id": PROJ, "identifier": "API", "description": self.project_desc})
         if req.method == "GET" and p == f"/projects/{PROJ}/issues/{ITEM}/":
@@ -516,3 +518,20 @@ def test_refused_name_and_start_still_update_description(env):
     bridge.handle_plane(module_event("see https://github.com/acme/from-plane"))
     assert fp.module_desc.startswith('<p><a href="https://github.com/acme/from-plane">')
     assert fp.module_name == "Auth" and fp.module_start is None
+
+
+def test_workspace_check(env, tmp_path):
+    bridge, fp, fg = env
+    assert bridge.plane.check_workspace() is None
+    wrong = PlaneClient("http://plane.local", "typo", "plane-key",
+                        transport=httpx.MockTransport(lambda r: httpx.Response(403, json={"detail": "no"})))
+    assert "must match the slug" in wrong.check_workspace()
+
+
+def test_health_reports_plane_problem(env):
+    bridge, fp, fg = env
+    bridge.plane = PlaneClient("http://plane.local", "typo", "plane-key",
+                               transport=httpx.MockTransport(lambda r: httpx.Response(403, json={})))
+    with TestClient(build_app(bridge)) as client:
+        body = client.get("/health").json()
+    assert body["plane_api_ok"] is False and "typo" in body["plane_problem"]

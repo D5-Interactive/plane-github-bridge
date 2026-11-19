@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 
@@ -25,7 +26,19 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
                         PlaneClient(s.plane_base_url, s.plane_workspace, s.plane_api_key),
                         GitHubClient(s.github_token))
     settings = bridge.s
-    app = FastAPI(title="Plane-GitHub bridge", docs_url=None, redoc_url=None, openapi_url=None)
+    state = {"plane_problem": None}
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        state["plane_problem"] = bridge.plane.check_workspace()
+        if state["plane_problem"]:
+            log.error("PLANE SETUP PROBLEM: %s", state["plane_problem"])
+        else:
+            log.info("Plane workspace '%s' is reachable", settings.plane_workspace)
+        yield
+
+    app = FastAPI(title="Plane-GitHub bridge", docs_url=None, redoc_url=None, openapi_url=None,
+                  lifespan=lifespan)
 
     def run(name: str, fn, *args):
         try:
@@ -38,8 +51,12 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
 
     @app.get("/health")
     def health():
-        return {"ok": True, "mappings": len(settings.mappings),
-                "plane_webhook_ready": bool(settings.plane_webhook_secret)}
+        out = {"ok": True, "mappings": len(settings.mappings),
+               "plane_webhook_ready": bool(settings.plane_webhook_secret),
+               "plane_api_ok": state["plane_problem"] is None}
+        if state["plane_problem"]:
+            out["plane_problem"] = state["plane_problem"]
+        return out
 
     @app.post("/plane/webhook", status_code=202)
     async def plane_webhook(request: Request, tasks: BackgroundTasks,

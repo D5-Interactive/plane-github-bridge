@@ -162,9 +162,16 @@ PLANE_PUBLIC_URL=https://plane.example.com      # the address your team opens Pl
 PLANE_WORKSPACE=your-workspace                  # the part after plane.example.com/ in your browser
 ```
 
+> [!IMPORTANT]
+> Copy `PLANE_WORKSPACE` from the address bar, not from the workspace's display
+> name: in `https://plane.example.com/acme-team/projects/...` it's `acme-team`.
+> A wrong slug makes every write fail with `403 You do not have permission`.
+
 > [!NOTE]
-> The bridge acts as this user, so use an account that's a member of every
-> mapped project.
+> The bridge acts as this user. Plane's API only lets it edit projects the user
+> is an explicit **member** of (role Member or Admin). Being the workspace
+> owner isn't enough. Add the account to every project whose modules you'll
+> link, under **Project → Settings → Members**.
 
 ### 3. GitHub token
 
@@ -236,10 +243,13 @@ curl http://127.0.0.1:8095/health
 You should see:
 
 ```json
-{"ok":true,"mappings":0,"plane_webhook_ready":false}
+{"ok":true,"mappings":0,"plane_webhook_ready":false,"plane_api_ok":true}
 ```
 
-`mappings` counts admin overrides in `config.yaml`, so `0` is normal. `plane_webhook_ready`
+`mappings` counts admin overrides in `config.yaml`, so `0` is normal.
+`plane_api_ok` is checked once at startup: `false` comes with a
+`plane_problem` message saying what's wrong (usually the workspace slug or the
+API token). `plane_webhook_ready`
 stays `false` until step 6. The log also warns that `PLANE_WEBHOOK_SECRET` is not
 set; that's expected for now.
 
@@ -656,6 +666,8 @@ A SQLite database at `/data/bridge.db`, in the `bridge-data` Docker volume:
 | `github:pull_request: moved to review` | State changed on the work item |
 | `... failed` followed by a traceback | Something errored; the event is skipped and the bridge keeps running |
 | `WARNING PLANE_WEBHOOK_SECRET is not set` | Expected until setup step 6 is done |
+| `PLANE SETUP PROBLEM: Plane refused workspace '...'` | `PLANE_WORKSPACE` doesn't match the slug in your Plane URL |
+| `... -> 403: You do not have permission to perform this action.` | The token's account isn't a member of that project, or the slug is wrong |
 
 Set `LOG_LEVEL=DEBUG` in `.env` and recreate the container to also print each
 Plane payload as received.

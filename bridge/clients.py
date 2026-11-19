@@ -60,6 +60,21 @@ class PlaneClient:
                 break
         return out
 
+    def check_workspace(self) -> str | None:
+        """None if the API key can see the workspace; otherwise a message saying why not."""
+        try:
+            r = self.http.get("/projects/", params={"per_page": 1})
+        except httpx.HTTPError as e:
+            return f"can't reach Plane's API ({e}); check PLANE_BASE_URL"
+        if r.status_code in (401,):
+            return "Plane rejected PLANE_API_KEY (401); check the token"
+        if r.status_code in (403, 404):
+            return (f"Plane refused workspace '{self.ws}' ({r.status_code}). PLANE_WORKSPACE must match "
+                    f"the slug in your Plane URL: https://<plane>/<slug>/projects/...")
+        if r.is_error:
+            return f"Plane's API answered {r.status_code} for workspace '{self.ws}'"
+        return None
+
     def project(self, project_id: str) -> dict:
         hit = self._projects.get(project_id)
         if not hit or time.monotonic() - hit[0] > self.cache_seconds:
