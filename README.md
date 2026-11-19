@@ -489,10 +489,11 @@ The exact rules the bridge follows. Everything here matches the code in
 
 | Source | Event | What the bridge does |
 |---|---|---|
-| Plane | Work item created / updated | Creates the GitHub issue if the item is in a linked module and has none yet; otherwise pushes title/description edits to its issue |
+| Plane | Work item created / updated | Creates the GitHub issue if the item is in a linked module and has none yet (closed at once if the item is already done or cancelled); otherwise pushes title/description edits to its issue, and opens or closes the issue when the item moves between open and done/cancelled states |
 | Plane | Work item deleted | Nothing. The issue stays |
 | Plane | Module created / updated | Tidies the module if its description links a repo, and schedules a [check](#how-syncing-works) of the module against its repo |
-| GitHub | `issues` closed / reopened | Moves the work item's state |
+| GitHub | `issues` closed / reopened | Moves the work item's state, unless it's already closed (or open) in Plane |
+| GitHub | `issues` edited (title) | Copies the new title to the work item |
 | GitHub | `pull_request` | Moves the state, adds the PR link and an activity comment |
 | GitHub | `pull_request_review` submitted | Activity comment |
 | GitHub | `push` | Activity comment listing the commits |
@@ -525,8 +526,12 @@ doesn't exist), it isn't retried and is recorded as a
 **The retry queue** lives in the database, so it survives restarts. Every 2
 seconds the bridge runs the actions that are due, waiting 5, 15, 30, 60 and
 then 120 seconds between attempts. A newer action of the same kind for the same
-item replaces the older one, so only the latest intent runs. A rate limit ends
-the round, and the next one starts when the [pacer](#api-usage) allows. An
+item replaces the older one, so only the latest intent runs. Every change to an
+item's state or title (from a webhook or a check) shares one entry per item, so
+a "close" and a later "reopen" can't both be waiting; while that entry waits,
+new changes to the item queue behind it instead of jumping ahead. Each action
+runs in the [pacing lane](#api-usage) it came from. A rate limit ends the round,
+and the next one starts when the [pacer](#api-usage) allows. An
 action still waiting after `BRIDGE_QUEUE_MAX_AGE` seconds (default 300) is
 flagged as a `stuck` sync problem; it keeps retrying, and the flag clears when
 it succeeds.
@@ -537,12 +542,19 @@ answer was lost:
 
 | Queued action | Checked first |
 |---|---|
-| Create an issue | Is the item already linked to an issue? Then only its link is added. Otherwise, is there a recent issue in the repo that the bridge made for this item (its body links the item, or it has the item's exact title and the bridge's marker)? Then that issue is linked instead of creating another |
+| Create an issue | Is the item already linked to an issue? Then only its link is added. Otherwise, is there a recent issue in the repo that the bridge made for this item (its body links the item, or it has the item's exact title and the bridge's marker)? Then that issue is linked instead of creating another. Every create looks for such an issue first, not only retries; and while a create waits in the queue, webhooks, checks and the membership pass leave the item to it |
 | Add a link | Is the URL already on the Plane item? |
-| Move a state | Is the item already in that state? |
-| Post a comment | Was this activity (commit, branch, review, PR event) already posted to the item? |
-| Push an edit | Is the issue's title already what the bridge last sent? (The bridge's own edit coming back is ignored) |
+| Sync an item's state or title | Reads both sides again and decides again, the way a check does: a queued "close the issue" does nothing if the item was reopened meanwhile |
+| Post a comment | Was this activity already recorded as posted? On a retry, is a comment with the same text already on the item? |
+| Push an edit | Is the issue's title already what the bridge last sent? |
 | Tidy a module | Uses the module as it is now, not as it was |
+
+**Its own changes don't come back.** The bridge records each value it writes
+(an issue closed or reopened, a title, a Plane state) for 10 minutes. A webhook
+that only reports one of those values is the bridge's own change coming back,
+and is ignored. An issue closed or reopened on GitHub also doesn't move a work
+item that's already closed (or open) in Plane, so a reopen doesn't knock an
+In Progress item back to Todo.
 
 **Checks of edited modules and repos.** Editing a linked module in Plane, or
 editing, renaming or transferring its repo on GitHub, schedules a check of that
@@ -552,24 +564,43 @@ check lists the module's items and the repo's issues and compares each pair:
 
 | Found | What the bridge does |
 |---|---|
-| An item with no issue | Creates the issue |
+| An item with no issue | Creates the issue (unless a create for it is already waiting in the queue) |
 | An issue link missing from the item | Adds it |
 | The title or open/closed state changed on one side since the last sync | Copies it to the other side |
-| Both sides changed since the last sync | The more recent change wins and is copied over; the conflict is recorded (see [Sync problems](#sync-problems)) but nothing is flagged, since it's settled |
-| Titles differ and there's no earlier sync to tell which side changed | Flagged as `title_differs`; nothing is overwritten |
+| Open/closed changed on both sides since the last sync, and they differ | If both change times are known (GitHub's `closed_at`, or `created_at` for an issue never closed; Plane's `completed_at`), the later one wins, and the conflict is recorded without a label. Otherwise flagged as `state_differs`; nothing is written |
+| The title changed on both sides, and they differ | Flagged as `title_differs`; nothing is overwritten |
+| A pair the bridge hasn't seen since the upgrade (first contact) | See below |
 | The item's issue no longer exists in the repo | Flagged as `issue_missing` |
 | Issues in the repo with no Plane item | Counted as one `unlinked_issues` problem for the repo; no issue is labeled |
 
+The bridge never decides by an item's or issue's "last updated" time: labels,
+comments and assignees change it too, so it says nothing about which title or
+state is newer.
+
 Fixes go through the same actions as webhooks, so a fix that fails is queued
-and retried like any other. After every successful sync of a pair the bridge
-records what it sent (title, open or closed, and when), which is how a later
-check tells which side changed.
+and retried like any other. A rate limit or rejected key while applying a fix
+ends the check, and the fix waits in the queue. After every sync of a pair the
+bridge records **both sides as they actually are** (each side's title and
+open/closed state), which is how a later check tells which side changed. A
+difference both sides already had at that point (for example an item moved to
+Done by a merged PR whose issue stayed open) is left alone.
+
+**First contact.** A pair with nothing recorded yet (every pair synced before
+this version) gets its first record from the first check that sees it. If the
+two sides differ then, the bridge can't tell which is right, so it **writes
+nothing** and flags `state_differs` or `title_differs` for a person to settle.
+The flag clears by itself once the two sides match. With
+`BRIDGE_FIRST_CONTACT_FIX=1`, open/closed differences are fixed instead where
+both change times are known (for example an item completed in Plane after its
+issue was opened, and the issue never closed: the issue is closed); titles are
+always left to a person.
 
 > [!NOTE]
-> Through checks, a work item moved to a **completed** or **cancelled** state in
-> Plane now closes its GitHub issue (as completed or not planned), and an issue
-> title edited on GitHub reaches Plane when it's the more recent change. Before,
-> only GitHub → Plane state changes and Plane → GitHub title edits were synced.
+> A work item moved to a **completed** or **cancelled** state in Plane now
+> closes its GitHub issue at once (as completed or not planned), and reopening
+> it reopens the issue. An issue **title** edited on GitHub now reaches Plane at
+> once. Before, only GitHub → Plane state changes and Plane → GitHub title edits
+> were synced.
 
 **The membership pass.** Plane sends no webhook when an existing work item is
 added to a module, so every `BRIDGE_MEMBERSHIP_INTERVAL` seconds (default 120)
@@ -577,6 +608,13 @@ a light pass lists the linked modules' items and creates issues for new ones
 (see [Catch-up sync](#catch-up-sync)). An item that fails with a temporary
 error goes into the retry queue; an item already waiting in the queue is left
 to it.
+
+**Large repos.** A check after an edit lists only the issues changed since the
+repo's last check (GitHub's `since`); linked issues it didn't list are read one
+by one only when their Plane side changed. The org scan lists every issue. If a
+repo has more than 5,000 issues (the listing's 50-page cap), linked issues past
+the cap are read one by one rather than reported missing, and `unlinked_issues`
+isn't updated from the partial list.
 
 **The org scan.** Less often, the bridge checks every linked module against its
 repo across the whole workspace, so drift is found even when nothing is being
@@ -590,12 +628,24 @@ from that:
 | Quick but heavy (more calls or CPU, or load average above 1.5 per CPU) | At the next 06:00 or 18:00 in `BRIDGE_TIMEZONE`, at least 12 hours after the last scan |
 | Slow (over 2 minutes) | At the start of the next quiet hours (`BRIDGE_QUIET_HOURS`, default 1-5, in `BRIDGE_TIMEZONE`) |
 
-The first scan after a start waits for the quiet hours. A scan that's due while
+> [!IMPORTANT]
+> The quiet hours are local to `BRIDGE_TIMEZONE`, which is **UTC** unless you set
+> it. Set it to your team's time zone (for example `America/New_York`), or
+> "1-5" means 1-5 a.m. UTC.
+
+The first scan after the bridge is installed waits for the quiet hours. The
+schedule is kept in the database, so a restart doesn't reset it. A slow scan
+only starts inside the quiet hours: if they're over when it comes due (the
+bridge was down, or the scan was postponed past their end), it waits for the
+next night. A scan that's due while
 the host is busy (load average above 1.5 per CPU) waits 15 minutes. A scan cut
 short by a rate limit or a rejected key isn't measured and is tried again in 15
 minutes. A workspace admin can ask for a scan now with
 `POST /admin/scan` (header `X-API-Key: <their Plane API key>`); it runs within
-a few seconds. Set `BRIDGE_ORG_SCAN=0` to turn the org scan off.
+a few seconds. Set `BRIDGE_ORG_SCAN=0` to turn the org scan off, or
+`BRIDGE_RECONCILE=0` to turn off checks and the org scan together. Checks
+waiting for their burst of edits to settle are kept in the database across
+restarts.
 
 Scans, checks and the membership pass use the **background lane**: they only
 use part of the rate-limit budget and step aside whenever a webhook or a
@@ -608,11 +658,12 @@ Anything the bridge can't settle on its own is a **sync problem**:
 | Kind | Meaning | Flagged | Clears when |
 |---|---|---|---|
 | `stuck` | A queued action is still failing after `BRIDGE_QUEUE_MAX_AGE` seconds | Item and issue | The action succeeds |
-| `refused` | Plane or GitHub refused an action for a lasting reason | Item and issue | The item syncs |
-| `title_differs` | The titles differ and the bridge can't tell which side is right | Item and issue | The title is synced either way |
-| `issue_missing` | The item's linked issue is gone from the repo | Item | — |
+| `refused` | Plane or GitHub refused an action for a lasting reason | Item and issue | A later action on the item succeeds, or the item is edited in Plane (it's tried again) |
+| `state_differs` | Open on one side, closed on the other, and the bridge can't tell which is right (first contact, or both changed) | Item and issue | The two sides match |
+| `title_differs` | The titles differ and the bridge can't tell which side is right | Item and issue | The two sides match |
+| `issue_missing` | The item's linked issue is gone from the repo | Item | A check finds the issue again |
 | `unlinked_issues` | Issues in a linked repo with no Plane item | No | The repo has none |
-| `conflict` | Both sides changed; the more recent change won | No (recorded as settled) | Already settled |
+| `conflict` | Open/closed changed on both sides; the side with the later known change time won | No (recorded as settled) | Already settled |
 
 A flagged work item gets a red **sync problem** label in Plane, and its GitHub
 issue a **plane-sync-problem** label, so people see that something is off
@@ -633,7 +684,9 @@ the labels' descriptions point there:
 
 The admin pages check the key with Plane on every request: it must belong to a
 workspace admin (role 20) who isn't a bot account. The key is used only for that
-check and is never stored or logged.
+check and is never stored or logged. Each client address may make 30 requests
+a minute to these pages (taken from `CF-Connecting-IP` or `X-Forwarded-For`
+behind a tunnel or proxy); more get `429`.
 
 ### /health
 
@@ -642,7 +695,7 @@ check and is never stored or logged.
 | `ok`, `mappings`, `plane_webhook_ready`, `plane_api_ok`, `plane_problem`, `plane_problem_temporary` | See [setup step 4](#4-start-the-bridge) |
 | `queue` | `length`: actions waiting to be retried; `oldest_age`: seconds the oldest has waited; `stale`: how many were flagged `stuck` |
 | `plane_pacer`, `github_pacer` | The pacing in force. `source`: `headers` (learned from the last response), `configured` (`PLANE_RATE_LIMIT`, until headers are seen) or `off`; `limit` and `limit_source` (`header`, or `inferred`, see [API usage](#api-usage)); `remaining`, `reset_in`; `interval` and `background_interval` (seconds between calls); `background_blocked_for`; `reserve_share`; `hold_in` (seconds left of a hold after a 429); `waiting` (callers waiting per lane) |
-| `scheduler` | The org scan: `class` of the last scan (`light`, `heavy`, `slow`), `next_run`, `last_run` and its measurements in `last`; `{"enabled": false}` when the org scan is off |
+| `scheduler` | The org scan: `class` of the last scan (`light`, `heavy`, `slow`), `next_run`, `last_run` and its measurements in `last`, and `quiet_hours_only` (the next run may only start in the quiet hours); `{"enabled": false}` when the org scan or checks are off |
 | `problems` | `open` sync problems, `by_kind`, and `flags_pending` (label changes waiting to be retried) |
 | `reconcile_pending` | Module and repo checks waiting for their burst of edits to settle |
 
@@ -652,11 +705,13 @@ Set in `.env`. Only the first block in `.env.example` is required.
 
 | Setting | Default | What it does |
 |---|---|---|
-| `BRIDGE_MEMBERSHIP_INTERVAL` | `120` | Seconds between membership passes. `0` turns off **all** background work (membership pass, retry queue, checks, org scan); use it only for testing. `BRIDGE_SYNC_INTERVAL` is still read if this isn't set |
+| `BRIDGE_MEMBERSHIP_INTERVAL` | `120` | Seconds between membership passes; `0` turns the membership pass off (the retry queue and checks keep running). `BRIDGE_SYNC_INTERVAL` is still read if this isn't set |
+| `BRIDGE_RECONCILE` | `1` | `0` turns off checks of edited modules and repos and the org scan. The retry queue always runs |
+| `BRIDGE_FIRST_CONTACT_FIX` | `0` | `1`: on a pair's first check, fix open/closed differences where both change times are known, instead of only flagging them (see [How syncing works](#how-syncing-works)) |
 | `BRIDGE_QUEUE_MAX_AGE` | `300` | Seconds a queued action may keep failing before it's flagged `stuck` |
 | `BRIDGE_RECONCILE_DELAY` | `30` | Seconds of quiet after the last module or repo edit before its check runs |
 | `BRIDGE_ORG_SCAN` | `1` | `0` turns the org scan off |
-| `BRIDGE_TIMEZONE` | `UTC` | Time zone for the quiet hours and the 06:00 / 18:00 slots (an IANA name such as `America/New_York`) |
+| `BRIDGE_TIMEZONE` | `UTC` | Time zone for the quiet hours and the 06:00 / 18:00 slots, as an IANA name such as `America/New_York`. **Set it**: the default puts the quiet hours at night in UTC |
 | `BRIDGE_QUIET_HOURS` | `1-5` | Start and end hour (0-23) of the quiet window for slow scans |
 | `BRIDGE_RATE_RESERVE_SHARE` | `0.3` | Share of each rate-limit window kept for webhooks and retries; background work uses the rest |
 | `BRIDGE_PUBLIC_URL` | empty | The bridge's public address, shown in sync problem labels |
@@ -749,9 +804,8 @@ The work item gets a link back, titled `GitHub owner/repo#12`.
   bridge rewrites the issue's title and body from the work item. Other fields
   (assignees, labels, priority, estimate, dates) aren't copied.
 - **GitHub → Plane:** an issue **title** edited on GitHub is copied to the work
-  item by the next check of the pair, when it's the more recent change. The
-  issue's body is never copied back, and the next Plane edit to the
-  description overwrites it. Treat Plane as the source of truth for the task's
+  item at once. The issue's body is never copied back, and the next Plane edit
+  to the description overwrites it. Treat Plane as the source of truth for the task's
   wording.
 
 ### How PRs, branches and commits find their work item
@@ -784,10 +838,11 @@ cancelled). With no `In Review` state, PRs in review land in the first
 "started" state. If the work item is already in the target state, nothing is
 sent.
 
-The other way, a [check](#how-syncing-works) that finds the work item in a
-completed or cancelled state while its issue is open closes the issue (as
-completed or not planned), and reopens a closed issue whose item is open again,
-when the Plane side is the more recent change.
+The other way, moving the work item into a completed or cancelled state closes
+its issue (as completed or not planned), and moving it back to any other state
+reopens it. A [check](#how-syncing-works) does the same for a change whose
+webhook was missed. A new issue for an item that's already done or cancelled is
+closed right after it's created.
 
 ### Activity comments
 
@@ -846,7 +901,11 @@ A SQLite database at `/data/bridge.db`, in the `bridge-data` Docker volume:
 | `pr_links` | Which PR links were already added per item |
 | `sync_failures` | Items GitHub refused for a lasting reason, with the repo and when, so the catch-up sync waits before retrying them. Cleared at every startup |
 | `retry_queue` | Actions waiting to be retried: what they're meant to do, why the last try failed, and when the next is due |
-| `sync_snapshot` | Per synced pair: the title and open/closed state last synced, and when, so a check can tell which side changed |
+| `pair_snapshot` | Per synced pair: each side's title and open/closed state after the last sync, so a check can tell which side changed |
+| `repo_checks` | When each repo was last checked, for listing only the issues changed since |
+| `pending_checks` | Module and repo checks waiting for their burst of edits to settle |
+| `scan_state` | The org scan's schedule and last measurements |
+| `own_writes` | Values the bridge wrote in the last hour, to recognise their webhooks |
 | `sync_problems` | Sync problems, open and resolved, with IDs and short values only |
 | `sync_flags` | Which items and issues carry a sync problem label, and label changes still to retry |
 
@@ -862,15 +921,19 @@ problems):
 
 1. Add the new settings you want to `.env` (see [Settings](#settings)); all have
    working defaults. `BRIDGE_SYNC_INTERVAL` is still read, but rename it to
-   `BRIDGE_MEMBERSHIP_INTERVAL`. Set `BRIDGE_PUBLIC_URL`.
+   `BRIDGE_MEMBERSHIP_INTERVAL`. Set `BRIDGE_PUBLIC_URL`, and set
+   `BRIDGE_TIMEZONE` so the quiet hours are your night, not UTC's.
 2. Tick **Repositories** in the GitHub webhook's events (setup step 7).
 3. Rebuild and recreate the container. The new tables are created at startup;
    nothing existing changes.
-4. Expect some catching up: pairs synced before the upgrade have no snapshot,
-   so the first check of each records one when both sides match, and flags
-   `title_differs` where titles already differ. Work items already completed or
-   cancelled in Plane whose issues are still open are closed by the first check
-   that sees them.
+4. Expect some flags, not changes: pairs synced before the upgrade have no
+   record yet, so the first check of each (at the latest, the first org scan in
+   the quiet hours) records both sides as they are. Where they differ, for
+   example items done in Plane whose issues are still open, it writes nothing
+   and flags `state_differs` or `title_differs` (see
+   [First contact](#how-syncing-works)). Settle them by hand and the flags
+   clear, or set `BRIDGE_FIRST_CONTACT_FIX=1` before the first scan to have
+   open/closed fixed where the change times are reliable.
 5. Optionally raise Plane's own limit (see [API usage](#api-usage)).
 
 Rolling back to the version before is safe: it ignores the new tables. Actions
@@ -958,6 +1021,9 @@ and recreate the container again, or the next restart re-checks everything.
 | `sync note conflict: ...` | Both sides changed; the more recent change won and was copied over |
 | `couldn't add the sync-problem label on ... ; will retry` | Flagging failed; retried every 5 minutes |
 | `checked owner/repo: 3 item(s), 1 fix(es), 0 conflict(s)` | A module or repo check fixed something |
+| `synced owner/repo#12: closed on GitHub` (or `title to Plane`, ...) | An item's state or title was synced between the two sides |
+| `github:issues: ignored: the bridge's own change` | GitHub's webhook for a change the bridge made; harmless |
+| `checks postponed (...)` | A rate limit or rejected key during a check; it runs again after the delay, and its fix waits in the queue |
 | `org scan: 4 pair(s), ...; next as light` | An org scan finished, and when the next one runs |
 | `org scan postponed 15 minutes: the host is busy` | The host's load was high when the scan came due |
 | `sync: owner/repo refused items from API (...); parked for 6h ...` | GitHub refused items for a lasting reason, such as Issues being disabled or the token lacking access. Fix it and edit the item, or restart the bridge |
