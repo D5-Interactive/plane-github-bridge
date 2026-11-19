@@ -21,8 +21,14 @@ class Settings:
     plane_workspace: str       # workspace slug, e.g. "your-workspace"
     plane_api_key: str
     plane_webhook_secret: str
-    github_token: str
-    github_webhook_secret: str
+    github_token: str = ""         # personal access token; fallback when no GitHub App is set up
+    github_webhook_secret: str = ""
+    # Bring your own GitHub App. Without these, /setup can create one.
+    github_app_id: str = ""
+    github_app_private_key_path: str = ""
+    # The bridge's own public address (https://hooks.example.com). Optional: /setup
+    # works it out from the request when this is empty.
+    public_url: str = ""
     db_path: str = "/data/bridge.db"
     mappings: list[Mapping] = field(default_factory=list)
     # GitHub owners the bridge may create issues for. Empty = any the token can reach.
@@ -38,6 +44,10 @@ class Settings:
     # pacing). Plane limits each API key per minute and answers 429 above it.
     plane_rate_limit: float = 50
 
+    @property
+    def data_dir(self) -> str:
+        return os.path.dirname(os.path.abspath(self.db_path))
+
     def owner_allowed(self, repo: str) -> bool:
         if not self.allowed_owners:
             return True
@@ -50,6 +60,9 @@ class Settings:
     def mapping_for_repo(self, repo: str) -> list[Mapping]:
         r = repo.lower()
         return [m for m in self.mappings if m.repo.lower() == r]
+
+
+DEFAULT_KEY_PATH = "/app/secrets/github-app.pem"
 
 
 def _need(name: str) -> str:
@@ -82,8 +95,15 @@ def load_settings(config_path: str | None = None) -> Settings:
         # Optional at startup: Plane only shows this secret after the webhook exists,
         # and the webhook needs the bridge running. Plane webhooks are refused until set.
         plane_webhook_secret=os.environ.get("PLANE_WEBHOOK_SECRET", "").strip(),
-        github_token=_need("GITHUB_TOKEN"),
-        github_webhook_secret=_need("GITHUB_WEBHOOK_SECRET"),
+        # All optional: a GitHub App made through /setup brings its own key and
+        # webhook secret. Without an app, GITHUB_TOKEN and GITHUB_WEBHOOK_SECRET are used.
+        github_token=os.environ.get("GITHUB_TOKEN", "").strip(),
+        github_webhook_secret=os.environ.get("GITHUB_WEBHOOK_SECRET", "").strip(),
+        github_app_id=os.environ.get("GITHUB_APP_ID", "").strip(),
+        # Only read when GITHUB_APP_ID is set. The default matches docker-compose.yml.
+        github_app_private_key_path=(os.environ.get("GITHUB_APP_PRIVATE_KEY_PATH", "").strip()
+                                     or DEFAULT_KEY_PATH),
+        public_url=os.environ.get("BRIDGE_PUBLIC_URL", "").strip().rstrip("/"),
         db_path=os.environ.get("BRIDGE_DB", "/data/bridge.db"),
         mappings=mappings,
         allowed_owners=[o.strip() for o in os.environ.get("GITHUB_ALLOWED_OWNERS", "").split(",") if o.strip()],
