@@ -242,7 +242,7 @@ def bare(tmp_path):
     s = Settings(plane_base_url="http://plane.local", plane_public_url="https://plane.example.com",
                  plane_workspace="acme", plane_api_key="plane-key", plane_webhook_secret="",
                  db_path=str(tmp_path / "b.db"), allowed_owners=["acme"],
-                 public_url="https://hooks.example.com")
+                 public_url="https://hooks.acme.test")
     plane = PlaneClient(s.plane_base_url, "acme", "plane-key",
                         transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"results": []})))
     return Bridge(s, Store(s.db_path), plane, GitHubClient(GitHubAuth()))
@@ -270,7 +270,7 @@ def test_setup_creates_app_and_switches_to_it(bare, keypair, tmp_path):
     page = client.get(f"/setup?token={token}")
     assert page.status_code == 200
     assert "https://github.com/organizations/acme/settings/apps/new?state=" in page.text
-    assert "https://hooks.example.com/github/webhook" in page.text
+    assert "https://hooks.acme.test/github/webhook" in page.text
     state = re.search(r"state=([\w-]+)", page.text).group(1)
 
     assert client.get("/setup/callback?code=the-code&state=forged").status_code == 403
@@ -589,3 +589,157 @@ def test_after_setup_repo_calls_carry_an_installation_token(bare, keypair):
     assert fake.calls[-1][2].startswith("Bearer ghs_")
     health = client.get("/health").json()
     assert health["github_app_installed_on"] == ["acme"] and "github_problem" not in health
+
+
+# ---------------------------------------------------------------- bring your own app, relays
+
+def test_bring_your_own_app_from_a_key_file(keypair, tmp_path):
+    pem, _ = keypair
+    key = tmp_path / "github-app.pem"
+    key.write_text(pem)
+    s = Settings(plane_base_url="http://p", plane_public_url="https://p", plane_workspace="w",
+                 plane_api_key="k", plane_webhook_secret="", db_path=str(tmp_path / "b.db"),
+                 github_app_id="123", github_app_private_key_path=str(key), github_webhook_secret="hook")
+    auth = github_auth_for(s)
+    assert auth.mode == "app"
+    assert auth.app.creds.private_key == pem and auth.app.creds.webhook_secret == "hook"
+
+
+def test_unreadable_key_file_stops_startup_with_a_clear_message(keypair, tmp_path):
+    import os
+    pem, _ = keypair
+    key = tmp_path / "github-app.pem"
+    key.write_text(pem)
+    key.chmod(0)
+    try:
+        if os.access(key, os.R_OK):
+            pytest.skip("running as root: file permissions don't stop reads")
+        s = Settings(plane_base_url="http://p", plane_public_url="https://p", plane_workspace="w",
+                     plane_api_key="k", plane_webhook_secret="", db_path=str(tmp_path / "b.db"),
+                     github_app_id="123", github_app_private_key_path=str(key))
+        with pytest.raises(RuntimeError, match="Can't read GITHUB_APP_PRIVATE_KEY_PATH"):
+            github_auth_for(s)
+    finally:
+        key.chmod(0o600)
+
+
+def test_not_a_pem_key_stops_startup(tmp_path):
+    key = tmp_path / "github-app.pem"
+    key.write_text("ghp_this_is_a_token_not_a_key")
+    s = Settings(plane_base_url="http://p", plane_public_url="https://p", plane_workspace="w",
+                 plane_api_key="k", plane_webhook_secret="", db_path=str(tmp_path / "b.db"),
+                 github_app_id="123", github_app_private_key_path=str(key))
+    with pytest.raises(RuntimeError, match="doesn't look like a PEM private key"):
+        github_auth_for(s)
+
+
+def test_relay_must_forward_the_exact_bytes(bare):
+    bare.s.github_webhook_secret = "relay-secret"
+    client = TestClient(build_app(bare))
+    original = b'{"zen":  "Keep it logically awesome.",\n "hook_id": 1}'      # GitHub's own spacing
+    sig = "sha256=" + hmac.new(b"relay-secret", original, hashlib.sha256).hexdigest()
+    headers = {"X-Hub-Signature-256": sig, "X-GitHub-Event": "ping"}
+    assert client.post("/github/webhook", content=original, headers=headers).json() == {"pong": True}
+    reencoded = json.dumps(json.loads(original)).encode()                        # what a careless relay sends
+    assert reencoded != original
+    assert client.post("/github/webhook", content=reencoded, headers=headers).status_code == 401
+
+
+# ---------------------------------------------------------------- setup polish
+
+def test_setup_refuses_the_example_address(bare):
+    bare.s.public_url = "https://hooks.example.com"
+    app = build_app(bare)
+    client = TestClient(app)
+    r = client.get(f"/setup?token={app.state.setup.token}")
+    assert r.status_code == 400 and "BRIDGE_PUBLIC_URL" in r.text
+
+
+def test_env_example_leaves_the_public_url_empty():
+    import pathlib
+    lines = pathlib.Path(__file__).parent.parent.joinpath(".env.example").read_text().splitlines()
+    assert "BRIDGE_PUBLIC_URL=" in lines
+
+
+def test_setup_link_is_logged_as_a_warning_even_with_a_token(bare, caplog):
+    import logging
+    bare.gh.auth.pat = "ghp_fallback"
+    app = build_app(bare)
+    with caplog.at_level(logging.WARNING, logger="bridge"):
+        app.state.setup.announce()
+    assert any(r.levelno == logging.WARNING and "/setup?token=" in r.getMessage() for r in caplog.records)
+
+
+def test_bot_name_preview_is_hedged_and_slugged(bare):
+    app = build_app(bare)
+    client = TestClient(app)
+    r = client.get(f"/setup?token={app.state.setup.token}&owner=acme&name=Acme%20Bot%20(v2)")
+    assert "something like" in r.text and "acme-bot-v2[bot]" in r.text
+
+
+def test_missing_webhook_secret_from_github_is_warned_about(keypair, caplog):
+    import logging
+    from bridge.github_auth import convert_manifest
+    pem, _ = keypair
+    transport = httpx.MockTransport(lambda r: httpx.Response(201, json={"id": 1, "pem": pem, "webhook_secret": None}))
+    with caplog.at_level(logging.WARNING, logger="bridge"):
+        creds = convert_manifest("code", transport=transport)
+    assert creds.webhook_secret == ""
+    assert any("no webhook secret" in r.getMessage() for r in caplog.records)
+
+
+def test_two_callbacks_at_once_save_only_one_app(bare, keypair, tmp_path):
+    import threading
+    import time as _time
+    pem, public = keypair
+    fake = FakeAppGitHub(public, Clock())
+    conversions = []
+
+    def handler(req):
+        if req.url.path.startswith("/app-manifests/"):
+            conversions.append(req.url.path)
+            _time.sleep(0.3)                      # GitHub is slow; the second tab submits meanwhile
+            return httpx.Response(201, json={"id": 123, "slug": "s", "pem": pem,
+                                             "webhook_secret": "w", "html_url": "https://github.com/apps/s"})
+        return fake.handler(req)
+
+    app = build_app(bare, github_transport=httpx.MockTransport(handler))
+    client = TestClient(app, follow_redirects=False)
+    token = app.state.setup.token
+    states = [re.search(r"state=([\w-]+)", client.get(f"/setup?token={token}").text).group(1)
+              for _ in range(2)]
+    results = []
+    threads = [threading.Thread(target=lambda st=st: results.append(
+        client.get(f"/setup/callback?code=c{st[:4]}&state={st}").status_code)) for st in states]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(results) == [303, 404]
+    assert len(conversions) == 1                  # the second never reached GitHub
+
+
+def test_corrupt_saved_app_gives_a_clear_startup_error(tmp_path):
+    (tmp_path / "github-app.json").write_text("{not json")
+    with pytest.raises(RuntimeError, match="Fix or delete the file"):
+        CredentialFile(str(tmp_path)).load()
+    (tmp_path / "github-app.json").write_text('{"app_id": "1"}')
+    with pytest.raises(RuntimeError, match="missing its ID or private key"):
+        CredentialFile(str(tmp_path)).load()
+
+
+def test_saved_app_is_private_even_over_a_leftover_temp_file(keypair, tmp_path):
+    pem, _ = keypair
+    leftover = tmp_path / "github-app.json.tmp"
+    leftover.write_text("old")
+    leftover.chmod(0o644)
+    CredentialFile(str(tmp_path)).save(AppCredentials(app_id="1", private_key=pem))
+    assert (tmp_path / "github-app.json").stat().st_mode & 0o777 == 0o600
+
+
+def test_httpx_request_logs_are_quiet_by_default():
+    import logging
+    import bridge.app  # noqa: F401  (configures the loggers on import)
+    if logging.getLogger().getEffectiveLevel() <= logging.DEBUG:
+        pytest.skip("debug logging keeps httpx request lines on purpose")
+    assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING

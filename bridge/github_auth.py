@@ -61,11 +61,18 @@ class CredentialFile:
                 raw = json.load(f)
         except FileNotFoundError:
             return None
-        return AppCredentials(**{k: raw.get(k, "") for k in AppCredentials.__dataclass_fields__})
+        except (OSError, ValueError) as e:
+            raise RuntimeError(f"Can't read the saved GitHub App in {self.path} ({e}). Fix or delete "
+                               f"the file and recreate the container; deleting it brings /setup back") from None
+        if not isinstance(raw, dict) or not raw.get("app_id") or not raw.get("private_key"):
+            raise RuntimeError(f"The saved GitHub App in {self.path} is missing its ID or private key. "
+                               f"Delete the file and recreate the container to run /setup again")
+        return AppCredentials(**{k: str(raw.get(k) or "") for k in AppCredentials.__dataclass_fields__})
 
     def save(self, creds: AppCredentials) -> None:
         tmp = self.path + ".tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)      # O_CREAT keeps the mode of a leftover temp file
         with os.fdopen(fd, "w") as f:
             json.dump(asdict(creds), f)
         os.replace(tmp, self.path)
@@ -332,6 +339,9 @@ def convert_manifest(code: str, transport: httpx.BaseTransport | None = None) ->
         raise RuntimeError(f"GitHub refused the setup code ({r.status_code}); it's single-use and "
                            f"expires after an hour. Start again from /setup")
     d = r.json()
+    if not d.get("webhook_secret"):
+        log.warning("GitHub returned no webhook secret for the new app; GitHub webhooks are refused "
+                    "until GITHUB_WEBHOOK_SECRET is set to the app's secret")
     return AppCredentials(app_id=str(d["id"]), private_key=d["pem"],
                           webhook_secret=d.get("webhook_secret") or "", slug=d.get("slug", ""),
                           html_url=d.get("html_url", ""), source="setup")

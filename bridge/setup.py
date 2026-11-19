@@ -18,7 +18,9 @@ import json
 import logging
 import re
 import secrets
+import threading
 import time
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -53,6 +55,7 @@ class SetupFlow:
         self.s, self.auth, self.transport, self.clock = settings, auth, transport, clock
         self.token = None if auth.app else secrets.token_urlsafe(24)
         self._states: dict[str, float] = {}
+        self._callback_lock = threading.Lock()
 
     # ------------------------------------------------------------ helpers
 
@@ -60,12 +63,16 @@ class SetupFlow:
         if not self.token:
             return
         where = self.s.public_url or "https://<the bridge's public address>"
-        level = logging.WARNING if self.auth.mode == "none" else logging.INFO
-        log.log(level, "GitHub App not set up%s. To create one in a click, open: %s/setup?token=%s",
+        log.warning("GitHub App not set up%s. To create one in a click, open: %s/setup?token=%s",
                 "" if self.auth.mode == "none" else " (using GITHUB_TOKEN for now)", where, self.token)
 
     def _base_url(self, request: Request) -> str:
         return self.s.public_url or str(request.base_url).rstrip("/")
+
+    @staticmethod
+    def _placeholder(base: str) -> bool:
+        host = (urlparse(base).hostname or "").lower()
+        return host == "example.com" or host.endswith(".example.com")
 
     def _check_token(self, token: str | None) -> None:
         if self.auth.app or not self.token:
@@ -98,13 +105,17 @@ class SetupFlow:
                 raise HTTPException(400, "That isn't a GitHub organization name")
             name = (name or f"{owner or 'Plane'} Plane bridge").strip()[:34]
             base = self._base_url(request)
+            if self._placeholder(base):
+                raise HTTPException(400, f"The bridge's public address is {base}, the example value. "
+                                         f"Set BRIDGE_PUBLIC_URL in .env to your real address (or leave "
+                                         f"it empty) and recreate the container")
             state = self._new_state()
             target = (f"https://github.com/organizations/{owner}/settings/apps/new" if owner
                       else "https://github.com/settings/apps/new")
             esc = html.escape
             body = f"""
-<p>This creates a GitHub App for the bridge. Activity then shows as
-<code>{esc(name.lower().replace(' ', '-'))}[bot]</code>, the app belongs to the
+<p>This creates a GitHub App for the bridge. Activity then shows as something like
+<code>{esc(re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-'))}[bot]</code>, the app belongs to the
 {'organization' if owner else 'account'} instead of one person, and its tokens expire after an hour.</p>
 
 <form method="get" action="/setup">
@@ -137,10 +148,17 @@ class SetupFlow:
 
         @app.get("/setup/callback", response_class=HTMLResponse)
         def setup_callback(code: str | None = None, state: str | None = None):
+            # One callback at a time, so a double submit or a second tab can't
+            # save a second app over the first.
+            with self._callback_lock:
+                return self._finish(code, state)
+
+    def _finish(self, code: str | None, state: str | None):
             if self.auth.app:
                 raise HTTPException(404, "A GitHub App is already set up for this bridge")
             if not code or not self._take_state(state):
                 raise HTTPException(403, "This setup link is unknown or expired. Start again from /setup")
+            self._states.clear()               # every other open setup page is now stale
             try:
                 creds = convert_manifest(code, transport=self.transport)
             except (RuntimeError, httpx.HTTPError, KeyError) as e:

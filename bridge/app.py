@@ -21,6 +21,11 @@ from .sync import Bridge
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bridge")
+# httpx logs every request URL at INFO, which would include /setup's one-time
+# manifest code. Keep it to warnings unless debugging.
+if logging.getLogger().getEffectiveLevel() > logging.DEBUG:
+    for _noisy in ("httpx", "httpcore"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 
 def github_auth_for(s: Settings, transport: httpx.BaseTransport | None = None) -> GitHubAuth:
