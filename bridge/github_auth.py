@@ -21,6 +21,9 @@ from datetime import datetime
 
 import httpx
 import jwt
+from cryptography.exceptions import UnsupportedAlgorithm
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 log = logging.getLogger("bridge")
 
@@ -116,6 +119,11 @@ class AppTokens:
     # let that stick for the full negative_ttl.
     settle_seconds = 120.0
     settle_ttl = 30.0
+    # After the app fails (bad key, GitHub down), use the personal token for this
+    # long before trying the app again, so every call doesn't pay for the failure.
+    cooldown = 45.0
+    # How often a failed or never-run check() is retried in the background.
+    recheck_every = 300.0
 
     def __init__(self, creds: AppCredentials, transport: httpx.BaseTransport | None = None,
                  clock=time.time):
@@ -130,29 +138,44 @@ class AppTokens:
         self._forgotten_at: dict[str, float] = {}
         # The latest reason the app couldn't be used, shown in /health; None when it works.
         self.problem: str | None = None
-        # (installed on, missing on) for the allowed owners, from refresh_coverage().
-        self.coverage: tuple[list[str], list[str]] | None = None
+        # Until when the app is skipped after a failure (see cooldown).
+        self.cooling_until = 0.0
+        # When check() last ran, and whether it passed (for maybe_recheck).
+        self.checked_at: float | None = None
+        self.check_ok = False
 
     def jwt(self) -> str:
         return app_jwt(self.creds.app_id, self.creds.private_key, self.clock())
 
     def _app_request(self, method: str, path: str) -> httpx.Response:
         try:
-            return self.http.request(method, path, headers={"Authorization": f"Bearer {self.jwt()}"})
+            signed = self.jwt()
+        except (jwt.PyJWTError, ValueError, TypeError, UnsupportedAlgorithm) as e:
+            # A malformed, encrypted or truncated key: the app can't sign anything.
+            raise self._fail(f"the app's private key can't be used to sign requests "
+                             f"({type(e).__name__}); replace it with the app's .pem file") from None
+        try:
+            return self.http.request(method, path, headers={"Authorization": f"Bearer {signed}"})
         except httpx.HTTPError as e:
             raise self._fail(f"can't reach GitHub's API ({type(e).__name__})") from None
+
+    def cooling(self) -> bool:
+        """True while the app is skipped after a failure."""
+        return self.clock() < self.cooling_until
 
     def _fail(self, message: str) -> AppError:
         """Record why the app can't be used, logging only when the reason changes."""
         if message != self.problem:
             log.error("GITHUB APP PROBLEM: %s", message)
         self.problem = message
+        self.cooling_until = self.clock() + self.cooldown
         return AppError(message)
 
     def _ok(self) -> None:
         if self.problem:
             log.info("GitHub App working again")
         self.problem = None
+        self.cooling_until = 0.0
 
     def _describe(self, r: httpx.Response, what: str) -> str:
         if r.status_code == 401:
@@ -162,12 +185,14 @@ class AppTokens:
 
     def check(self) -> str | None:
         """None if GitHub accepts the app's key; otherwise a message saying why not."""
+        self.checked_at, self.check_ok = self.clock(), False
         try:
             r = self._app_request("GET", "/app")
         except AppError as e:
             return str(e)
         if r.is_error:
             return str(self._fail(self._describe(r, f"checking app {self.creds.app_id}")))
+        self.check_ok = True
         meta = r.json()
         self.creds.slug = self.creds.slug or meta.get("slug", "")
         self.creds.html_url = self.creds.html_url or meta.get("html_url", "")
@@ -186,7 +211,9 @@ class AppTokens:
                 continue
             if r.is_error:
                 raise self._fail(self._describe(r, f"looking up the app's installation on {owner}"))
+            self._ok()
             return r.json()["id"]
+        self._ok()                            # GitHub answered: the app itself works
         return None
 
     def installation_id(self, owner: str) -> int | None:
@@ -248,18 +275,54 @@ class AppTokens:
             self._forgotten_at[key] = self.clock()
 
     def refresh_coverage(self, owners: list[str]) -> tuple[list[str], list[str]]:
-        """Which of these accounts the app is installed on. Network calls; run off the event loop."""
+        """Look the app up on these accounts (network calls; run off the event loop).
+
+        Returns (installed on, missing on). An account whose lookup failed is in
+        neither list: coverage_now() reports it as unknown.
+        """
         installed, missing = [], []
         for owner in owners:
             try:
                 (installed if self.installation_id(owner) is not None else missing).append(owner)
             except AppError:
-                missing.append(owner)
-        self.coverage = (installed, missing)
-        return self.coverage
+                pass
+        return installed, missing
+
+    def coverage_now(self, owners: list[str]) -> dict[str, list[str]]:
+        """Where the app is installed, from the live cache; no network calls.
+
+        "unknown" means not looked up yet, the last answer has expired, or the
+        lookup failed; only a fresh "not installed" answer counts as missing.
+        """
+        now = self.clock()
+        out: dict[str, list[str]] = {"installed": [], "missing": [], "unknown": []}
+        with self._guard:
+            cached = dict(self._installations)
+        for owner in owners:
+            hit = cached.get(owner.lower())
+            if not hit or hit[1] <= now:
+                out["unknown"].append(owner)
+            else:
+                out["installed" if hit[0] is not None else "missing"].append(owner)
+        return out
+
+    def maybe_recheck(self, owners: list[str]) -> None:
+        """Background upkeep: retry a failed check() and refresh accounts whose answer
+        expired or is missing. Network calls; run off the event loop."""
+        now = self.clock()
+        if not self.check_ok and (self.checked_at is None or now - self.checked_at >= self.recheck_every):
+            self.check()
+        if not self.check_ok:
+            return
+        stale = self.coverage_now(owners)["unknown"]
+        if stale:
+            self.refresh_coverage(stale)
 
 
 _REPO_PATH = re.compile(r"^/repos/([^/]+)/([^/]+)")
+
+
+_INTEGRATION_403 = "resource not accessible by integration"
 
 
 class GitHubAuth(httpx.Auth):
@@ -270,6 +333,9 @@ class GitHubAuth(httpx.Auth):
     otherwise: also when the app can't be used right now, or the installation can't
     reach that one repo. The app can be switched on at runtime (after /setup).
     """
+
+    # The 403 fallback below reads the response's message.
+    requires_response_body = True
 
     def __init__(self, pat: str = "", app: AppTokens | None = None):
         self.pat = pat
@@ -285,7 +351,7 @@ class GitHubAuth(httpx.Auth):
     def _token(self, path: str) -> tuple[str | None, str | None]:
         """(token, owner it was minted for, or None when it's the PAT or nothing)."""
         m = _REPO_PATH.match(path)
-        if self.app and m:
+        if self.app and m and not self.app.cooling():
             try:
                 token = self.app.token_for(m.group(1), m.group(2))
             except AppError:
@@ -318,6 +384,12 @@ class GitHubAuth(httpx.Auth):
             # install); the personal token may.
             self._set(request, self.pat)
             yield request
+        elif (response.status_code == 403 and self.pat
+              and _INTEGRATION_403 in response.text.lower()):
+            # A public repo outside the install: reads work with the installation
+            # token, writes are refused. The personal token may be allowed.
+            self._set(request, self.pat)
+            yield request
 
 
 def load_private_key(path: str) -> str:
@@ -328,6 +400,16 @@ def load_private_key(path: str) -> str:
         raise RuntimeError(f"Can't read GITHUB_APP_PRIVATE_KEY_PATH {path!r}: {e.strerror}") from None
     if "PRIVATE KEY" not in key:
         raise RuntimeError(f"GITHUB_APP_PRIVATE_KEY_PATH {path!r} doesn't look like a PEM private key")
+    try:
+        parsed = serialization.load_pem_private_key(key.encode(), password=None)
+    except TypeError:
+        raise RuntimeError(f"GITHUB_APP_PRIVATE_KEY_PATH {path!r} is encrypted with a passphrase; "
+                           f"use the unencrypted .pem GitHub generated for the app") from None
+    except (ValueError, UnsupportedAlgorithm):
+        raise RuntimeError(f"GITHUB_APP_PRIVATE_KEY_PATH {path!r} can't be read as a private key "
+                           f"(damaged or truncated?); download a new one from the app's settings") from None
+    if not isinstance(parsed, rsa.RSAPrivateKey):
+        raise RuntimeError(f"GITHUB_APP_PRIVATE_KEY_PATH {path!r} isn't an RSA key; GitHub Apps use RSA keys")
     return key
 
 

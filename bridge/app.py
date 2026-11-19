@@ -29,6 +29,9 @@ if logging.getLogger().getEffectiveLevel() > logging.DEBUG:
         logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 
+APP_UPKEEP_SECONDS = 60.0
+
+
 def github_auth_for(s: Settings, transport: httpx.BaseTransport | None = None) -> GitHubAuth:
     """App from .env (bring your own) wins, then the app /setup made, then the token alone."""
     auth = GitHubAuth(pat=s.github_token)
@@ -65,6 +68,16 @@ def build_app(bridge: Bridge | None = None,
         return [x for i, x in enumerate(out) if x and x not in out[:i]]
 
     stop = threading.Event()
+
+    def app_upkeep() -> None:
+        """Retry a failed GitHub App check and refresh install coverage that has expired.
+        Runs whether or not the catch-up sync does, and picks up an app made by /setup."""
+        while not stop.wait(APP_UPKEEP_SECONDS):
+            if auth.app:
+                try:
+                    auth.app.maybe_recheck(settings.allowed_owners)
+                except Exception:
+                    log.exception("GitHub App upkeep failed")
 
     def sync_loop() -> None:
         while True:
@@ -115,6 +128,7 @@ def build_app(bridge: Bridge | None = None,
                         log.warning("GitHub App is not installed on: %s", ", ".join(missing))
         else:
             setup.announce()
+        threading.Thread(target=app_upkeep, name="github-app-upkeep", daemon=True).start()
         prepare_store()
         if settings.sync_interval > 0 and not (problem and setup_problem):
             threading.Thread(target=sync_loop, name="module-sync", daemon=True).start()
@@ -147,8 +161,12 @@ def build_app(bridge: Bridge | None = None,
         if auth.app:
             if auth.app.creds.slug:
                 out["github_app"] = auth.app.creds.slug
-            if auth.app.coverage is not None:
-                out["github_app_installed_on"], out["github_app_missing_on"] = auth.app.coverage
+            if settings.allowed_owners:
+                # From the live cache: an answer that has expired or failed is "unknown".
+                cov = auth.app.coverage_now(settings.allowed_owners)
+                out["github_app_installed_on"] = cov["installed"]
+                out["github_app_missing_on"] = cov["missing"]
+                out["github_app_unknown_on"] = cov["unknown"]
         if state["plane_problem"]:
             out["plane_problem"] = state["plane_problem"]
             if state["temporary"]:

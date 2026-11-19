@@ -222,6 +222,8 @@ docker compose logs --tail 30 bridge
 | `Missing required environment variable ...` | That line in `.env` is empty or misspelled |
 | `IsADirectoryError` or a YAML error | `config.yaml` is missing, so Docker created a folder in its place. Run `docker compose down && rmdir config.yaml && cp config.example.yaml config.yaml`, fill it in, then start again |
 | `Can't read GITHUB_APP_PRIVATE_KEY_PATH ...: Permission denied` | The key isn't readable by the container's user: `sudo chown 10001 secrets/github-app.pem` |
+| `GITHUB_APP_PRIVATE_KEY_PATH ... is encrypted with a passphrase` | Use the unencrypted `.pem` GitHub generated for the app |
+| `GITHUB_APP_PRIVATE_KEY_PATH ... can't be read as a private key` or `isn't an RSA key` | The file is damaged, truncated or the wrong key; download a new one from the app's settings |
 
 ### 4. Give it a public address
 
@@ -338,8 +340,13 @@ it can't rename, delete or reconfigure a repo.
 `curl http://127.0.0.1:8095/health` should now show `"github_auth":"app"`, the
 app's name in `github_app`, `"github_webhook_ready":true`, and, if you set
 `GITHUB_ALLOWED_OWNERS`, your org under `github_app_installed_on` with
-`github_app_missing_on` empty. The app's own webhook is already set up: skip to
-step 6.
+`github_app_missing_on` and `github_app_unknown_on` empty. The app's own webhook
+is already set up: skip to step 6.
+
+These three lists come from what the bridge last heard from GitHub, so they
+never claim more than it knows: an account whose answer has expired, or whose
+lookup failed, is listed under `github_app_unknown_on` until the next check,
+which runs about every minute.
 
 > [!NOTE]
 > Creating an app on an organization takes an org owner or an **app manager**
@@ -389,7 +396,8 @@ the permissions and events above, and its webhook pointed at
    ```
 
    Look for `"github_auth":"app"`, no `github_problem`, and (with
-   `GITHUB_ALLOWED_OWNERS` set) an empty `github_app_missing_on`.
+   `GITHUB_ALLOWED_OWNERS` set) empty `github_app_missing_on` and
+   `github_app_unknown_on` lists.
 
 **Moving from a token and org webhook to your own app?**
 
@@ -400,8 +408,10 @@ the permissions and events above, and its webhook pointed at
    webhook a minute later. Events in that overlap arrive twice, which is
    harmless: each activity comment is posted once and state moves don't
    repeat. A gap, on the other hand, loses events.
-3. Check `/health`: `github_app_missing_on` must be empty, or repos of the
-   accounts listed there still depend on the token.
+3. Check `/health`: `github_app_missing_on` and `github_app_unknown_on` must
+   both be present and empty, or repos of the accounts listed there still
+   depend on the token. A missing field means the app can't be checked right
+   now (see `github_problem`): don't revoke the token yet.
 4. Once activity shows up as the app's bot, remove `GITHUB_TOKEN` from `.env`,
    recreate the container, and revoke the token.
 
@@ -491,11 +501,16 @@ if you'd rather they didn't show your name.
 
 The token keeps working alongside an app. The bridge falls back to it for an
 account the app isn't installed on, for a repo left out of a **Only select
-repositories** install (the call is retried with the token), and while the app
-itself is failing (a wrong key, a skewed clock, GitHub errors; `/health` shows
-the reason as `github_problem`). To move from a token to an app later, do option
-A, check that `github_app_missing_on` in `/health` is empty, then delete the org
-webhook. With an app made by `/setup`, both its secret and
+repositories** install (the call is retried with the token), for a public repo
+outside the install that the app can read but not write to (GitHub answers
+"Resource not accessible by integration"; the write is retried with the token),
+and while the app itself is failing (a wrong key, a skewed clock, GitHub errors;
+`/health` shows the reason as `github_problem`). After such a failure the bridge
+uses the token for about 45 seconds before trying the app again, so every call
+doesn't pay for the failure, and it retries a failed startup check in the
+background every few minutes. To move from a token to an app later, do option
+A, check that `github_app_missing_on` and `github_app_unknown_on` in `/health`
+are empty, then delete the org webhook. With an app made by `/setup`, both its secret and
 `GITHUB_WEBHOOK_SECRET` are accepted in the meantime, so nothing is missed.
 
 | Ping shows (any option) | Meaning |
@@ -950,7 +965,8 @@ and recreate the container again, or the next restart re-checks everything.
 | `acting on GitHub as the app ...` | Startup message; the GitHub App is in use |
 | `GITHUB APP PROBLEM: GitHub rejected the app's private key` | Wrong key for that app ID, or the server's clock is off |
 | `GitHub App isn't installed on owner` | Install the app on that account; until then the bridge uses `GITHUB_TOKEN` there if set. Checked again every 10 minutes |
-| `GitHub App is not installed on: owner, ...` | Startup check of `GITHUB_ALLOWED_OWNERS`; the same list is in `/health` as `github_app_missing_on` |
+| `GitHub App is not installed on: owner, ...` | Startup check of `GITHUB_ALLOWED_OWNERS`; `/health` shows the live state as `github_app_missing_on` (and `github_app_unknown_on` for accounts it couldn't check) |
+| `GITHUB APP PROBLEM: the app's private key can't be used to sign requests` | The saved or configured key is damaged; calls use `GITHUB_TOKEN` meanwhile. Replace the key |
 | `GITHUB APP PROBLEM: ...` (any other reason) | The app can't be used right now; calls fall back to `GITHUB_TOKEN` if set. Shown live in `/health` as `github_problem` |
 | `GitHub App working again` | The problem above cleared itself |
 | `GitHub returned no webhook secret for the new app` | Copy the app's webhook secret into `GITHUB_WEBHOOK_SECRET` and recreate the container |
