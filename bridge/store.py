@@ -33,6 +33,11 @@ class Store:
                 event_id TEXT PRIMARY KEY,
                 seen_at  TEXT DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS posted (
+                plane_item_id TEXT NOT NULL,
+                key           TEXT NOT NULL,
+                PRIMARY KEY (plane_item_id, key)
+            );
             CREATE TABLE IF NOT EXISTS pr_links (
                 plane_item_id TEXT NOT NULL,
                 pr_url        TEXT NOT NULL,
@@ -75,6 +80,13 @@ class Store:
         with self._lock:
             cur = self._db.execute(
                 "INSERT OR IGNORE INTO seen_events (event_id) VALUES (?)", (event_id,))
+            self._db.commit()
+            return cur.rowcount == 1
+
+    def post_is_new(self, item_id: str, key: str) -> bool:
+        """True the first time (item, key) is seen; used so GitHub activity is posted to Plane once."""
+        with self._lock:
+            cur = self._db.execute("INSERT OR IGNORE INTO posted VALUES (?, ?)", (item_id, key))
             self._db.commit()
             return cur.rowcount == 1
 

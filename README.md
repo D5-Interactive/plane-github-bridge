@@ -71,6 +71,27 @@ before anything happens.
 | Issue closed as not planned | ✕ Cancelled |
 | Issue reopened | ○ Todo |
 
+A PR counts as belonging to a work item if it says `Closes #N` for the linked
+issue, or if its branch is named after the issue (`12-scan-command`).
+
+### Activity feed
+
+GitHub already shows branches, commits, PRs, reviews and merges on the issue.
+The bridge copies that activity onto the Plane work item as comments, so the
+same history is visible from either side:
+
+| GitHub activity | Shows on the work item as |
+|---|---|
+| Branch created for the issue | ◆ comment + branch link |
+| Commits pushed to the issue's branch, or mentioning `#N` | ◆ comment listing each commit |
+| PR opened, ready for review, closed, reopened | ◆ comment + PR link |
+| PR review: approved, changes requested, commented | ◆ comment |
+| PR merged | ◆ comment, and the item moves to Done |
+
+Each event is posted once, even if GitHub redelivers it.
+
+### Edits
+
 Edits to a work item's **title or description** in Plane are copied to its
 issue. Edits made on the GitHub issue are **not** copied back: Plane is the
 source of truth for the task itself.
@@ -170,6 +191,10 @@ Fine-grained tokens**):
 | Repository access | Only the repos in `config.yaml` |
 | Permissions | **Issues → Read and write** (Metadata → Read is added automatically) |
 
+That one permission is enough. Commits, branches, PRs and reviews reach the
+bridge inside GitHub's webhook payloads (step 7), so the token never reads
+them. Keeping it to Issues means a leaked token can't touch your code.
+
 > [!NOTE]
 > If `your-org` doesn't appear under Resource owner, an org owner has to allow
 > fine-grained tokens first: **Org settings → Personal access tokens →
@@ -259,7 +284,7 @@ webhook to each mapped repo under **Repo settings → Webhooks** instead.
 | Payload URL | `https://hooks.example.com/github/webhook` |
 | Content type | `application/json` |
 | Secret | the `GITHUB_WEBHOOK_SECRET` value from `.env` |
-| Events | **Let me select** → ✓ Issues, ✓ Pull requests |
+| Events | **Let me select** → ✓ Issues, ✓ Pull requests, ✓ Pull request reviews, ✓ Pushes, ✓ Branch or tag creation |
 
 GitHub sends a ping right away; it should show a green check.
 
@@ -281,8 +306,10 @@ docker compose logs -f bridge
 1. **Plan in Plane.** Create the task in the right module and write the
    acceptance criteria as a checklist; it becomes a checklist on the GitHub issue.
 2. **Branch from the issue.** On the GitHub issue: **Development → Create a
-   branch**, so the branch is linked to the issue.
+   branch**. GitHub names it like `12-scan-command`, which links the branch, its
+   commits and its PR to the work item automatically.
 3. **Close it from the PR.** Put `Closes #<issue number>` in the PR description.
+   Commits on other branches show up too if their message mentions `#12`.
 4. **Hands off the board.** Leave the Plane state alone; the bridge moves it.
 
 ## ◆ Limits
@@ -290,7 +317,9 @@ docker compose logs -f bridge
 - Only work items in mapped projects/modules sync. Adding an item to a mapped
   module later also creates its issue.
 - Deleting a work item doesn't delete or close its issue.
-- A PR only moves a work item if it says it closes the linked issue.
+- A PR only moves a work item if it says it closes the linked issue or its
+  branch is named after it.
+- Commit and review comments only reach Plane for issues the bridge created.
 - State names should be **Todo, In Progress, In Review, Done** and
   **Cancelled**. Otherwise the bridge falls back to the first state in the
   matching state group.

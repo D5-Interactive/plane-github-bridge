@@ -5,13 +5,18 @@ Plane -> GitHub
     gets a GitHub issue, once. The issue link is added to the work item.
   * Later edits to the item's title or description are copied to the issue.
 
-GitHub -> Plane (state only)
+GitHub -> Plane: state
   * PR that says "Closes #N" opened / ready for review  -> In Review
   * PR is a draft, converted to draft, or closed unmerged -> In Progress
   * PR merged, or issue closed as completed              -> Done
   * Issue closed as not planned                         -> Cancelled
   * Issue reopened                                      -> Todo
-  The PR link is also added to the work item the first time it is seen.
+
+GitHub -> Plane: activity (posted as comments on the work item, each once)
+  * PR opened, ready for review, merged, closed, reopened (+ the PR link)
+  * PR reviews: approved, changes requested, commented
+  * Branches created for the issue (named like "12-scan-command") (+ the branch link)
+  * Commits pushed to the issue's branch, or whose message mentions #N
 """
 from __future__ import annotations
 
@@ -21,7 +26,8 @@ from collections import defaultdict
 
 from .clients import GitHubClient, PlaneClient
 from .config import Settings
-from .render import closing_refs, issue_body, normalize_plane_event, plane_html_to_markdown
+from .render import (branch_issue_number, closing_refs, esc, issue_body, mention_refs,
+                     normalize_plane_event, plane_html_to_markdown)
 from .store import Link, Store
 
 log = logging.getLogger("bridge")
@@ -126,7 +132,103 @@ class Bridge:
             return self._on_issue(repo, payload)
         if event == "pull_request":
             return self._on_pull_request(repo, payload)
+        if event == "pull_request_review":
+            return self._on_review(repo, payload)
+        if event == "push":
+            return self._on_push(repo, payload)
+        if event == "create":
+            return self._on_create(repo, payload)
         return f"ignored: {event} event"
+
+    # -------- activity comments
+
+    def _comment(self, link: Link, key: str, html: str) -> bool:
+        """Post an activity comment on the linked work item, once per key."""
+        if not self.store.post_is_new(link.plane_item_id, key):
+            return False
+        self.plane.add_comment(link.plane_project_id, link.plane_item_id,
+                               f"<p>◆ <strong>GitHub</strong> · {html}</p>")
+        return True
+
+    def _pr_html(self, repo: str, pr: dict) -> str:
+        return (f'PR <a href="{esc(pr.get("html_url"))}">{esc(repo)}#{esc(pr.get("number"))}</a> '
+                f'“{esc(pr.get("title"))}”')
+
+    def _on_review(self, repo: str, p: dict) -> str:
+        if p.get("action") != "submitted":
+            return f"ignored: review {p.get('action')}"
+        pr, review = p.get("pull_request") or {}, p.get("review") or {}
+        state = (review.get("state") or "").lower()
+        verb = {"approved": "✓ approved", "changes_requested": "✕ requested changes on",
+                "commented": "commented on"}.get(state)
+        if not verb or (state == "commented" and not (review.get("body") or "").strip()):
+            return "ignored: empty or unknown review"
+        links = self._links_for_pr(repo, pr)
+        user = (review.get("user") or {}).get("login", "someone")
+        posted = 0
+        for link in links:
+            posted += self._comment(link, f"review:{review.get('id')}",
+                                    f'<code>{esc(user)}</code> {verb} '
+                                    f'<a href="{esc(review.get("html_url"))}">{self._pr_html(repo, pr)}</a>')
+        return f"review posted to {posted} item(s)" if links else "ignored: PR does not close a linked issue"
+
+    def _on_create(self, repo: str, p: dict) -> str:
+        if p.get("ref_type") != "branch":
+            return "ignored: not a branch"
+        branch = p.get("ref", "")
+        num = branch_issue_number(branch)
+        link = self.store.by_issue(repo, num) if num else None
+        if not link:
+            return "ignored: branch not named after a linked issue"
+        url = f"https://github.com/{repo}/tree/{branch}"
+        user = (p.get("sender") or {}).get("login", "someone")
+        if self._comment(link, f"branch:{branch}",
+                         f'branch <a href="{esc(url)}"><code>{esc(branch)}</code></a> created by '
+                         f'<code>{esc(user)}</code>'):
+            self.plane.add_link(link.plane_project_id, link.plane_item_id, url, f"Branch {branch}")
+        return f"branch {branch} posted"
+
+    def _on_push(self, repo: str, p: dict) -> str:
+        ref = p.get("ref", "")
+        if not ref.startswith("refs/heads/") or p.get("deleted"):
+            return "ignored: not a branch push"
+        branch = ref[len("refs/heads/"):]
+        commits = [c for c in p.get("commits") or [] if c.get("distinct", True)]
+        if not commits:
+            return "ignored: no new commits"
+
+        branch_num = branch_issue_number(branch)
+        per_item: dict[str, tuple[Link, list[dict]]] = {}
+        for c in commits:
+            refs = mention_refs(c.get("message"), repo)
+            if branch_num:
+                refs.append((repo, branch_num))
+            for r, n in refs:
+                link = self.store.by_issue(r, n)
+                if link:
+                    entry = per_item.setdefault(link.plane_item_id, (link, []))
+                    if c not in entry[1]:
+                        entry[1].append(c)
+        if not per_item:
+            return "ignored: commits don't touch a linked issue"
+
+        pusher = (p.get("pusher") or {}).get("name") or (p.get("sender") or {}).get("login", "someone")
+        posted = 0
+        for link, cs in per_item.values():
+            new = [c for c in cs if self.store.post_is_new(link.plane_item_id, f"commit:{c.get('id')}")]
+            if not new:
+                continue
+            rows = "".join(
+                f'<li><a href="{esc(c.get("url"))}"><code>{esc((c.get("id") or "")[:7])}</code></a> '
+                f'{esc((c.get("message") or "").splitlines()[0][:120])}</li>' for c in new[:10])
+            more = f"<li>…and {len(new) - 10} more</li>" if len(new) > 10 else ""
+            noun = "commit" if len(new) == 1 else "commits"
+            self.plane.add_comment(
+                link.plane_project_id, link.plane_item_id,
+                f"<p>◆ <strong>GitHub</strong> · {len(new)} {noun} pushed to "
+                f"<code>{esc(branch)}</code> by <code>{esc(pusher)}</code></p><ul>{rows}{more}</ul>")
+            posted += 1
+        return f"commits posted to {posted} item(s)"
 
     def _on_issue(self, repo: str, p: dict) -> str:
         issue, action = p.get("issue") or {}, p.get("action")
@@ -141,10 +243,21 @@ class Bridge:
             return f"ignored: issue {action}"
         return self._move(link, target)
 
+    def _links_for_pr(self, repo: str, pr: dict) -> list[Link]:
+        refs = closing_refs(f"{pr.get('title', '')}\n{pr.get('body') or ''}", repo)
+        num = branch_issue_number((pr.get("head") or {}).get("ref"))
+        if num:
+            refs.append((repo, num))
+        out: list[Link] = []
+        for r, n in refs:
+            link = self.store.by_issue(r, n)
+            if link and link.plane_item_id not in {l.plane_item_id for l in out}:
+                out.append(link)
+        return out
+
     def _on_pull_request(self, repo: str, p: dict) -> str:
         pr, action = p.get("pull_request") or {}, p.get("action")
-        refs = closing_refs(f"{pr.get('title', '')}\n{pr.get('body') or ''}", repo)
-        links = [l for l in (self.store.by_issue(r, n) for r, n in refs) if l]
+        links = self._links_for_pr(repo, pr)
         if not links:
             return "ignored: PR does not close a linked issue"
 
@@ -159,11 +272,24 @@ class Bridge:
         else:
             return f"ignored: pull_request {action}"
 
+        user = (p.get("sender") or {}).get("login", "someone")
+        what = {
+            "opened": "opened as a draft" if pr.get("draft") else "opened",
+            "reopened": "reopened",
+            "ready_for_review": "marked ready for review",
+            "converted_to_draft": "converted to a draft",
+            "closed": (f"● merged into <code>{esc((pr.get('base') or {}).get('ref'))}</code>"
+                       if pr.get("merged") else "closed without merging"),
+        }.get(action)
+
         results = []
         for link in links:
             if pr.get("html_url") and self.store.pr_link_is_new(link.plane_item_id, pr["html_url"]):
                 self.plane.add_link(link.plane_project_id, link.plane_item_id, pr["html_url"],
                                     f"PR {repo}#{pr.get('number')}: {pr.get('title', '')}"[:255])
+            if what:
+                self._comment(link, f"pr:{pr.get('number')}:{action}:{pr.get('updated_at', '')}",
+                              f"{self._pr_html(repo, pr)} {what} by <code>{esc(user)}</code>")
             results.append(self._move(link, target))
         return "; ".join(results)
 

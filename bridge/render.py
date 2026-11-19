@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import html as _html
 import re
 
 from markdownify import markdownify
@@ -94,6 +95,33 @@ _CLOSING = re.compile(
     r"(?:(?P<repo>[\w.-]+/[\w.-]+))?#(?P<num>\d+)",
     re.I,
 )
+
+
+_MENTION = re.compile(r"(?<![\w/])(?:(?P<repo>[\w.-]+/[\w.-]+))?#(?P<num>\d+)\b")
+_BRANCH = re.compile(r"^(?:[\w.-]+/)?(?P<num>\d+)[-_]")
+
+
+def mention_refs(text: str | None, default_repo: str) -> list[tuple[str, int]]:
+    """Every issue a commit message mentions: '#12', 'see your-org/repo#3', 'Closes #4'."""
+    if not text:
+        return []
+    out: list[tuple[str, int]] = []
+    for m in _MENTION.finditer(text):
+        ref = (m.group("repo") or default_repo, int(m.group("num")))
+        if ref not in out:
+            out.append(ref)
+    return out
+
+
+def branch_issue_number(branch: str | None) -> int | None:
+    """Issue number from a branch named the way GitHub's 'Create a branch' names it:
+    '12-scan-command' (also 'feature/12-scan', '12_scan')."""
+    m = _BRANCH.match(branch or "")
+    return int(m.group("num")) if m else None
+
+
+def esc(text) -> str:
+    return _html.escape(str(text or ""), quote=True)
 
 
 def closing_refs(text: str | None, default_repo: str) -> list[tuple[str, int]]:

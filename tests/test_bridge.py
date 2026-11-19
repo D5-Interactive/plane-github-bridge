@@ -36,7 +36,7 @@ class FakePlane:
         self.item = {"id": ITEM, "name": "Scan command", "sequence_id": 7, "state": "s-todo",
                      "description_html": DESC, "project": PROJ}
         self.module_members = {ITEM}
-        self.links, self.patches = [], []
+        self.links, self.patches, self.comments = [], [], []
 
     def handler(self, req: httpx.Request) -> httpx.Response:
         assert req.headers["X-API-Key"] == "plane-key"
@@ -56,6 +56,9 @@ class FakePlane:
             self.patches.append(body)
             self.item["state"] = body["state"]
             return httpx.Response(200, json=self.item)
+        if req.method == "POST" and p == f"/projects/{PROJ}/issues/{ITEM}/comments/":
+            self.comments.append(json.loads(req.content)["comment_html"])
+            return httpx.Response(201, json={})
         if req.method == "POST" and p == f"/projects/{PROJ}/issues/{ITEM}/links/":
             self.links.append(json.loads(req.content))
             return httpx.Response(201, json={})
@@ -243,3 +246,79 @@ def test_missing_plane_secret_refuses_plane_webhooks(env):
     assert not verify_plane_signature("", body, forged)
     assert client.get("/health").json()["plane_webhook_ready"] is False
     assert not fg.created
+
+
+# ---------------------------------------------------------------- GitHub activity -> Plane comments
+
+def test_mention_and_branch_helpers():
+    from bridge.render import branch_issue_number, mention_refs
+    assert mention_refs("Fix scan (#42), see acme/other#3; not a#9", "acme/x") == [("acme/x", 42), ("acme/other", 3)]
+    assert branch_issue_number("42-scan-command") == 42
+    assert branch_issue_number("feature/42_scan") == 42
+    assert branch_issue_number("main") is None
+
+
+def push_event(branch="42-scan-command", commits=None):
+    commits = commits or [{"id": "abc1234def", "message": "Add scanner\n\nbody", "url": "https://github.com/c/abc"}]
+    return {"ref": f"refs/heads/{branch}", "repository": {"full_name": "acme/auth-service"},
+            "pusher": {"name": "zep"}, "commits": commits}
+
+
+def test_push_to_issue_branch_posts_commits_once(env):
+    bridge, fp, fg = env
+    bridge.handle_plane(plane_event())
+    assert bridge.handle_github("push", push_event()) == "commits posted to 1 item(s)"
+    assert "1 commit pushed to <code>42-scan-command</code>" in fp.comments[-1]
+    assert "<code>abc1234</code></a> Add scanner" in fp.comments[-1]
+    # the same commit pushed again (e.g. to another branch) isn't posted twice
+    assert bridge.handle_github("push", push_event()) == "commits posted to 0 item(s)"
+    assert len(fp.comments) == 1
+
+
+def test_push_with_mention_on_other_branch(env):
+    bridge, fp, fg = env
+    bridge.handle_plane(plane_event())
+    ev = push_event("main", [{"id": "1111111aaa", "message": "Tweak <b>html</b> for #42", "url": "u"},
+                             {"id": "2222222bbb", "message": "Unrelated", "url": "u"}])
+    assert bridge.handle_github("push", ev) == "commits posted to 1 item(s)"
+    assert "&lt;b&gt;html&lt;/b&gt;" in fp.comments[-1]       # commit text is escaped
+    assert "Unrelated" not in fp.comments[-1]
+    assert "ignored" in bridge.handle_github("push", push_event("main", [{"id": "3", "message": "nope", "url": "u"}]))
+
+
+def test_branch_creation_posts_comment_and_link(env):
+    bridge, fp, fg = env
+    bridge.handle_plane(plane_event())
+    ev = {"ref": "42-scan-command", "ref_type": "branch", "repository": {"full_name": "acme/auth-service"},
+          "sender": {"login": "zep"}}
+    bridge.handle_github("create", ev)
+    assert "branch" in fp.comments[-1] and "42-scan-command" in fp.comments[-1]
+    assert fp.links[-1]["url"] == "https://github.com/acme/auth-service/tree/42-scan-command"
+    bridge.handle_github("create", ev)
+    assert len(fp.comments) == 1
+
+
+def test_review_and_pr_activity_comments(env):
+    bridge, fp, fg = env
+    bridge.handle_plane(plane_event())
+    bridge.handle_github("pull_request", gh_pr("opened"))
+    assert "opened by" in fp.comments[-1]
+    review = {"action": "submitted", "repository": {"full_name": "acme/auth-service"},
+              "pull_request": gh_pr("opened")["pull_request"],
+              "review": {"id": 9, "state": "APPROVED", "body": "", "user": {"login": "lead"},
+                         "html_url": "https://github.com/r/9"}}
+    assert bridge.handle_github("pull_request_review", review) == "review posted to 1 item(s)"
+    assert fp.comments[-1].startswith("<p>◆ <strong>GitHub</strong> · <code>lead</code> ✓ approved")
+    merged = gh_pr("closed", merged=True, state="closed")
+    merged["pull_request"]["base"] = {"ref": "main"}
+    bridge.handle_github("pull_request", merged)
+    assert "merged into <code>main</code>" in fp.comments[-1]
+    assert fp.item["state"] == "s-done"
+
+
+def test_pr_linked_by_branch_name_without_closes(env):
+    bridge, fp, fg = env
+    bridge.handle_plane(plane_event())
+    ev = gh_pr("opened", body="no keywords here")
+    ev["pull_request"]["head"] = {"ref": "42-scan-command"}
+    assert bridge.handle_github("pull_request", ev) == "moved to review"

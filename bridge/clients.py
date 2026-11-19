@@ -78,6 +78,11 @@ class PlaneClient:
         r = self.http.patch(f"/projects/{project_id}/issues/{item_id}/", json={"state": state_id})
         r.raise_for_status()
 
+    def add_comment(self, project_id: str, item_id: str, html: str) -> None:
+        r = self.http.post(f"/projects/{project_id}/issues/{item_id}/comments/",
+                           json={"comment_html": html})
+        r.raise_for_status()
+
     def add_link(self, project_id: str, item_id: str, url: str, title: str) -> None:
         r = self.http.post(f"/projects/{project_id}/issues/{item_id}/links/",
                            json={"url": url, "title": title})
