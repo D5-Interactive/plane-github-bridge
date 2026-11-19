@@ -529,7 +529,12 @@ then 120 seconds between attempts. A newer action of the same kind for the same
 item replaces the older one, so only the latest intent runs. Every change to an
 item's state or title (from a webhook or a check) shares one entry per item, so
 a "close" and a later "reopen" can't both be waiting; while that entry waits,
-new changes to the item queue behind it instead of jumping ahead. Each action
+new changes to the item queue behind it instead of jumping ahead. Changes are
+merged in the order they arrived: a later change to open/closed on either side
+replaces an earlier one still waiting (a person moving the item in Plane beats
+an older "move to Done" from GitHub that hadn't gone through yet), and when the
+entry runs, a GitHub-driven move is first checked against the issue as it is
+then. A change merged in while the entry is running stays queued and runs next. Each action
 runs in the [pacing lane](#api-usage) it came from. A rate limit ends the round,
 and the next one starts when the [pacer](#api-usage) allows. An
 action still waiting after `BRIDGE_QUEUE_MAX_AGE` seconds (default 300) is
@@ -549,10 +554,13 @@ answer was lost:
 | Push an edit | Is the issue's title already what the bridge last sent? |
 | Tidy a module | Uses the module as it is now, not as it was |
 
-**Its own changes don't come back.** The bridge records each value it writes
-(an issue closed or reopened, a title, a Plane state) for 10 minutes. A webhook
-that only reports one of those values is the bridge's own change coming back,
-and is ignored. An issue closed or reopened on GitHub also doesn't move a work
+**Its own changes don't come back.** The bridge records the last value it wrote
+to each field (an issue's open/closed state or title, a work item's state or
+title) for 10 minutes. A webhook is ignored as the bridge's own change only if
+it reports exactly that value and the bridge's record of the pair still holds
+it. Each write matches one webhook at most, and any other change to the field
+forgets it, so a person flipping a field away and back (B to C to B) within the
+10 minutes is still synced. An issue closed or reopened on GitHub also doesn't move a work
 item that's already closed (or open) in Plane, so a reopen doesn't knock an
 In Progress item back to Todo.
 
@@ -610,7 +618,9 @@ error goes into the retry queue; an item already waiting in the queue is left
 to it.
 
 **Large repos.** A check after an edit lists only the issues changed since the
-repo's last check (GitHub's `since`); linked issues it didn't list are read one
+module's last check against that repo (GitHub's `since`, kept per module, so
+one module's check doesn't hide changes from another module linked to the same
+repo); linked issues it didn't list are read one
 by one only when their Plane side changed. The org scan lists every issue. If a
 repo has more than 5,000 issues (the listing's 50-page cap), linked issues past
 the cap are read one by one rather than reported missing, and `unlinked_issues`
@@ -664,6 +674,7 @@ Anything the bridge can't settle on its own is a **sync problem**:
 | `issue_missing` | The item's linked issue is gone from the repo | Item | A check finds the issue again |
 | `unlinked_issues` | Issues in a linked repo with no Plane item | No | The repo has none |
 | `conflict` | Open/closed changed on both sides; the side with the later known change time won | No (recorded as settled) | Already settled |
+| `closed_by_merge` | The bridge closed an issue because a PR from its branch merged (see [State changes](#state-changes)) | No (informational) | Already settled |
 
 A flagged work item gets a red **sync problem** label in Plane, and its GitHub
 issue a **plane-sync-problem** label, so people see that something is off
@@ -685,8 +696,15 @@ the labels' descriptions point there:
 The admin pages check the key with Plane on every request: it must belong to a
 workspace admin (role 20) who isn't a bot account. The key is used only for that
 check and is never stored or logged. Each client address may make 30 requests
-a minute to these pages (taken from `CF-Connecting-IP` or `X-Forwarded-For`
-behind a tunnel or proxy); more get `429`.
+a minute to these pages; more get `429`. The address is the connection's own,
+unless `BRIDGE_TRUST_PROXY_HEADERS=1`, which takes it from `CF-Connecting-IP` or
+`X-Forwarded-For`.
+
+> [!IMPORTANT]
+> Behind a Cloudflare Tunnel or a reverse proxy every request reaches the bridge
+> from the tunnel or proxy, so all callers share one limit. Set
+> `BRIDGE_TRUST_PROXY_HEADERS=1` there. Leave it off when nothing in front sets
+> those headers, or callers could pick their own address.
 
 ### /health
 
@@ -712,7 +730,8 @@ Set in `.env`. Only the first block in `.env.example` is required.
 | `BRIDGE_RECONCILE_DELAY` | `30` | Seconds of quiet after the last module or repo edit before its check runs |
 | `BRIDGE_ORG_SCAN` | `1` | `0` turns the org scan off |
 | `BRIDGE_TIMEZONE` | `UTC` | Time zone for the quiet hours and the 06:00 / 18:00 slots, as an IANA name such as `America/New_York`. **Set it**: the default puts the quiet hours at night in UTC |
-| `BRIDGE_QUIET_HOURS` | `1-5` | Start and end hour (0-23) of the quiet window for slow scans |
+| `BRIDGE_QUIET_HOURS` | `1-5` | Start and end hour (0-23, different) of the quiet window for slow scans; it may wrap midnight, such as `22-4` |
+| `BRIDGE_TRUST_PROXY_HEADERS` | `0` | `1`: take client addresses for the sync problem pages' rate limit from `CF-Connecting-IP` / `X-Forwarded-For`. Set it behind a Cloudflare Tunnel or reverse proxy |
 | `BRIDGE_RATE_RESERVE_SHARE` | `0.3` | Share of each rate-limit window kept for webhooks and retries; background work uses the rest |
 | `BRIDGE_PUBLIC_URL` | empty | The bridge's public address, shown in sync problem labels |
 | `PLANE_RATE_LIMIT` | `50` | Requests per minute for Plane until its headers have been seen |
@@ -826,7 +845,7 @@ Activity on any other issue is ignored.
 |---|---|
 | PR opened as a draft, converted to draft, or closed without merging | In Progress |
 | PR opened (not draft), marked ready, reopened, edited, or new commits pushed to it | In Review |
-| PR merged | Done |
+| PR merged | Done (and see below for the issue) |
 | Issue closed as completed | Done |
 | Issue closed as not planned | Cancelled |
 | Issue reopened | Todo |
@@ -837,6 +856,15 @@ first state in the matching Plane state group (unstarted, started, completed,
 cancelled). With no `In Review` state, PRs in review land in the first
 "started" state. If the work item is already in the target state, nothing is
 sent.
+
+**Merged PRs from the issue's branch.** GitHub only closes an issue on merge when
+the PR says `Closes #12`. When a PR from a branch named after the issue (such
+as `12-scan`) merges and the work item moves to Done through it, the bridge
+closes the issue as completed too, and posts one comment on it saying it was
+closed because PR #N merged and the work item moved to Done, so the issue's
+subscribers are told. The comment is posted once per PR, even if GitHub
+redelivers the event, and the close is recorded as an informational
+`closed_by_merge` entry in the item's history on `/status` (no label).
 
 The other way, moving the work item into a completed or cancelled state closes
 its issue (as completed or not planned), and moving it back to any other state
@@ -902,10 +930,10 @@ A SQLite database at `/data/bridge.db`, in the `bridge-data` Docker volume:
 | `sync_failures` | Items GitHub refused for a lasting reason, with the repo and when, so the catch-up sync waits before retrying them. Cleared at every startup |
 | `retry_queue` | Actions waiting to be retried: what they're meant to do, why the last try failed, and when the next is due |
 | `pair_snapshot` | Per synced pair: each side's title and open/closed state after the last sync, so a check can tell which side changed |
-| `repo_checks` | When each repo was last checked, for listing only the issues changed since |
+| `repo_checks` | When each module was last checked against its repo, for listing only the issues changed since |
 | `pending_checks` | Module and repo checks waiting for their burst of edits to settle |
 | `scan_state` | The org scan's schedule and last measurements |
-| `own_writes` | Values the bridge wrote in the last hour, to recognise their webhooks |
+| `bridge_writes` | The last value the bridge wrote to each field of each item, to recognise the webhook it causes |
 | `sync_problems` | Sync problems, open and resolved, with IDs and short values only |
 | `sync_flags` | Which items and issues carry a sync problem label, and label changes still to retry |
 
@@ -934,6 +962,16 @@ problems):
    [First contact](#how-syncing-works)). Settle them by hand and the flags
    clear, or set `BRIDGE_FIRST_CONTACT_FIX=1` before the first scan to have
    open/closed fixed where the change times are reliable.
+
+   On a big workspace this can label many items at once. To work through them:
+   list them with `GET /admin/sync-problems?kind=state_differs` (and
+   `?kind=title_differs`), then make each pair match on whichever side is right
+   (close or reopen the issue, or move the work item; fix the title on one
+   side). The next check of that module, or the next org scan, sees them match
+   and removes the labels; `POST /admin/scan` runs a scan within seconds instead
+   of waiting. If most are items done in Plane with issues left open, setting
+   `BRIDGE_FIRST_CONTACT_FIX=1` and asking for a scan closes those whose times
+   are reliable; the rest stay flagged for a person.
 5. Optionally raise Plane's own limit (see [API usage](#api-usage)).
 
 Rolling back to the version before is safe: it ignores the new tables. Actions
