@@ -43,11 +43,14 @@ def iso(t: float) -> str:
 class FakeAppGitHub:
     """GitHub as a GitHub App sees it: installations, token minting, and repo calls."""
 
-    def __init__(self, public_key, clock, installed=("acme",)):
+    def __init__(self, public_key, clock, installed=("acme",), users=()):
         self.public_key, self.clock = public_key, clock
         self.installed = {o: 900 + i for i, o in enumerate(installed)}
+        self.users = set(users)                  # accounts that are users, not orgs
         self.minted, self.lookups, self.calls = 0, 0, []
         self.revoked: set[str] = set()
+        self.app_status = 200                    # what installation lookups and mints answer
+        self.hidden: set[str] = set()            # repos the installation can't see
 
     def _check_jwt(self, req):
         token = req.headers["Authorization"].removeprefix("Bearer ")
@@ -63,15 +66,22 @@ class FakeAppGitHub:
             self._check_jwt(req)
             return httpx.Response(200, json={"slug": "acme-plane-bridge",
                                              "html_url": "https://github.com/apps/acme-plane-bridge"})
-        m = re.fullmatch(r"/repos/([^/]+)/([^/]+)/installation", p)
+        m = re.fullmatch(r"/(orgs|users)/([^/]+)/installation", p)
         if m:
             self._check_jwt(req)
+            if self.app_status != 200:
+                return httpx.Response(self.app_status, json={})
+            kind, owner = m.groups()
+            if (kind == "users") != (owner in self.users):
+                return httpx.Response(404, json={})   # /orgs/ for a user and vice versa
             self.lookups += 1
-            inst = self.installed.get(m.group(1))
+            inst = self.installed.get(owner)
             return httpx.Response(200, json={"id": inst}) if inst else httpx.Response(404, json={})
         m = re.fullmatch(r"/app/installations/(\d+)/access_tokens", p)
         if m:
             self._check_jwt(req)
+            if self.app_status != 200:
+                return httpx.Response(self.app_status, json={})
             self.minted += 1
             return httpx.Response(201, json={"token": f"ghs_{m.group(1)}_{self.minted}",
                                              "expires_at": iso(self.clock() + 3600)})
@@ -79,6 +89,9 @@ class FakeAppGitHub:
         self.calls.append((req.method, p, auth))
         if auth.removeprefix("Bearer ") in self.revoked:
             return httpx.Response(401, json={"message": "Bad credentials"})
+        repo = "/".join(p.split("/")[2:4])
+        if repo in self.hidden and auth.startswith("Bearer ghs_"):
+            return httpx.Response(404, json={})
         if req.method == "GET" and re.fullmatch(r"/repos/[^/]+/[^/]+", p):
             return httpx.Response(200, json={"name": p.rsplit("/", 1)[1]})
         if req.method == "POST" and p.endswith("/issues"):
@@ -170,7 +183,7 @@ def test_account_without_the_app_falls_back_to_the_personal_token(keypair):
     gh.get_repo("elsewhere/repo")
     assert [c[2] for c in fake.calls] == ["Bearer ghs_900_1", "Bearer ghp_pat"]
     gh.get_repo("elsewhere/repo")
-    assert fake.lookups == 2                     # "not installed" is remembered too
+    assert fake.lookups == 2                     # "not installed" is remembered for a while too
 
 
 def test_app_from_env_beats_saved_app_beats_token(keypair, tmp_path):
@@ -320,3 +333,259 @@ def test_bad_private_key_is_reported_in_health(bare, keypair):
     with TestClient(build_app(bare)) as client:
         health = client.get("/health").json()
     assert "rejected the app's private key" in health["github_problem"]
+
+
+# ---------------------------------------------------------------- per-account lookup (ALL-84)
+
+def test_typo_repo_does_not_cost_the_whole_account_its_app_token(keypair):
+    pem, public = keypair
+    clock = Clock()
+    fake = FakeAppGitHub(public, clock)
+    gh = app_client(pem, fake, clock, pat="ghp_pat")
+    gh.get_repo("acme/typo")                     # a repo that doesn't exist
+    gh.get_repo("acme/real")
+    assert [c[2] for c in fake.calls] == ["Bearer ghs_900_1", "Bearer ghs_900_1"]
+
+
+def test_user_accounts_are_found_too(keypair):
+    pem, public = keypair
+    clock = Clock()
+    fake = FakeAppGitHub(public, clock, installed=("solo",), users=("solo",))
+    gh = app_client(pem, fake, clock)
+    gh.get_repo("solo/tool")
+    assert fake.calls[-1][2] == "Bearer ghs_900_1"
+
+
+def test_repo_outside_a_select_repositories_install_retries_with_the_token(keypair):
+    pem, public = keypair
+    clock = Clock()
+    fake = FakeAppGitHub(public, clock)
+    fake.hidden.add("acme/private-one")
+    gh = app_client(pem, fake, clock, pat="ghp_pat")
+    assert gh.get_repo("acme/private-one") == {"name": "private-one"}
+    assert [c[2] for c in fake.calls] == ["Bearer ghs_900_1", "Bearer ghp_pat"]
+    assert gh.get_repo("acme/visible") == {"name": "visible"}        # app token still used elsewhere
+    assert fake.calls[-1][2] == "Bearer ghs_900_1"
+
+
+def test_repo_outside_the_install_without_a_token_is_just_not_found(keypair):
+    pem, public = keypair
+    clock = Clock()
+    fake = FakeAppGitHub(public, clock)
+    fake.hidden.add("acme/private-one")
+    gh = app_client(pem, fake, clock)
+    assert gh.get_repo("acme/private-one") is None
+    assert len(fake.calls) == 1
+
+
+def test_not_installed_is_rechecked_after_a_while(keypair):
+    pem, public = keypair
+    clock = Clock()
+    fake = FakeAppGitHub(public, clock, installed=())
+    gh = app_client(pem, fake, clock, pat="ghp_pat")
+    gh.get_repo("acme/one")
+    fake.installed["acme"] = 900                 # installed, but no webhook reached us
+    gh.get_repo("acme/one")
+    assert fake.calls[-1][2] == "Bearer ghp_pat"  # still believed missing
+    clock.t += AppTokens.negative_ttl + 1
+    gh.get_repo("acme/one")
+    assert fake.calls[-1][2] == "Bearer ghs_900_1"
+
+
+def test_404_right_after_an_installation_event_does_not_stick(keypair):
+    pem, public = keypair
+    clock = Clock()
+    fake = FakeAppGitHub(public, clock, installed=())
+    tokens = AppTokens(creds(pem), transport=httpx.MockTransport(fake.handler), clock=clock)
+    tokens.forget("acme")                        # installation event arrives
+    assert tokens.installation_id("acme") is None  # GitHub hasn't caught up yet
+    fake.installed["acme"] = 900
+    clock.t += AppTokens.settle_ttl + 1          # well short of negative_ttl
+    assert tokens.installation_id("acme") == 900
+
+
+# ---------------------------------------------------------------- broken app falls back (ALL-85)
+
+@pytest.mark.parametrize("status", [401, 500, 503])
+def test_broken_app_falls_back_to_the_token(keypair, status, caplog):
+    pem, public = keypair
+    clock = Clock()
+    fake = FakeAppGitHub(public, clock)
+    fake.app_status = status
+    gh = app_client(pem, fake, clock, pat="ghp_pat")
+    assert gh.get_repo("acme/one") == {"name": "one"}               # no exception
+    gh.create_issue("acme/one", "t", "b")
+    assert [c[2] for c in fake.calls] == ["Bearer ghp_pat", "Bearer ghp_pat"]
+    assert str(status) in gh.auth.app.problem
+    assert len([r for r in caplog.records if "GITHUB APP PROBLEM" in r.getMessage()]) == 1   # logged once
+
+
+def test_broken_app_without_a_token_sends_no_auth(keypair):
+    pem, public = keypair
+    clock = Clock()
+    fake = FakeAppGitHub(public, clock)
+    fake.app_status = 401
+    gh = app_client(pem, fake, clock)
+    gh.get_repo("acme/one")
+    assert fake.calls[-1][2] == ""
+    assert "rejected the app's private key" in gh.auth.app.problem
+
+
+def test_github_unreachable_during_minting_falls_back(keypair):
+    pem, public = keypair
+    clock = Clock()
+    fake = FakeAppGitHub(public, clock)
+
+    def app_side(req):
+        raise httpx.ConnectError("down", request=req)
+
+    tokens = AppTokens(creds(pem), transport=httpx.MockTransport(app_side), clock=clock)
+    gh = GitHubClient(GitHubAuth(pat="ghp_pat", app=tokens), transport=httpx.MockTransport(fake.handler))
+    assert gh.get_repo("acme/one") == {"name": "one"}
+    assert fake.calls[-1][2] == "Bearer ghp_pat"
+    assert "can't reach GitHub" in tokens.problem
+
+
+def test_problem_clears_when_the_app_works_again(keypair):
+    pem, public = keypair
+    clock = Clock()
+    fake = FakeAppGitHub(public, clock)
+    fake.app_status = 500
+    gh = app_client(pem, fake, clock, pat="ghp_pat")
+    gh.get_repo("acme/one")
+    assert gh.auth.app.problem
+    fake.app_status = 200
+    gh.get_repo("acme/one")
+    assert gh.auth.app.problem is None and fake.calls[-1][2] == "Bearer ghs_900_1"
+
+
+def test_health_shows_a_runtime_app_problem_live(bare, keypair):
+    pem, public = keypair
+    clock = Clock()
+    fake = FakeAppGitHub(public, clock)
+    bare.gh.auth.pat = "ghp_pat"
+    bare.gh.auth.use_app(AppTokens(creds(pem), transport=httpx.MockTransport(fake.handler), clock=clock))
+    bare.gh = GitHubClient(bare.gh.auth, transport=httpx.MockTransport(fake.handler))
+    with TestClient(build_app(bare)) as client:
+        assert "github_problem" not in client.get("/health").json()
+        fake.app_status = 503
+        bare.gh.get_repo("acme/one")
+        assert "503" in client.get("/health").json()["github_problem"]
+
+
+# ---------------------------------------------------------------- installed on which owners (ALL-86)
+
+def test_health_lists_where_the_app_is_installed(bare, keypair):
+    pem, public = keypair
+    clock = Clock()
+    fake = FakeAppGitHub(public, clock, installed=("acme",))
+    bare.s.allowed_owners = ["acme", "other"]
+    bare.gh.auth.use_app(AppTokens(creds(pem), transport=httpx.MockTransport(fake.handler), clock=clock))
+    with TestClient(build_app(bare)) as client:
+        health = client.get("/health").json()
+        assert health["github_app_installed_on"] == ["acme"]
+        assert health["github_app_missing_on"] == ["other"]
+
+        # Installing on "other" sends an installation event: cache reset, coverage refreshed.
+        fake.installed["other"] = 950
+        body = json.dumps({"action": "created",
+                           "installation": {"id": 950, "account": {"login": "other"}}}).encode()
+        sig = "sha256=" + hmac.new(b"app-secret", body, hashlib.sha256).hexdigest()
+        r = client.post("/github/webhook", content=body,
+                        headers={"X-Hub-Signature-256": sig, "X-GitHub-Event": "installation"})
+        assert r.status_code == 202
+        health = client.get("/health").json()
+    assert health["github_app_installed_on"] == ["acme", "other"]
+    assert health["github_app_missing_on"] == []
+
+
+def test_installation_event_resets_the_cached_token(bare, keypair):
+    pem, public = keypair
+    clock = Clock()
+    fake = FakeAppGitHub(public, clock)
+    tokens = AppTokens(creds(pem), transport=httpx.MockTransport(fake.handler), clock=clock)
+    bare.gh.auth.use_app(tokens)
+    tokens.token_for("acme")
+    client = TestClient(build_app(bare))
+    body = json.dumps({"action": "suspend", "installation": {"account": {"login": "ACME"}}}).encode()
+    sig = "sha256=" + hmac.new(b"app-secret", body, hashlib.sha256).hexdigest()
+    client.post("/github/webhook", content=body,
+                headers={"X-Hub-Signature-256": sig, "X-GitHub-Event": "installation_repositories"})
+    tokens.token_for("acme")
+    assert fake.minted == 2 and fake.lookups == 2
+
+
+# ---------------------------------------------------------------- locking (ALL-88)
+
+def test_concurrent_requests_for_one_account_mint_once(keypair):
+    import threading
+    import time as _time
+    pem, public = keypair
+    clock = Clock()
+    fake = FakeAppGitHub(public, clock)
+
+    def slow(req):
+        if req.url.path.endswith("/access_tokens"):
+            _time.sleep(0.2)
+        return fake.handler(req)
+
+    tokens = AppTokens(creds(pem), transport=httpx.MockTransport(slow), clock=clock)
+    out = []
+    threads = [threading.Thread(target=lambda: out.append(tokens.token_for("acme"))) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert fake.minted == 1 and set(out) == {"ghs_900_1"}
+
+
+def test_forget_does_not_wait_for_a_mint_in_progress(keypair):
+    import threading
+    import time as _time
+    pem, public = keypair
+    clock = Clock()
+    fake = FakeAppGitHub(public, clock)
+    release = threading.Event()
+
+    def blocking(req):
+        if req.url.path.endswith("/access_tokens"):
+            release.wait(5)
+        return fake.handler(req)
+
+    tokens = AppTokens(creds(pem), transport=httpx.MockTransport(blocking), clock=clock)
+    minting = threading.Thread(target=tokens.token_for, args=("acme",))
+    minting.start()
+    _time.sleep(0.1)                             # the mint is now stuck on the network
+    started = _time.monotonic()
+    tokens.forget("acme")
+    tokens.forget("other")
+    assert _time.monotonic() - started < 0.5
+    release.set()
+    minting.join()
+
+
+# ---------------------------------------------------------------- after /setup (ALL-90)
+
+def test_after_setup_repo_calls_carry_an_installation_token(bare, keypair):
+    pem, public = keypair
+    clock = Clock()
+    fake = FakeAppGitHub(public, clock)
+
+    def handler(req):
+        if req.url.path == "/app-manifests/c/conversions":
+            return httpx.Response(201, json={"id": 123, "slug": "acme-plane-bridge", "pem": pem,
+                                             "webhook_secret": "app-secret",
+                                             "html_url": "https://github.com/apps/acme-plane-bridge"})
+        return fake.handler(req)
+
+    transport = httpx.MockTransport(handler)
+    bare.gh = GitHubClient(bare.gh.auth, transport=transport)
+    app = build_app(bare, github_transport=transport)
+    client = TestClient(app, follow_redirects=False)
+    page = client.get(f"/setup?token={app.state.setup.token}")
+    state = re.search(r"state=([\w-]+)", page.text).group(1)
+    assert client.get(f"/setup/callback?code=c&state={state}").status_code == 303
+    bare.gh.get_repo("acme/one")
+    assert fake.calls[-1][2].startswith("Bearer ghs_")
+    health = client.get("/health").json()
+    assert health["github_app_installed_on"] == ["acme"] and "github_problem" not in health

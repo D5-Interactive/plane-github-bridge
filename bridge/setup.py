@@ -147,8 +147,12 @@ class SetupFlow:
                 log.error("GitHub App setup failed: %s", e)
                 return _page("Setup failed", f"<p>{html.escape(str(e))}</p>", status=502)
             CredentialFile(self.s.data_dir).save(creds)
-            self.auth.use_app(AppTokens(creds, transport=self.transport))
+            tokens = AppTokens(creds, transport=self.transport)
+            self.auth.use_app(tokens)
             self.token = None
+            tokens.check()                     # a problem shows in /health and the log
+            if self.s.allowed_owners:
+                tokens.refresh_coverage(self.s.allowed_owners)
             log.info("GitHub App %s (id %s) created and saved; install it on your org next",
                      creds.slug, creds.app_id)
             if creds.html_url:

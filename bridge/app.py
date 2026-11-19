@@ -46,7 +46,7 @@ def build_app(bridge: Bridge | None = None,
                         GitHubClient(github_auth_for(s)))
     settings = bridge.s
     auth = bridge.gh.auth
-    state = {"plane_problem": None, "github_problem": None}
+    state = {"plane_problem": None}
     setup = SetupFlow(settings, auth, transport=github_transport)
 
     def github_secrets() -> list[str]:
@@ -76,11 +76,12 @@ def build_app(bridge: Bridge | None = None,
         else:
             log.info("Plane workspace '%s' is reachable", settings.plane_workspace)
         if auth.app:
-            state["github_problem"] = auth.app.check()
-            if state["github_problem"]:
-                log.error("GITHUB APP PROBLEM: %s", state["github_problem"])
-            else:
+            if auth.app.check() is None:      # a problem is logged by check() itself
                 log.info("acting on GitHub as the app %s", auth.app.creds.slug or auth.app.creds.app_id)
+                if settings.allowed_owners:
+                    installed, missing = auth.app.refresh_coverage(settings.allowed_owners)
+                    if missing:
+                        log.warning("GitHub App is not installed on: %s", ", ".join(missing))
         else:
             setup.announce()
         if settings.sync_interval > 0 and not state["plane_problem"]:
@@ -111,12 +112,15 @@ def build_app(bridge: Bridge | None = None,
                "plane_api_ok": state["plane_problem"] is None,
                "github_auth": auth.mode,
                "github_webhook_ready": bool(github_secrets())}
-        if auth.app and auth.app.creds.slug:
-            out["github_app"] = auth.app.creds.slug
+        if auth.app:
+            if auth.app.creds.slug:
+                out["github_app"] = auth.app.creds.slug
+            if auth.app.coverage is not None:
+                out["github_app_installed_on"], out["github_app_missing_on"] = auth.app.coverage
         if state["plane_problem"]:
             out["plane_problem"] = state["plane_problem"]
-        if state["github_problem"]:
-            out["github_problem"] = state["github_problem"]
+        if auth.app and auth.app.problem:        # live: the latest reason the app can't be used
+            out["github_problem"] = auth.app.problem
         return out
 
     @app.post("/plane/webhook", status_code=202)
@@ -147,7 +151,9 @@ def build_app(bridge: Bridge | None = None,
         if x_github_event in ("installation", "installation_repositories") and auth.app:
             account = ((json.loads(body or b"{}").get("installation") or {}).get("account") or {})
             if account.get("login"):
-                auth.app.forget(account["login"])   # look the installation up afresh next time
+                auth.app.forget(account["login"])   # cheap: never waits on network calls
+            if settings.allowed_owners:             # network calls: off the event loop
+                tasks.add_task(auth.app.refresh_coverage, settings.allowed_owners)
             return {"accepted": True}
         tasks.add_task(run, f"github:{x_github_event}", bridge.handle_github,
                        x_github_event, json.loads(body or b"{}"))

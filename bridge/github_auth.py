@@ -88,86 +88,168 @@ def _expiry(stamp: str | None, now: float) -> float:
         return now + 3600   # GitHub's documented lifetime
 
 
+class AppError(Exception):
+    """The GitHub App couldn't be used: bad key, clock drift, GitHub down. Message has no secrets."""
+
+
 class AppTokens:
-    """Installation tokens for one GitHub App, one per account (org or user)."""
+    """Installation tokens for one GitHub App, one per account (org or user).
+
+    Locking: a short-lived guard protects the caches and is never held across a
+    network call. Minting for one account is serialized by that account's own
+    lock, so concurrent callers share one mint; other accounts, forget() and the
+    webhook handler never wait on it.
+    """
 
     # Refresh this many seconds before GitHub's expiry, so a token never runs out mid-request.
     margin = 300.0
+    # How long "the app isn't installed on this account" is believed before asking again.
+    negative_ttl = 600.0
+    # Right after an installation event GitHub can still answer 404 briefly; don't
+    # let that stick for the full negative_ttl.
+    settle_seconds = 120.0
+    settle_ttl = 30.0
 
     def __init__(self, creds: AppCredentials, transport: httpx.BaseTransport | None = None,
                  clock=time.time):
         self.creds = creds
         self.clock = clock
         self.http = httpx.Client(base_url=API, headers=HEADERS, timeout=20, transport=transport)
-        self._lock = threading.Lock()
-        self._installations: dict[str, int | None] = {}     # owner -> installation id (None = not installed)
+        self._guard = threading.Lock()
+        self._owner_locks: dict[str, threading.Lock] = {}
+        # owner -> (installation id or None = not installed, believed until; inf for positives)
+        self._installations: dict[str, tuple[int | None, float]] = {}
         self._tokens: dict[str, tuple[str, float]] = {}     # owner -> (token, expires_at)
+        self._forgotten_at: dict[str, float] = {}
+        # The latest reason the app couldn't be used, shown in /health; None when it works.
+        self.problem: str | None = None
+        # (installed on, missing on) for the allowed owners, from refresh_coverage().
+        self.coverage: tuple[list[str], list[str]] | None = None
 
     def jwt(self) -> str:
         return app_jwt(self.creds.app_id, self.creds.private_key, self.clock())
 
-    def _app_get(self, path: str) -> httpx.Response:
-        return self.http.get(path, headers={"Authorization": f"Bearer {self.jwt()}"})
+    def _app_request(self, method: str, path: str) -> httpx.Response:
+        try:
+            return self.http.request(method, path, headers={"Authorization": f"Bearer {self.jwt()}"})
+        except httpx.HTTPError as e:
+            raise self._fail(f"can't reach GitHub's API ({type(e).__name__})") from None
+
+    def _fail(self, message: str) -> AppError:
+        """Record why the app can't be used, logging only when the reason changes."""
+        if message != self.problem:
+            log.error("GITHUB APP PROBLEM: %s", message)
+        self.problem = message
+        return AppError(message)
+
+    def _ok(self) -> None:
+        if self.problem:
+            log.info("GitHub App working again")
+        self.problem = None
+
+    def _describe(self, r: httpx.Response, what: str) -> str:
+        if r.status_code == 401:
+            return (f"GitHub rejected the app's private key (401) while {what}. Check that it "
+                    f"belongs to app {self.creds.app_id} and that the server's clock is right")
+        return f"GitHub answered {r.status_code} while {what}"
 
     def check(self) -> str | None:
         """None if GitHub accepts the app's key; otherwise a message saying why not."""
         try:
-            r = self._app_get("/app")
-        except httpx.HTTPError as e:
-            return f"can't reach GitHub's API ({e})"
-        if r.status_code == 401:
-            return (f"GitHub rejected the app's private key (401). Check that it belongs to app "
-                    f"{self.creds.app_id} and that the server's clock is right")
+            r = self._app_request("GET", "/app")
+        except AppError as e:
+            return str(e)
         if r.is_error:
-            return f"GitHub answered {r.status_code} for app {self.creds.app_id}"
+            return str(self._fail(self._describe(r, f"checking app {self.creds.app_id}")))
         meta = r.json()
         self.creds.slug = self.creds.slug or meta.get("slug", "")
         self.creds.html_url = self.creds.html_url or meta.get("html_url", "")
+        self._ok()
         return None
 
-    def _installation_id(self, owner: str, repo: str) -> int | None:
-        key = owner.lower()
-        if key not in self._installations:
-            r = self._app_get(f"/repos/{owner}/{repo}/installation")
+    def _owner_lock(self, key: str) -> threading.Lock:
+        with self._guard:
+            return self._owner_locks.setdefault(key, threading.Lock())
+
+    def _lookup_installation(self, owner: str) -> int | None:
+        """The app's installation on an account (org first, then user), or None. Network call."""
+        for kind in ("orgs", "users"):
+            r = self._app_request("GET", f"/{kind}/{owner}/installation")
             if r.status_code == 404:
+                continue
+            if r.is_error:
+                raise self._fail(self._describe(r, f"looking up the app's installation on {owner}"))
+            return r.json()["id"]
+        return None
+
+    def installation_id(self, owner: str) -> int | None:
+        key = owner.lower()
+        now = self.clock()
+        with self._guard:
+            hit = self._installations.get(key)
+        if hit and hit[1] > now:
+            return hit[0]
+        inst = self._lookup_installation(owner)
+        if inst is None:
+            with self._guard:
+                settling = now - self._forgotten_at.get(key, float("-inf")) < self.settle_seconds
+            if not hit or hit[0] is not None:     # log once per change, not on every re-check
                 log.warning("GitHub App isn't installed on %s; install it, or that account falls back "
                             "to GITHUB_TOKEN if set", owner)
-                self._installations[key] = None
-            elif r.is_error:
-                raise httpx.HTTPStatusError(f"{r.status_code} looking up the app's installation on {owner}",
-                                            request=r.request, response=r)
-            else:
-                self._installations[key] = r.json()["id"]
-        return self._installations[key]
+            until = now + (self.settle_ttl if settling else self.negative_ttl)
+        else:
+            until = float("inf")
+        with self._guard:
+            self._installations[key] = (inst, until)
+        return inst
 
-    def token_for(self, owner: str, repo: str) -> str | None:
-        """An installation token for owner's repos, or None if the app isn't installed there."""
+    def token_for(self, owner: str, repo: str | None = None) -> str | None:
+        """An installation token for owner's repos, or None if the app isn't installed there.
+
+        Raises AppError when the app can't be used at all (bad key, GitHub down).
+        """
         key = owner.lower()
-        with self._lock:
-            hit = self._tokens.get(key)
+        with self._owner_lock(key):           # one mint per account at a time
+            with self._guard:
+                hit = self._tokens.get(key)
             now = self.clock()
             if hit and hit[1] - self.margin > now:
                 return hit[0]
-            inst = self._installation_id(owner, repo)
+            inst = self.installation_id(owner)
             if inst is None:
                 return None
-            r = self.http.post(f"/app/installations/{inst}/access_tokens",
-                               headers={"Authorization": f"Bearer {self.jwt()}"})
+            r = self._app_request("POST", f"/app/installations/{inst}/access_tokens")
             if r.status_code == 404:          # app was uninstalled since we looked
-                self._installations.pop(key, None)
+                with self._guard:
+                    self._installations.pop(key, None)
                 return None
             if r.is_error:
-                raise httpx.HTTPStatusError(f"{r.status_code} minting an installation token for {owner}",
-                                            request=r.request, response=r)
+                raise self._fail(self._describe(r, f"minting an installation token for {owner}"))
             data = r.json()
-            self._tokens[key] = (data["token"], _expiry(data.get("expires_at"), now))
+            with self._guard:
+                self._tokens[key] = (data["token"], _expiry(data.get("expires_at"), now))
+            self._ok()
             log.debug("minted installation token for %s", owner)
             return data["token"]
 
     def forget(self, owner: str) -> None:
-        with self._lock:
-            self._tokens.pop(owner.lower(), None)
-            self._installations.pop(owner.lower(), None)
+        """Drop what's cached for an account. Never waits on network calls."""
+        key = owner.lower()
+        with self._guard:
+            self._tokens.pop(key, None)
+            self._installations.pop(key, None)
+            self._forgotten_at[key] = self.clock()
+
+    def refresh_coverage(self, owners: list[str]) -> tuple[list[str], list[str]]:
+        """Which of these accounts the app is installed on. Network calls; run off the event loop."""
+        installed, missing = [], []
+        for owner in owners:
+            try:
+                (installed if self.installation_id(owner) is not None else missing).append(owner)
+            except AppError:
+                missing.append(owner)
+        self.coverage = (installed, missing)
+        return self.coverage
 
 
 _REPO_PATH = re.compile(r"^/repos/([^/]+)/([^/]+)")
@@ -178,7 +260,8 @@ class GitHubAuth(httpx.Auth):
 
     Repo calls (/repos/owner/name/...) use the app's installation token for that
     owner when an app is set up and installed there, and the personal access token
-    otherwise. The app can be switched on at runtime (after /setup) without a restart.
+    otherwise: also when the app can't be used right now, or the installation can't
+    reach that one repo. The app can be switched on at runtime (after /setup).
     """
 
     def __init__(self, pat: str = "", app: AppTokens | None = None):
@@ -193,26 +276,41 @@ class GitHubAuth(httpx.Auth):
         self.app = app
 
     def _token(self, path: str) -> tuple[str | None, str | None]:
-        """(token, owner it was minted for, or None for the PAT)."""
+        """(token, owner it was minted for, or None when it's the PAT or nothing)."""
         m = _REPO_PATH.match(path)
         if self.app and m:
-            token = self.app.token_for(m.group(1), m.group(2))
+            try:
+                token = self.app.token_for(m.group(1), m.group(2))
+            except AppError:
+                token = None                  # already logged and shown in /health
             if token:
                 return token, m.group(1)
         return (self.pat or None), None
 
-    def auth_flow(self, request: httpx.Request):
-        token, owner = self._token(request.url.path)
+    def _set(self, request: httpx.Request, token: str | None) -> None:
         if token:
             request.headers["Authorization"] = f"Bearer {token}"
+        else:
+            request.headers.pop("Authorization", None)
+
+    def auth_flow(self, request: httpx.Request):
+        token, owner = self._token(request.url.path)
+        self._set(request, token)
         response = yield request
-        # A revoked or rotated installation token: mint a fresh one and try once more.
-        if response.status_code == 401 and owner and self.app:
+        if not (owner and self.app):
+            return
+        if response.status_code == 401:
+            # A revoked or rotated installation token: mint a fresh one and try once more.
             self.app.forget(owner)
-            token, owner = self._token(request.url.path)
+            token, _ = self._token(request.url.path)
             if token:
-                request.headers["Authorization"] = f"Bearer {token}"
+                self._set(request, token)
                 yield request
+        elif response.status_code == 404 and self.pat:
+            # The installation can't see this repo (not in a "select repositories"
+            # install); the personal token may.
+            self._set(request, self.pat)
+            yield request
 
 
 def load_private_key(path: str) -> str:
