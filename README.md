@@ -290,9 +290,14 @@ more:
 |---|---|---|
 | Issues | Read and write | Creating issues and keeping them in step with Plane |
 | Pull requests | Read and write | Reading PRs linked to work items |
-| Checks | Read and write | The "Plane" check on linked commits and PRs |
-| Contents | Read | Seeing branches and commits |
+| Checks | Read and write | Reserved for check runs on linked commits and PRs (planned) |
+| Contents | Read | Reserved for the same check runs (planned) |
 | Metadata | Read | Reading a repo's name and description (always granted) |
+
+Checks and Contents aren't used yet. They're requested now so that when check
+runs arrive, the app doesn't have to be re-approved by an org owner. If you'd
+rather grant only what's used today, leave them off; you'll be asked to accept
+the new permissions when the feature ships.
 
 And these webhook events: **Issues, Pull request, Pull request review, Push,
 Create** (branch or tag creation). The bridge never asks for Administration, so
@@ -327,8 +332,10 @@ it can't rename, delete or reconfigure a repo.
    add each repo to the app as you link it.
 
 `curl http://127.0.0.1:8095/health` should now show `"github_auth":"app"`, the
-app's name in `github_app`, and `"github_webhook_ready":true`. The app's own
-webhook is already set up: skip to step 6.
+app's name in `github_app`, `"github_webhook_ready":true`, and, if you set
+`GITHUB_ALLOWED_OWNERS`, your org under `github_app_installed_on` with
+`github_app_missing_on` empty. The app's own webhook is already set up: skip to
+step 6.
 
 > [!NOTE]
 > Creating an app on an organization takes an org owner or an **app manager**
@@ -377,13 +384,22 @@ the permissions and events above, and its webhook pointed at
    sleep 5 && curl http://127.0.0.1:8095/health
    ```
 
-   Look for `"github_auth":"app"` and no `github_problem`.
+   Look for `"github_auth":"app"`, no `github_problem`, and (with
+   `GITHUB_ALLOWED_OWNERS` set) an empty `github_app_missing_on`.
 
-**Moving from a token and org webhook to your own app?** Give the app the same
-webhook secret as the org webhook, so `GITHUB_WEBHOOK_SECRET` stays as it is.
-After step 3, turn on the app's webhook (**Active**) and delete the org webhook
-at the same time, so each event arrives once. Once activity shows up as the
-app's bot, remove `GITHUB_TOKEN` from `.env` and revoke the token.
+**Moving from a token and org webhook to your own app?**
+
+1. Give the app the same webhook secret as the org webhook. With your own app
+   the bridge has one `GITHUB_WEBHOOK_SECRET`, so both webhooks must use it;
+   whichever doesn't match gets `401`.
+2. After step 3, turn on the app's webhook (**Active**) first. Delete the org
+   webhook a minute later. Events in that overlap arrive twice, which is
+   harmless: each activity comment is posted once and state moves don't
+   repeat. A gap, on the other hand, loses events.
+3. Check `/health`: `github_app_missing_on` must be empty, or repos of the
+   accounts listed there still depend on the token.
+4. Once activity shows up as the app's bot, remove `GITHUB_TOKEN` from `.env`,
+   recreate the container, and revoke the token.
 
 An app set in `.env` takes priority over one made with `/setup`.
 
@@ -469,10 +485,14 @@ if you'd rather they didn't show your name.
 5. Open the webhook again and select the **Recent Deliveries** tab. GitHub sends
    a ping as soon as the webhook is created; it should show a green ✓.
 
-The token keeps working alongside an app: for any account the app isn't
-installed on, the bridge falls back to it. To move from a token to an app later,
-do option A, then delete the org webhook (both secrets are accepted in the
-meantime, so nothing is missed).
+The token keeps working alongside an app. The bridge falls back to it for an
+account the app isn't installed on, for a repo left out of a **Only select
+repositories** install (the call is retried with the token), and while the app
+itself is failing (a wrong key, a skewed clock, GitHub errors; `/health` shows
+the reason as `github_problem`). To move from a token to an app later, do option
+A, check that `github_app_missing_on` in `/health` is empty, then delete the org
+webhook. With an app made by `/setup`, both its secret and
+`GITHUB_WEBHOOK_SECRET` are accepted in the meantime, so nothing is missed.
 
 | Ping shows (any option) | Meaning |
 |---|---|
@@ -798,15 +818,22 @@ container's user. Deleting that file and recreating the container brings
 - Both webhooks need a valid HMAC signature. An unset `PLANE_WEBHOOK_SECRET`
   rejects every Plane webhook with `503` rather than accepting unsigned ones.
 - On GitHub the bridge has Issues, Pull requests and Checks (read and write)
-  and Contents and Metadata (read only). It can read code but never change it,
-  and has no Administration access, so it can't rename, delete or reconfigure
-  a repo. A personal access token needs only Issues.
+  and Contents and Metadata (read only); Checks and Contents are reserved for
+  planned check runs and unused today. It can't change code, and has no
+  Administration access, so it can't rename, delete or reconfigure a repo. A
+  personal access token needs only Issues.
 - GitHub App installation tokens are minted from the app's private key, cached
   in memory, and replaced five minutes before their one-hour expiry. The
   private key never leaves the server.
 - `/setup` only answers while no app is configured, and only with the one-time
   token printed in the log. The state GitHub sends back is checked and
-  single-use, so nobody else can attach their own app to your bridge.
+  single-use, and only one callback runs at a time, so nobody else can attach
+  their own app to your bridge. It also refuses to run while
+  `BRIDGE_PUBLIC_URL` is still the `example.com` placeholder.
+- The setup token is in the link's query string, so it can appear in your
+  proxy or tunnel's access logs. It changes on every restart and stops working
+  once an app exists. The one-time code GitHub sends back is kept out of the
+  bridge's own request log unless `LOG_LEVEL=DEBUG`.
 - `GITHUB_ALLOWED_OWNERS` stops anyone in Plane from pointing a module at a repo
   outside your org.
 - The container runs as an unprivileged user.
@@ -835,7 +862,12 @@ container's user. Deleting that file and recreating the container brings
 | `GitHub App not set up ... open: .../setup?token=...` | No app yet: the one-time setup link (setup step 5A) |
 | `acting on GitHub as the app ...` | Startup message; the GitHub App is in use |
 | `GITHUB APP PROBLEM: GitHub rejected the app's private key` | Wrong key for that app ID, or the server's clock is off |
-| `GitHub App isn't installed on owner` | Install the app on that account; until then the bridge uses `GITHUB_TOKEN` there if set |
+| `GitHub App isn't installed on owner` | Install the app on that account; until then the bridge uses `GITHUB_TOKEN` there if set. Checked again every 10 minutes |
+| `GitHub App is not installed on: owner, ...` | Startup check of `GITHUB_ALLOWED_OWNERS`; the same list is in `/health` as `github_app_missing_on` |
+| `GITHUB APP PROBLEM: ...` (any other reason) | The app can't be used right now; calls fall back to `GITHUB_TOKEN` if set. Shown live in `/health` as `github_problem` |
+| `GitHub App working again` | The problem above cleared itself |
+| `GitHub returned no webhook secret for the new app` | Copy the app's webhook secret into `GITHUB_WEBHOOK_SECRET` and recreate the container |
+| `Can't read the saved GitHub App in /data/github-app.json` | The file `/setup` saved is damaged. Delete it and recreate the container to run `/setup` again |
 | `PLANE SETUP PROBLEM: Plane refused workspace '...'` | `PLANE_WORKSPACE` doesn't match the slug in your Plane URL |
 | `... -> 403: You do not have permission to perform this action.` | The token's account isn't a member of that project, or the slug is wrong |
 
