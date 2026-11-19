@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🔗 plane-github-bridge
+# ⇄ plane-github-bridge
 
 **Plan in Plane. Build in GitHub. Never update a board by hand.**
 
@@ -14,30 +14,30 @@ A small, self-hosted webhook service that links [Plane](https://plane.so) Commun
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](docker-compose.yml)
 [![Plane CE](https://img.shields.io/badge/Plane-Community%20Edition-3F76FF)](https://github.com/makeplane/plane)
 
-[How it works](#-how-it-works) •
-[Installation](#-installation) •
-[Setup](#%EF%B8%8F-setup) •
-[Team workflow](#-team-workflow) •
-[Limits](#%EF%B8%8F-limits) •
+[How it works](#-how-it-works) ·
+[Installation](#-installation) ·
+[Setup](#-setup) ·
+[Team workflow](#-team-workflow) ·
+[Limits](#-limits) ·
 [Development](#-development)
 
 </div>
 
 ---
 
-## ✨ Why
+## ◆ Why
 
 Plane's built-in GitHub sync is a paid feature. This bridge gives Community
 Edition the part that matters for a Scrum team:
 
-- 📝 **Plane is where tasks are planned.** Write the task, its acceptance
+- ▸ **Plane is where tasks are planned.** Write the task, its acceptance
   criteria and its estimate in Plane, inside a module that's mapped to a repo.
-- 🐙 **GitHub is where the code work happens.** The bridge creates the issue, and
+- ▸ **GitHub is where the code work happens.** The bridge creates the issue, and
   branches, commits and PRs attach to it the normal GitHub way.
-- 🔄 **Progress flows back on its own.** Opening, reviewing and merging PRs moves
+- ▸ **Progress flows back on its own.** Opening, reviewing and merging PRs moves
   the work item across the sprint board.
 
-## 🧭 How it works
+## ◆ How it works
 
 ```mermaid
 sequenceDiagram
@@ -64,18 +64,18 @@ before anything happens.
 
 | On GitHub | Work item moves to |
 |---|---|
-| PR that says `Closes #N` opened as a draft | 🟡 In Progress |
-| PR ready for review | 🔵 In Review |
-| PR closed without merging, or converted to draft | 🟡 In Progress |
-| PR merged, or issue closed as completed | 🟢 Done |
-| Issue closed as not planned | ⚫ Cancelled |
-| Issue reopened | ⚪ Todo |
+| PR that says `Closes #N` opened as a draft | ◐ In Progress |
+| PR ready for review | ◑ In Review |
+| PR closed without merging, or converted to draft | ◐ In Progress |
+| PR merged, or issue closed as completed | ● Done |
+| Issue closed as not planned | ✕ Cancelled |
+| Issue reopened | ○ Todo |
 
 Edits to a work item's **title or description** in Plane are copied to its
 issue. Edits made on the GitHub issue are **not** copied back: Plane is the
 source of truth for the task itself.
 
-## 📦 Installation
+## ◆ Installation
 
 Everything runs on the Plane server, next to Plane. Clone the repo there:
 
@@ -89,7 +89,7 @@ cd plane-github-bridge
 instance, and a Cloudflare Tunnel (or any other way to give the bridge a public
 HTTPS address).
 
-## ⚙️ Setup
+## ◆ Setup
 
 ### 1. Create your config
 
@@ -190,7 +190,7 @@ GitHub → **D5-Interactive → Settings → Webhooks → Add webhook**:
 | Payload URL | `https://hooks.d5i.dev/github/webhook` |
 | Content type | `application/json` |
 | Secret | your `GITHUB_WEBHOOK_SECRET` |
-| Events | **Let me select** → ✅ Issues, ✅ Pull requests |
+| Events | **Let me select** → ✓ Issues, ✓ Pull requests |
 
 GitHub sends a ping right away; it should show a green check.
 
@@ -207,7 +207,7 @@ docker compose logs -f bridge
 > If nothing happens, set `LOG_LEVEL=DEBUG` in `.env`, restart, and try again.
 > The log then shows each Plane payload exactly as received.
 
-## 👥 Team workflow
+## ◆ Team workflow
 
 1. **Plan in Plane.** Create the task in the right module and write the
    acceptance criteria as a checklist; it becomes a checklist on the GitHub issue.
@@ -216,7 +216,7 @@ docker compose logs -f bridge
 3. **Close it from the PR.** Put `Closes #<issue number>` in the PR description.
 4. **Hands off the board.** Leave the Plane state alone; the bridge moves it.
 
-## ⚠️ Limits
+## ◆ Limits
 
 - Only work items in mapped projects/modules sync. Adding an item to a mapped
   module later also creates its issue.
@@ -226,7 +226,7 @@ docker compose logs -f bridge
   **Cancelled**. Otherwise the bridge falls back to the first state in the
   matching state group.
 
-## 🛠 Development
+## ◆ Development
 
 The project uses [uv](https://docs.astral.sh/uv/) and Python 3.14.
 
@@ -258,6 +258,6 @@ bridge/
 tests/           # pytest suite with fake Plane and GitHub APIs
 ```
 
-## 📄 License
+## ◆ License
 
 [MIT](LICENSE) © D5i
