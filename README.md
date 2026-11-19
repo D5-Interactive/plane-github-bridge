@@ -1,6 +1,6 @@
 # plane-github-bridge
 
-Links D5i's Plane work items to GitHub issues.
+Links Plane work items to GitHub issues.
 
 - **Plane is where tasks are planned.** Create a Scrum task in Plane, write the
   description and acceptance criteria (use a checklist), and put it in a module
