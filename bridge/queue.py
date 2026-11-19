@@ -37,7 +37,11 @@ def ensure_schema(store) -> None:
                    updated_at     REAL NOT NULL,
                    next_at        REAL NOT NULL,
                    stale_reported INTEGER NOT NULL DEFAULT 0,
+                   version        INTEGER NOT NULL DEFAULT 0,
                    UNIQUE (kind, key))""")
+        cols = {r[1] for r in store._db.execute("PRAGMA table_info(retry_queue)")}
+        if "version" not in cols:
+            store._db.execute("ALTER TABLE retry_queue ADD COLUMN version INTEGER NOT NULL DEFAULT 0")
         store._db.commit()
 
 
@@ -53,14 +57,16 @@ class Entry:
     updated_at: float
     next_at: float
     stale_reported: bool
+    version: int = 0        # bumped by every put: tells a merged-in payload from the one that ran
 
 
-_COLS = "id, kind, key, payload, reason, attempts, first_seen, updated_at, next_at, stale_reported"
+_COLS = ("id, kind, key, payload, reason, attempts, first_seen, updated_at, next_at, "
+         "stale_reported, version")
 
 
 def _entry(row) -> Entry:
     return Entry(row[0], row[1], row[2], json.loads(row[3]), row[4], row[5],
-                 row[6], row[7], row[8], bool(row[9]))
+                 row[6], row[7], row[8], bool(row[9]), row[10])
 
 
 class RetryQueue:
@@ -87,17 +93,27 @@ class RetryQueue:
                    VALUES (?, ?, ?, ?, 0, ?, ?, ?, 0)
                    ON CONFLICT (kind, key) DO UPDATE SET
                        payload = excluded.payload, reason = excluded.reason,
-                       updated_at = excluded.updated_at, next_at = excluded.next_at""",
+                       updated_at = excluded.updated_at, next_at = excluded.next_at,
+                       version = retry_queue.version + 1""",
                 (kind, key, data, reason, now, now, now))
             self.store._db.commit()
 
-    def done(self, entry_id: int) -> None:
+    def done(self, entry_id: int, version: int | None = None) -> bool:
+        """Remove a finished entry. With version: only if nothing was merged into it
+        since it was read (a newer intent put while the handler ran stays queued,
+        due now). Returns True if it was removed."""
         with self.store._lock:
-            self.store._db.execute("DELETE FROM retry_queue WHERE id = ?", (entry_id,))
+            if version is None:
+                cur = self.store._db.execute("DELETE FROM retry_queue WHERE id = ?", (entry_id,))
+            else:
+                cur = self.store._db.execute("DELETE FROM retry_queue WHERE id = ? AND version = ?",
+                                             (entry_id, version))
             self.store._db.commit()
+            return cur.rowcount > 0
 
-    def failed(self, entry_id: int, reason: str) -> Entry | None:
-        """Record a failed attempt and schedule the next one. Returns the updated entry."""
+    def failed(self, entry_id: int, reason: str, version: int | None = None) -> Entry | None:
+        """Record a failed attempt and schedule the next one. Returns the updated entry.
+        If a newer payload was merged in since `version`, it stays due now."""
         now = self.clock()
         with self.store._lock:
             row = self.store._db.execute(
@@ -107,6 +123,8 @@ class RetryQueue:
             e = _entry(row)
             attempts = e.attempts + 1
             delay = self.backoff[min(attempts - 1, len(self.backoff) - 1)]
+            if version is not None and e.version != version:
+                delay = 0
             report = (not e.stale_reported) and (now - e.first_seen > self.max_age)
             self.store._db.execute(
                 """UPDATE retry_queue SET attempts = ?, reason = ?, updated_at = ?, next_at = ?,
@@ -176,12 +194,12 @@ def run_due(queue: RetryQueue, handlers: dict[str, Callable[[dict], None]], *,
         try:
             handler(e.payload)
         except Exception as exc:
-            queue.failed(e.id, short_reason(exc))
+            queue.failed(e.id, short_reason(exc), version=e.version)
             summary["failed"] += 1
             if stop(exc):
                 summary["stopped"] = True
                 break
         else:
-            queue.done(e.id)
+            queue.done(e.id, version=e.version)
             summary["done"] += 1
     return summary
