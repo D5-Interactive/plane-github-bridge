@@ -24,7 +24,8 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
     if bridge is None:
         s = load_settings()
         bridge = Bridge(s, Store(s.db_path),
-                        PlaneClient(s.plane_base_url, s.plane_workspace, s.plane_api_key),
+                        PlaneClient(s.plane_base_url, s.plane_workspace, s.plane_api_key,
+                                    rate_limit=s.plane_rate_limit),
                         GitHubClient(s.github_token))
     settings = bridge.s
     state = {"plane_problem": None}

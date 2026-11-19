@@ -687,6 +687,8 @@ A SQLite database at `/data/bridge.db`, in the `bridge-data` Docker volume:
 | `WARNING PLANE_WEBHOOK_SECRET is not set` | Expected until setup step 6 is done |
 | `PLANE SETUP PROBLEM: Plane refused workspace '...'` | `PLANE_WORKSPACE` doesn't match the slug in your Plane URL |
 | `... -> 403: You do not have permission to perform this action.` | The token's account isn't a member of that project, or the slug is wrong |
+| `Plane rate limit: GET /... answered 429; waiting 10s (retry 1 of 3)` | Plane's per-key limit was hit; the bridge waits and retries. If it's frequent, lower `PLANE_RATE_LIMIT` |
+| `GitHub rate limit: POST /repos/... answered 403; waiting 60s and retrying once` | GitHub's secondary rate limit, usually from creating many issues quickly; harmless |
 
 Set `LOG_LEVEL=DEBUG` in `.env` and recreate the container to also print each
 Plane payload as received.
@@ -695,9 +697,23 @@ Plane payload as received.
 
 Per Plane event the bridge makes a handful of Plane API calls (the work item,
 plus the project and module list when they're not cached) and at most one or two
-GitHub calls. Plane's API rate limit applies per API key, so a very large import
-of work items into linked modules may hit it; events that fail are logged and
-skipped, and editing the item again retries it.
+GitHub calls.
+
+**Plane's rate limit.** Plane limits each API key to a number of requests per
+minute (60 by default) and answers `429 RATE_LIMIT_EXCEEDED` above it. The
+bridge keeps itself under the limit and recovers when it hits it anyway:
+
+- **Pacing.** All Plane calls are spaced evenly so they stay under
+  `PLANE_RATE_LIMIT` requests per minute (default `50`). Set it a little below
+  your Plane's limit, or to `0` to turn pacing off.
+- **Backoff.** A request answered `429` waits as long as Plane's `Retry-After`
+  (or `X-RateLimit-Reset`) header says, at most 60 seconds, then is sent again,
+  up to 3 times. If it still fails, the error is logged and the work is picked
+  up again later.
+
+**GitHub's rate limits.** A `429`, or a `403` that is GitHub's secondary rate
+limit, is retried once after the wait GitHub asks for (at most 60 seconds).
+Ordinary `403` and `404` answers aren't retried.
 
 ## ◆ Development
 
