@@ -1,9 +1,12 @@
 """Thin REST clients for Plane (v1 API) and GitHub."""
 from __future__ import annotations
 
+import contextvars
 import logging
+import math
 import threading
 import time
+from contextlib import contextmanager
 from email.utils import parsedate_to_datetime
 
 import httpx
@@ -49,19 +52,163 @@ def retry_after(r: httpx.Response, now: float | None = None) -> float:
     return min(MAX_WAIT, server_wait(r, now))
 
 
-class Pacer:
-    """Spaces requests evenly so a client stays under a per-minute limit.
+LANE_INTERACTIVE = "interactive"
+LANE_BACKGROUND = "background"
+_LANE: contextvars.ContextVar[str] = contextvars.ContextVar("bridge_pacer_lane", default=LANE_INTERACTIVE)
 
-    Thread-safe: each caller reserves the next free slot under a lock, then
-    sleeps outside it. per_minute <= 0 turns pacing off.
+
+@contextmanager
+def lane(name: str):
+    """Run the calls inside this block in a pacing lane.
+
+    "interactive" (the default) is for webhook work that someone is waiting on.
+    "background" is for scans and catch-up passes: they only use part of the
+    remaining budget and step aside whenever an interactive call is waiting.
+    """
+    if name not in (LANE_INTERACTIVE, LANE_BACKGROUND):
+        raise ValueError(f"unknown pacing lane {name!r}")
+    token = _LANE.set(name)
+    try:
+        yield
+    finally:
+        _LANE.reset(token)
+
+
+def current_lane() -> str:
+    return _LANE.get()
+
+
+def _header(headers, *names: str) -> str:
+    for n in names:
+        v = headers.get(n)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return ""
+
+
+class Pacer:
+    """Spaces requests so a client stays under its rate limit.
+
+    Two sources for the pace:
+    ▸ configured: per_minute requests a minute, evenly spaced (0 = no pacing);
+    ▸ learned: once a response carries rate-limit headers (Plane's
+      X-RateLimit-Remaining/-Reset, GitHub's x-ratelimit-*), the remaining budget
+      is spread over the time left until the window resets. Stale headers (the
+      window has reset) fall back to the configured pace.
+
+    Two lanes (see lane()): background calls may only use (1 - reserve_share) of
+    the remaining budget and yield to waiting interactive calls, so scans can't
+    starve webhook work.
+
+    Thread-safe: callers reserve a slot under a lock and sleep outside it.
     """
 
-    def __init__(self, per_minute: float, clock=time.monotonic, sleep=time.sleep):
+    def __init__(self, per_minute: float, clock=time.monotonic, sleep=time.sleep,
+                 wall=time.time, reserve_share: float = 0.3, floor: float = 0.05,
+                 burst: int = 4, resource: str = "core"):
+        """per_minute: configured pace, used until headers are seen (0 = none).
+        reserve_share: share of the learned budget kept for interactive calls.
+        floor: shortest spacing ever used when pacing from headers.
+        burst: interactive calls that may go back to back when the learned budget
+        is well ahead of schedule (the spacing still holds over time).
+        resource: GitHub's x-ratelimit-resource this pacer tracks ("core");
+        headers for other resources are recorded for /health but don't pace.
+        """
         self.interval = 60.0 / per_minute if per_minute and per_minute > 0 else 0.0
-        self.clock, self.sleep = clock, sleep
+        self.clock, self.sleep, self.wall = clock, sleep, wall
+        self.reserve_share = min(max(reserve_share, 0.0), 0.95)
+        self.floor = max(floor, 0.0)
+        self.burst = max(int(burst), 0)
+        self.resource = resource
         self._lock = threading.Lock()
-        self._next = 0.0
+        self._next = 0.0            # theoretical time of the next slot
         self._hold_until = 0.0      # after a 429: nobody sends before this
+        # Learned from headers
+        self._limit: int | None = None
+        self._remaining: int | None = None
+        self._reset_at: float | None = None      # on self.clock's scale
+        self._others: dict[str, dict] = {}       # other GitHub resources, for /health
+        self._waiting = {LANE_INTERACTIVE: 0, LANE_BACKGROUND: 0}
+
+    # ------------------------------------------------------------ learning
+
+    def observe(self, headers) -> None:
+        """Learn the budget from a response's rate-limit headers (if it has any)."""
+        remaining = _header(headers, "X-RateLimit-Remaining", "x-ratelimit-remaining")
+        reset = _header(headers, "X-RateLimit-Reset", "x-ratelimit-reset")
+        if not remaining or not reset:
+            return
+        try:
+            remaining_n = int(float(remaining))
+            reset_n = float(reset)
+        except ValueError:
+            return
+        limit = _header(headers, "X-RateLimit-Limit", "x-ratelimit-limit")
+        try:
+            limit_n = int(float(limit)) if limit else None
+        except ValueError:
+            limit_n = None
+        resource = _header(headers, "x-ratelimit-resource") or self.resource
+        with self._lock:
+            now = self.clock()
+            # Epoch seconds, or (if small) seconds until the reset.
+            reset_at = now + (reset_n - self.wall() if reset_n > 1_000_000_000 else reset_n)
+            if resource != self.resource:
+                self._others[resource] = {"limit": limit_n, "remaining": remaining_n,
+                                          "reset_in": round(max(0.0, reset_at - now), 1)}
+                return
+            if reset_at <= now:
+                return          # already stale
+            same_window = (self._reset_at is not None and abs(reset_at - self._reset_at) < 2.0
+                           and self._reset_at > now)
+            if same_window and self._remaining is not None:
+                # Concurrent responses arrive out of order: within one window the
+                # budget only goes down.
+                remaining_n = min(remaining_n, self._remaining)
+                limit_n = limit_n or self._limit
+            self._reset_at = reset_at
+            self._remaining = max(remaining_n, 0)
+            seen = self._limit if same_window else None
+            self._limit = limit_n or max(seen or 0, remaining_n + 1)
+
+    def _fresh(self, now: float) -> bool:
+        if self._reset_at is not None and now >= self._reset_at:
+            # The window reset: what we learned no longer applies.
+            self._remaining = self._reset_at = None
+            self._limit = None
+        return self._reset_at is not None
+
+    def _reserve(self) -> int:
+        return int(math.ceil(self.reserve_share * (self._limit or self._remaining or 0)))
+
+    def _plan(self, now: float, which: str) -> tuple[float, float, float]:
+        """(interval, earliest start from the budget, burst tolerance) for a lane."""
+        if not self._fresh(now):
+            return self.interval, now, 0.0
+        left = self._reset_at - now
+        budget = self._remaining if which == LANE_INTERACTIVE else self._remaining - self._reserve()
+        if budget <= 0:
+            # Nothing left for this lane: wait for the window to reset.
+            return max(self.floor, self.interval), self._reset_at, 0.0
+        interval = max(self.floor, left / budget)
+        # GCRA: a tolerance of (burst - 1) slots lets `burst` calls go back to back.
+        tolerance = interval * max(self.burst - 1, 0) if which == LANE_INTERACTIVE else 0.0
+        return interval, now, tolerance
+
+    def _hold_start(self, now: float, honor_hold: bool, own_hold: float | None) -> float:
+        if not honor_hold:
+            return now
+        if own_hold is not None and self._hold_until <= own_hold:
+            return now
+        return max(now, self._hold_until)
+
+    def _take(self, now: float, start: float, interval: float) -> None:
+        if interval:
+            self._next = max(self._next, start) + interval
+        if self._remaining is not None and self._fresh(now):
+            self._remaining = max(self._remaining - 1, 0)
+
+    # ------------------------------------------------------------ holds and waits
 
     def hold(self, seconds: float) -> float:
         """After a 429, make every caller wait until the server's window has passed,
@@ -72,26 +219,83 @@ class Pacer:
             return until
 
     def wait(self, honor_hold: bool = True, own_hold: float | None = None) -> float:
-        """Wait for this caller's slot.
+        """Wait for this caller's slot, in the current lane. Returns seconds waited.
 
         own_hold: the end of a hold this caller set and has already slept through.
         It still waits for any longer hold another thread set since.
         """
+        if current_lane() == LANE_BACKGROUND:
+            return self._wait_background(honor_hold, own_hold)
         with self._lock:
             now = self.clock()
-            if not honor_hold:
-                start = now
-            elif own_hold is not None and self._hold_until <= own_hold:
-                start = now
-            else:
-                start = max(now, self._hold_until)
-            if self.interval:
-                start = max(start, self._next)
-                self._next = start + self.interval
-        delay = start - now
+            interval, budget_start, tolerance = self._plan(now, LANE_INTERACTIVE)
+            start = max(self._hold_start(now, honor_hold, own_hold), budget_start)
+            if interval:
+                start = max(start, self._next - tolerance)
+            self._take(now, start, interval)
+            delay = start - now
+            if delay > 0:
+                self._waiting[LANE_INTERACTIVE] += 1
         if delay > 0:
-            self.sleep(delay)
-        return delay
+            try:
+                self.sleep(delay)
+            finally:
+                with self._lock:
+                    self._waiting[LANE_INTERACTIVE] -= 1
+        return max(delay, 0.0)
+
+    def _wait_background(self, honor_hold: bool, own_hold: float | None) -> float:
+        """Background calls don't reserve future slots: they wait until a slot is
+        free now and no interactive call is waiting, then take it."""
+        waited = 0.0
+        with self._lock:
+            self._waiting[LANE_BACKGROUND] += 1
+        try:
+            for _ in range(10_000):
+                with self._lock:
+                    now = self.clock()
+                    interval, budget_start, _tol = self._plan(now, LANE_BACKGROUND)
+                    start = max(self._hold_start(now, honor_hold, own_hold), budget_start)
+                    if interval:
+                        start = max(start, self._next)
+                    if start <= now and self._waiting[LANE_INTERACTIVE] == 0:
+                        self._take(now, now, interval)
+                        return waited
+                    delay = start - now if start > now else max(self.floor, interval, 0.01)
+                self.sleep(delay)
+                waited += delay
+            # Safety valve (a frozen test clock): go anyway rather than spin forever.
+            with self._lock:
+                self._take(self.clock(), self.clock(), self.interval)
+            return waited
+        finally:
+            with self._lock:
+                self._waiting[LANE_BACKGROUND] -= 1
+
+    # ------------------------------------------------------------ reporting
+
+    def snapshot(self) -> dict:
+        """The pacer's current view, for /health."""
+        with self._lock:
+            now = self.clock()
+            fresh = self._fresh(now)
+            interval, _s, _t = self._plan(now, LANE_INTERACTIVE)
+            bg_interval, bg_start, _t = self._plan(now, LANE_BACKGROUND)
+            out = {
+                "source": "headers" if fresh else ("configured" if self.interval else "off"),
+                "limit": self._limit if fresh else None,
+                "remaining": self._remaining if fresh else None,
+                "reset_in": round(self._reset_at - now, 1) if fresh else None,
+                "interval": round(interval, 3),
+                "background_interval": round(bg_interval, 3),
+                "background_blocked_for": round(max(0.0, bg_start - now), 1),
+                "reserve_share": self.reserve_share,
+                "hold_in": round(max(0.0, self._hold_until - now), 1),
+                "waiting": dict(self._waiting),
+            }
+            if self._others:
+                out["other_resources"] = {k: dict(v) for k, v in self._others.items()}
+            return out
 
 
 def _check(r: httpx.Response) -> None:
@@ -130,15 +334,19 @@ class PlaneClient:
     def __init__(self, base_url: str, workspace: str, api_key: str,
                  transport: httpx.BaseTransport | None = None,
                  rate_limit: float = 0, max_retries: int = 3, sleep=time.sleep,
-                 clock=time.monotonic):
-        """rate_limit: requests per minute to stay under (0 = no pacing).
-        max_retries: how often a request answered 429 is retried before giving up."""
+                 clock=time.monotonic, wall=time.time, reserve_share: float = 0.3):
+        """rate_limit: requests per minute to stay under until Plane's own rate-limit
+        headers have been seen (0 = no pacing until then); after that the pace comes
+        from the headers.
+        max_retries: how often a request answered 429 is retried before giving up.
+        reserve_share: share of the learned budget kept for interactive (webhook) calls."""
         self.ws = workspace
         self.http = httpx.Client(
             base_url=f"{base_url}/api/v1/workspaces/{workspace}",
             headers={"X-API-Key": api_key, "Content-Type": "application/json"},
             timeout=20, transport=transport)
-        self.pacer = Pacer(rate_limit, clock=clock, sleep=sleep)
+        self.pacer = Pacer(rate_limit, clock=clock, sleep=sleep, wall=wall,
+                           reserve_share=reserve_share)
         self.max_retries = max_retries
         self.sleep = sleep
         self._projects: dict[str, tuple[float, dict]] = {}
@@ -162,6 +370,7 @@ class PlaneClient:
         for attempt in range(self.max_retries + 1):
             self.pacer.wait(own_hold=own_hold)
             r = self.http.request(method, path, **kwargs)
+            self.pacer.observe(r.headers)
             if r.status_code != 429:
                 return r
             if attempt == self.max_retries:
@@ -209,6 +418,7 @@ class PlaneClient:
         try:
             self.pacer.wait()
             r = self.http.request("GET", "/projects/", params={"per_page": 1})
+            self.pacer.observe(r.headers)
         except httpx.HTTPError as e:
             return (f"can't reach Plane's API ({type(e).__name__}); check PLANE_BASE_URL "
                     f"if this lasts", False)
@@ -345,7 +555,8 @@ def _github_rate_limited(r: httpx.Response) -> bool:
 
 class GitHubClient:
     def __init__(self, token: str, transport: httpx.BaseTransport | None = None,
-                 sleep=time.sleep):
+                 sleep=time.sleep, clock=time.monotonic, wall=time.time,
+                 reserve_share: float = 0.3):
         self.http = httpx.Client(
             base_url="https://api.github.com",
             headers={"Authorization": f"Bearer {token}",
@@ -353,20 +564,31 @@ class GitHubClient:
                      "X-GitHub-Api-Version": "2022-11-28"},
             timeout=20, transport=transport)
         self.sleep = sleep
+        # No configured pace: GitHub's x-ratelimit-* headers (core resource) set it.
+        self.pacer = Pacer(0, clock=clock, sleep=sleep, wall=wall, reserve_share=reserve_share)
+
+    def _send(self, method: str, path: str, own_hold: float | None = None, **kwargs) -> httpx.Response:
+        self.pacer.wait(own_hold=own_hold)
+        r = self.http.request(method, path, **kwargs)
+        self.pacer.observe(r.headers)
+        return r
 
     def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
-        """Send a request; on a rate limit, wait as GitHub says (capped) and retry once."""
-        r = self.http.request(method, path, **kwargs)
+        """Send a request, paced by GitHub's rate-limit headers; on a rate limit, wait
+        as GitHub says (capped) and retry once. Other threads wait out the same window."""
+        r = self._send(method, path, **kwargs)
         if _github_rate_limited(r):
             wait = server_wait(r)
             if wait > MAX_WAIT:     # e.g. the hourly primary limit: don't sleep, fail now
                 log.warning("GitHub rate limit: %s %s answered %s and asks for %.0fs; not waiting",
                             method, r.request.url.path, r.status_code, wait)
+                self.pacer.hold(MAX_WAIT)
                 return r
             log.warning("GitHub rate limit: %s %s answered %s; waiting %.0fs and retrying once",
                         method, r.request.url.path, r.status_code, wait)
+            own_hold = self.pacer.hold(wait)
             self.sleep(wait)
-            r = self.http.request(method, path, **kwargs)
+            r = self._send(method, path, own_hold=own_hold, **kwargs)
         return r
 
     def get_repo(self, repo: str) -> dict | None:
