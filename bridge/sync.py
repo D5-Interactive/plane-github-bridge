@@ -29,7 +29,10 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import defaultdict
+
+import httpx
 
 from .clients import GitHubClient, PlaneClient
 from .config import Settings
@@ -49,12 +52,47 @@ TARGETS = {
     "cancelled": (("cancelled", "canceled"), "cancelled"),
 }
 
+# An item GitHub refused for a lasting reason (repo gone, Issues disabled, no access)
+# is retried by the catch-up sync only after this long. Editing the item retries it
+# at once, through the webhook.
+PERMANENT_RETRY_SECONDS = 6 * 3600
+# Missing Plane links repaired per catch-up pass, so a backlog can't eat the rate limit.
+LINK_REPAIRS_PER_PASS = 10
+
+
+class _StopPass(Exception):
+    """A rate limit was hit: end this catch-up pass and let the next one resume."""
+
+
+def _failure_kind(e: Exception) -> str:
+    """"rate" (stop the pass), "permanent" (don't retry soon) or "transient" (retry next pass)."""
+    if isinstance(e, httpx.HTTPStatusError):
+        status, host = e.response.status_code, e.request.url.host
+        if status == 429:
+            return "rate"
+        if host.endswith("github.com"):
+            text = e.response.text.lower()
+            if status == 403 and "rate limit" in text:
+                return "rate"
+            if status in (403, 404, 410, 422):
+                return "permanent"
+    return "transient"
+
+
+def _short_reason(e: Exception) -> str:
+    """A log-safe reason: status and endpoint, never response bodies or item content."""
+    if isinstance(e, httpx.HTTPStatusError):
+        where = "GitHub" if e.request.url.host.endswith("github.com") else "Plane"
+        return f"{where} answered {e.response.status_code} for {e.request.method} {e.request.url.path}"
+    return type(e).__name__
+
 
 class Bridge:
     def __init__(self, settings: Settings, store: Store, plane: PlaneClient, github: GitHubClient):
         self.s, self.store, self.plane, self.gh = settings, store, plane, github
         self._locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
         self._locks_guard = threading.Lock()
+        self.clock = time.time
 
     def _lock(self, key: str) -> threading.Lock:
         with self._locks_guard:
@@ -202,36 +240,143 @@ class Bridge:
 
         Plane sends no webhook when an existing work item is added to a module, so
         without this, items dragged into a linked module would never reach GitHub.
-        """
-        created, skipped_projects = [], 0
-        for project in self.plane.projects():
-            pid = project["id"]
-            try:
-                modules = self.plane.modules(pid)
-            except Exception:
-                skipped_projects += 1  # usually: the token's user isn't a member of this project
-                continue
-            ident = project.get("identifier", "")
-            pinned = {m.module.strip().lower(): m.repo for m in self.s.mappings_for(ident)}
-            for mod in modules:
-                repo = pinned.get((mod.get("name") or "").strip().lower()) or self._described_repo(mod)
-                if not repo:
-                    continue
-                for item_id in self.plane.module_item_ids(pid, mod["id"]):
-                    if not item_id or self.store.by_plane_item(item_id):
-                        continue
-                    with self._lock(item_id):
-                        if self.store.by_plane_item(item_id):
-                            continue
-                        result = self._maybe_create_issue(pid, item_id)
-                    if result.startswith("created"):
-                        created.append(result.removeprefix("created "))
-        note = f"; skipped {skipped_projects} project(s) the token can't read" if skipped_projects else ""
-        return (f"created {', '.join(created)}" if created else "nothing new") + note
 
-    def _maybe_create_issue(self, project_id: str, item_id: str) -> str:
+        Each module's items are listed once per pass and an item's repo is taken from
+        that list, so the pass costs about one Plane call per linked module plus a few
+        per new item. One item failing doesn't stop the others; a rate limit (429)
+        ends the pass early and the next pass carries on.
+        """
+        created: list[str] = []
+        failed = repaired = skipped_projects = 0
+        stopped = ""
+        try:
+            repaired = self._repair_plane_links()
+            for project in self.plane.projects():
+                pid, ident = project["id"], project.get("identifier", "")
+                try:
+                    modules = self.plane.modules(pid)
+                except Exception as e:
+                    if _failure_kind(e) == "rate":
+                        raise _StopPass(_short_reason(e)) from None
+                    skipped_projects += 1  # usually: the token's user isn't a member of this project
+                    continue
+                linked = self._linked_modules(ident, modules)
+                if not linked:
+                    continue                # nothing linked here: no item listings at all
+                c, f = self._sync_project(pid, ident, linked)
+                created += c
+                failed += f
+        except _StopPass as e:
+            stopped = str(e)
+            log.warning("sync: stopped early, will resume next pass (%s)", stopped)
+
+        parts = []
+        if created:
+            parts.append(f"created {', '.join(created)}")
+        if repaired:
+            parts.append(f"repaired {repaired} Plane link(s)")
+        if failed:
+            parts.append(f"{failed} item(s) failed")
+        if stopped:
+            parts.append("stopped early: rate limited")
+        if not parts:
+            return "nothing new"    # quiet: the caller logs only when something happened
+        if skipped_projects:
+            parts.append(f"skipped {skipped_projects} project(s) the token can't read")
+        return "; ".join(parts)
+
+    def _linked_modules(self, ident: str, modules: list[dict]) -> list[tuple[dict, str, bool]]:
+        """(module, repo, pinned) for each linked module; config.yaml pins first, as in _repo_for."""
+        pinned = {m.module.strip().lower(): m.repo for m in self.s.mappings_for(ident)}
+        out = []
+        for mod in modules:
+            repo = pinned.get((mod.get("name") or "").strip().lower())
+            if repo:
+                out.append((mod, repo, True))
+        for mod in modules:
+            if (mod.get("name") or "").strip().lower() in pinned:
+                continue
+            repo = self._described_repo(mod)
+            if repo:
+                out.append((mod, repo, False))
+        # A repo outside GITHUB_ALLOWED_OWNERS never gets issues: don't list its items.
+        return [t for t in out if self.s.owner_allowed(t[1])]
+
+    def _sync_project(self, pid: str, ident: str, linked: list[tuple[dict, str, bool]]) -> tuple[list[str], int]:
+        # item id -> (module, repo, pinned): the first linked module listing it wins.
+        targets: dict[str, tuple[dict, str, bool]] = {}
+        for mod, repo, pinned in linked:
+            try:
+                ids = self.plane.module_item_ids(pid, mod["id"])
+            except Exception as e:
+                if _failure_kind(e) == "rate":
+                    raise _StopPass(_short_reason(e)) from None
+                log.warning("sync: couldn't list module %s in %s (%s)", mod.get("id"), ident, _short_reason(e))
+                continue
+            for item_id in ids:
+                if item_id and item_id not in targets:
+                    targets[item_id] = (mod, repo, pinned)
+
+        created, failed, tidied = [], 0, set()
+        now = self.clock()
+        for item_id, (mod, repo, pinned) in targets.items():
+            if self.store.by_plane_item(item_id):
+                continue
+            past = self.store.failure(item_id)
+            if past and now - past[1] < PERMANENT_RETRY_SECONDS:
+                continue
+            if not pinned and mod["id"] not in tidied:
+                tidied.add(mod["id"])
+                try:
+                    self.tidy_module_description(pid, mod)
+                except Exception as e:
+                    if _failure_kind(e) == "rate":
+                        raise _StopPass(_short_reason(e)) from None
+                    log.warning("sync: couldn't tidy module %s (%s)", mod.get("id"), _short_reason(e))
+            try:
+                with self._lock(item_id):
+                    if self.store.by_plane_item(item_id):
+                        continue
+                    result = self._maybe_create_issue(pid, item_id, repo=repo)
+            except Exception as e:
+                kind = _failure_kind(e)
+                if kind == "rate":
+                    raise _StopPass(_short_reason(e)) from None
+                failed += 1
+                reason = _short_reason(e)
+                if kind == "permanent":
+                    self.store.record_failure(item_id, reason, now)
+                    log.warning("sync: %s item %s not sent to %s (%s); retrying in %dh or when edited",
+                                ident, item_id, repo, reason, PERMANENT_RETRY_SECONDS // 3600)
+                else:
+                    log.warning("sync: %s item %s failed, retrying next pass (%s)", ident, item_id, reason)
+                continue
+            if result.startswith("created"):
+                created.append(result.removeprefix("created "))
+        return created, failed
+
+    def _repair_plane_links(self) -> int:
+        """Add issue links that never reached Plane (the pass died between the two calls)."""
+        repaired = 0
+        for link in self.store.missing_plane_links(LINK_REPAIRS_PER_PASS):
+            try:
+                self.plane.add_link(link.plane_project_id, link.plane_item_id, link.issue_url,
+                                    f"GitHub {link.repo}#{link.issue_number}")
+            except Exception as e:
+                if _failure_kind(e) == "rate":
+                    raise _StopPass(_short_reason(e)) from None
+                log.warning("sync: couldn't add the link for %s#%s yet (%s)",
+                            link.repo, link.issue_number, _short_reason(e))
+                continue
+            self.store.mark_plane_linked(link.plane_item_id)
+            repaired += 1
+        return repaired
+
+    def _maybe_create_issue(self, project_id: str, item_id: str, repo: str | None = None) -> str:
+        """Create the item's issue. repo: already known (catch-up sync), so skip the module lookup."""
         item = self.plane.work_item(project_id, item_id)
-        repo = self._repo_for(project_id, item)
+        if repo is None:
+            repo = self._repo_for(project_id, item)
         if not repo:
             return "kept in Plane: item isn't in a module linked to a repo"
         if not self.s.owner_allowed(repo):
@@ -241,9 +386,14 @@ class Bridge:
         ref, url = self._item_ref(project_id, item)
         body = issue_body(plane_html_to_markdown(item.get("description_html")), ref, url)
         issue = self.gh.create_issue(repo, item["name"], body)
-        self.store.save(Link(item_id, project_id, repo, issue["number"], issue["html_url"]))
-        self.plane.add_link(project_id, item_id, issue["html_url"], f"GitHub {repo}#{issue['number']}")
+        # Saved before the Plane link: if adding the link fails, the issue isn't made
+        # twice, and the catch-up sync adds the missing link later.
+        link = Link(item_id, project_id, repo, issue["number"], issue["html_url"], plane_linked=False)
+        self.store.save(link)
+        self.store.clear_failure(item_id)
         log.info("created %s#%s for %s", repo, issue["number"], ref)
+        self.plane.add_link(project_id, item_id, issue["html_url"], f"GitHub {repo}#{issue['number']}")
+        self.store.mark_plane_linked(item_id)
         return f"created {repo}#{issue['number']}"
 
     # ------------------------------------------------------------ GitHub -> Plane
