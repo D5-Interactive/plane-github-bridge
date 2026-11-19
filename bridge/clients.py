@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 import httpx
 
@@ -23,9 +24,12 @@ class PlaneClient:
             base_url=f"{base_url}/api/v1/workspaces/{workspace}",
             headers={"X-API-Key": api_key, "Content-Type": "application/json"},
             timeout=20, transport=transport)
-        self._projects: dict[str, dict] = {}
+        self._projects: dict[str, tuple[float, dict]] = {}
         self._states: dict[str, list[dict]] = {}
-        self._modules: dict[str, list[dict]] = {}
+        self._modules: dict[str, tuple[float, list[dict]]] = {}
+        # Module and project descriptions hold repo links people edit in Plane,
+        # so they're only cached briefly.
+        self.cache_seconds = 60.0
 
     def _get(self, path: str, **params):
         r = self.http.get(path, params=params or None)
@@ -45,9 +49,18 @@ class PlaneClient:
         return out
 
     def project(self, project_id: str) -> dict:
-        if project_id not in self._projects:
-            self._projects[project_id] = self._get(f"/projects/{project_id}/")
-        return self._projects[project_id]
+        hit = self._projects.get(project_id)
+        if not hit or time.monotonic() - hit[0] > self.cache_seconds:
+            hit = (time.monotonic(), self._get(f"/projects/{project_id}/"))
+            self._projects[project_id] = hit
+        return hit[1]
+
+    def modules(self, project_id: str) -> list[dict]:
+        hit = self._modules.get(project_id)
+        if not hit or time.monotonic() - hit[0] > self.cache_seconds:
+            hit = (time.monotonic(), self._paged(f"/projects/{project_id}/modules/"))
+            self._modules[project_id] = hit
+        return hit[1]
 
     def work_item(self, project_id: str, item_id: str) -> dict:
         return self._get(f"/projects/{project_id}/issues/{item_id}/")
@@ -58,9 +71,7 @@ class PlaneClient:
         return self._states[project_id]
 
     def module_id(self, project_id: str, module_name: str) -> str | None:
-        if project_id not in self._modules:
-            self._modules[project_id] = self._paged(f"/projects/{project_id}/modules/")
-        for m in self._modules[project_id]:
+        for m in self.modules(project_id):
             if m.get("name", "").strip().lower() == module_name.strip().lower():
                 return m["id"]
         # The module may have been created after we cached the list.

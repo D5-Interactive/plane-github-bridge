@@ -120,6 +120,21 @@ def branch_issue_number(branch: str | None) -> int | None:
     return int(m.group("num")) if m else None
 
 
+_GITHUB_REPO = re.compile(
+    r"https?://(?:www\.)?github\.com/(?P<owner>[A-Za-z0-9-]+)/(?P<repo>[A-Za-z0-9._-]+?)"
+    r"(?:\.git)?(?=[/?#\s\"'<)\],]|$)")
+
+
+def github_repo_in(*texts) -> str | None:
+    """The first github.com/owner/repo URL in any of the given texts, as 'owner/repo'."""
+    for t in texts:
+        if isinstance(t, str):
+            m = _GITHUB_REPO.search(t)
+            if m:
+                return f"{m.group('owner')}/{m.group('repo')}"
+    return None
+
+
 def esc(text) -> str:
     return _html.escape(str(text or ""), quote=True)
 

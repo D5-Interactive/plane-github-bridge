@@ -25,6 +25,13 @@ class Settings:
     github_webhook_secret: str
     db_path: str = "/data/bridge.db"
     mappings: list[Mapping] = field(default_factory=list)
+    # GitHub owners the bridge may create issues for. Empty = any the token can reach.
+    allowed_owners: list[str] = field(default_factory=list)
+
+    def owner_allowed(self, repo: str) -> bool:
+        if not self.allowed_owners:
+            return True
+        return repo.split("/", 1)[0].lower() in {o.lower() for o in self.allowed_owners}
 
     def mappings_for(self, project_identifier: str) -> list[Mapping]:
         p = project_identifier.upper()
@@ -44,8 +51,10 @@ def _need(name: str) -> str:
 
 def load_settings(config_path: str | None = None) -> Settings:
     config_path = config_path or os.environ.get("BRIDGE_CONFIG", "config.yaml")
-    with open(config_path) as f:
-        raw = yaml.safe_load(f) or {}
+    raw = {}
+    if os.path.isfile(config_path):          # config.yaml is optional
+        with open(config_path) as f:
+            raw = yaml.safe_load(f) or {}
 
     mappings = []
     for m in raw.get("mappings", []):
@@ -67,4 +76,5 @@ def load_settings(config_path: str | None = None) -> Settings:
         github_webhook_secret=_need("GITHUB_WEBHOOK_SECRET"),
         db_path=os.environ.get("BRIDGE_DB", "/data/bridge.db"),
         mappings=mappings,
+        allowed_owners=[o.strip() for o in os.environ.get("GITHUB_ALLOWED_OWNERS", "").split(",") if o.strip()],
     )

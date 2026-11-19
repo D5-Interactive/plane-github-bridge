@@ -36,19 +36,22 @@ class FakePlane:
         self.item = {"id": ITEM, "name": "Scan command", "sequence_id": 7, "state": "s-todo",
                      "description_html": DESC, "project": PROJ}
         self.module_members = {ITEM}
+        self.module_desc = ""
+        self.project_desc = ""
         self.links, self.patches, self.comments = [], [], []
 
     def handler(self, req: httpx.Request) -> httpx.Response:
         assert req.headers["X-API-Key"] == "plane-key"
         p = req.url.path.split("/workspaces/acme", 1)[1]
         if req.method == "GET" and p == f"/projects/{PROJ}/":
-            return httpx.Response(200, json={"id": PROJ, "identifier": "API"})
+            return httpx.Response(200, json={"id": PROJ, "identifier": "API", "description": self.project_desc})
         if req.method == "GET" and p == f"/projects/{PROJ}/issues/{ITEM}/":
             return httpx.Response(200, json=self.item)
         if req.method == "GET" and p == f"/projects/{PROJ}/states/":
             return httpx.Response(200, json={"results": STATES, "next_page_results": False})
         if req.method == "GET" and p == f"/projects/{PROJ}/modules/":
-            return httpx.Response(200, json={"results": [{"id": MOD, "name": "Auth"}]})
+            return httpx.Response(200, json={"results": [{"id": MOD, "name": "Auth",
+                                                          "description_html": self.module_desc}]})
         if req.method == "GET" and p == f"/projects/{PROJ}/modules/{MOD}/module-issues/":
             return httpx.Response(200, json={"results": [{"id": i} for i in self.module_members]})
         if req.method == "PATCH" and p == f"/projects/{PROJ}/issues/{ITEM}/":
@@ -160,15 +163,62 @@ def test_created_item_in_module_makes_issue_once(env):
 def test_item_added_to_module_later(env):
     bridge, fp, fg = env
     fp.module_members = set()
-    assert "not in a mapped module" in bridge.handle_plane(plane_event())
+    assert "aren't linked to a repo" in bridge.handle_plane(plane_event())
     fp.module_members = {ITEM}
     assert bridge.handle_plane(plane_event("workitem.updated", "e2")).startswith("created")
 
 
-def test_unmapped_project_ignored(env):
+def test_unlinked_project_ignored(env):
     bridge, fp, fg = env
     bridge.s.mappings = [Mapping(project="WEB", repo="acme/website")]
-    assert "no mapping" in bridge.handle_plane(plane_event())
+    assert "aren't linked to a repo" in bridge.handle_plane(plane_event())
+    assert not fg.created
+
+
+def test_github_repo_in():
+    from bridge.render import github_repo_in
+    assert github_repo_in('<p>Repo: <a href="https://github.com/acme/auth-service">x</a></p>') == "acme/auth-service"
+    assert github_repo_in("https://github.com/acme/my.repo.git") == "acme/my.repo"
+    assert github_repo_in("see https://github.com/acme/api/issues/3 for more") == "acme/api"
+    assert github_repo_in("https://github.com/acme") is None
+    assert github_repo_in(None, "", "gitlab.com/acme/x") is None
+
+
+def test_module_description_links_repo_without_config(env):
+    bridge, fp, fg = env
+    bridge.s.mappings = []
+    fp.module_desc = '<p>Code: <a href="https://github.com/acme/from-plane">github.com/acme/from-plane</a></p>'
+    assert bridge.handle_plane(plane_event()) == "created acme/from-plane#42"
+
+
+def test_module_link_only_applies_to_items_in_that_module(env):
+    bridge, fp, fg = env
+    bridge.s.mappings = []
+    fp.module_desc = "https://github.com/acme/from-plane"
+    fp.module_members = set()
+    assert "aren't linked" in bridge.handle_plane(plane_event())
+
+
+def test_project_description_is_the_fallback(env):
+    bridge, fp, fg = env
+    bridge.s.mappings = []
+    fp.module_members = set()
+    fp.project_desc = "All work for https://github.com/acme/monorepo"
+    assert bridge.handle_plane(plane_event()) == "created acme/monorepo#42"
+
+
+def test_config_mapping_wins_over_description(env):
+    bridge, fp, fg = env
+    fp.module_desc = "https://github.com/acme/from-plane"
+    assert bridge.handle_plane(plane_event()) == "created acme/auth-service#42"
+
+
+def test_allowed_owners_blocks_other_orgs(env):
+    bridge, fp, fg = env
+    bridge.s.mappings = []
+    bridge.s.allowed_owners = ["acme"]
+    fp.module_desc = "https://github.com/someone-else/repo"
+    assert "GITHUB_ALLOWED_OWNERS" in bridge.handle_plane(plane_event())
     assert not fg.created
 
 

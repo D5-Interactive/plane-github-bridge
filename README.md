@@ -17,6 +17,7 @@ A small, self-hosted webhook service that links [Plane](https://plane.so) Commun
 [How it works](#-how-it-works) ·
 [Installation](#-installation) ·
 [Setup](#-setup) ·
+[Linking repos](#-linking-plane-to-repos) ·
 [Team workflow](#-team-workflow) ·
 [Limits](#-limits) ·
 [Development](#-development)
@@ -133,23 +134,12 @@ cp config.example.yaml config.yaml
 chmod 600 .env
 ```
 
-You now have two files to fill in over the next steps:
+You fill in `.env` over the next steps. It holds the secrets: API tokens and
+webhook secrets. Never commit it.
 
-| File | What goes in it |
-|---|---|
-| `.env` | Secrets: API tokens and webhook secrets. Never commit it. |
-| `config.yaml` | Which Plane projects and modules sync to which repos |
-
-Open `config.yaml` (`nano config.yaml`) and map Plane projects and modules to repos:
-
-```yaml
-mappings:
-  - project: API             # Plane project identifier (the prefix in API-12)
-    module: Auth             # optional: only items in this module sync
-    repo: your-org/auth-service
-```
-
-A module mapping wins over a project-wide one.
+`config.yaml` can stay as it is. Repos are linked from inside Plane (see
+[Linking Plane to repos](#-linking-plane-to-repos)); the file is only an
+optional override for admins.
 
 ### 2. Plane API token
 
@@ -188,12 +178,16 @@ Fine-grained tokens**):
 | Setting | Value |
 |---|---|
 | Resource owner | `your-org` (not your username) |
-| Repository access | Only the repos in `config.yaml` |
+| Repository access | **All repositories**, or only the repos you'll link |
 | Permissions | **Issues → Read and write** (Metadata → Read is added automatically) |
 
 That one permission is enough. Commits, branches, PRs and reviews reach the
 bridge inside GitHub's webhook payloads (step 7), so the token never reads
 them. Keeping it to Issues means a leaked token can't touch your code.
+
+**All repositories** means linking a new repo is done entirely in Plane. With
+**Only select repositories**, each new repo also has to be added to the token
+before its issues can be created.
 
 > [!NOTE]
 > If `your-org` doesn't appear under Resource owner, an org owner has to allow
@@ -207,12 +201,17 @@ Then make up a secret for the GitHub webhook:
 openssl rand -hex 32
 ```
 
-Put both in `.env`:
+Put both in `.env`, along with your org name:
 
 ```bash
 GITHUB_TOKEN=github_pat_0123456789abcdef
 GITHUB_WEBHOOK_SECRET=<the output of openssl rand -hex 32>
+GITHUB_ALLOWED_OWNERS=your-org
 ```
+
+`GITHUB_ALLOWED_OWNERS` limits which GitHub owners anyone in Plane can link to.
+Separate several with commas; leave it empty to allow any repo the token can
+reach.
 
 Leave `PLANE_WEBHOOK_SECRET` empty for now; Plane gives you that one in step 6.
 Until then the bridge starts but turns away Plane webhooks.
@@ -234,10 +233,10 @@ curl http://127.0.0.1:8095/health
 You should see:
 
 ```json
-{"ok":true,"mappings":1,"plane_webhook_ready":false}
+{"ok":true,"mappings":0,"plane_webhook_ready":false}
 ```
 
-`mappings` is the number of mappings in `config.yaml`. `plane_webhook_ready`
+`mappings` counts admin overrides in `config.yaml`, so `0` is normal. `plane_webhook_ready`
 stays `false` until step 6. The log also warns that `PLANE_WEBHOOK_SECRET` is not
 set; that's expected for now.
 
@@ -370,7 +369,9 @@ under **Repo → Settings → Webhooks** instead.
 
 ### 8. Try it
 
-Create a work item in a mapped module. Within a few seconds a GitHub issue
+Link a module to a repo as described in
+[Linking Plane to repos](#-linking-plane-to-repos), then create a work item in
+that module. Within a few seconds a GitHub issue
 appears and its link shows on the work item.
 
 ```bash
@@ -381,9 +382,43 @@ docker compose logs -f bridge
 > If nothing happens, set `LOG_LEVEL=DEBUG` in `.env`, restart, and try again.
 > The log then shows each Plane payload exactly as received.
 
+## ◆ Linking Plane to repos
+
+Anyone who can edit a module in Plane can link it to a repo. No server access
+is needed.
+
+1. In Plane, open the project → **Modules** → the module (or create one).
+2. In the module's **description**, paste the repo's GitHub URL:
+
+   ```
+   https://github.com/your-org/auth-service
+   ```
+
+   Any text around it is fine, such as `Code lives at https://github.com/...`.
+
+3. That's it. New work items in that module get an issue in that repo. Existing
+   items get theirs the next time they're edited or moved into the module.
+
+To send **every** work item in a project to one repo, put the URL in the
+**project's** description instead (**Project settings → General**). A module
+link wins over the project link.
+
+| Where the URL is | Which work items sync |
+|---|---|
+| Module description | Items in that module |
+| Project description | Every item in the project that isn't in a linked module |
+| Neither | Nothing; the items stay Plane-only |
+
+Changes take effect within a minute. To unlink, remove the URL; issues that
+already exist stay linked.
+
+> [!NOTE]
+> Admins can also pin mappings in `config.yaml`, which take priority over
+> anything set in Plane. See the comments in `config.example.yaml`.
+
 ## ◆ Team workflow
 
-1. **Plan in Plane.** Create the task in the right module and write the
+1. **Plan in Plane.** Create the task in a linked module and write the
    acceptance criteria as a checklist; it becomes a checklist on the GitHub issue.
 2. **Branch from the issue.** On the GitHub issue: **Development → Create a
    branch**. GitHub names it like `12-scan-command`, which links the branch, its
@@ -394,8 +429,8 @@ docker compose logs -f bridge
 
 ## ◆ Limits
 
-- Only work items in mapped projects/modules sync. Adding an item to a mapped
-  module later also creates its issue.
+- Only work items in linked modules or projects sync. Moving an item into a
+  linked module later also creates its issue.
 - Deleting a work item doesn't delete or close its issue.
 - A PR only moves a work item if it says it closes the linked issue or its
   branch is named after it.
@@ -432,7 +467,7 @@ bridge/
 ├── clients.py   # Plane and GitHub REST clients
 ├── render.py    # HTML → Markdown, closing-reference parsing, signatures
 ├── store.py     # SQLite: item ↔ issue links, delivery de-duplication
-└── config.py    # environment settings + config.yaml mappings
+└── config.py    # environment settings + optional config.yaml overrides
 tests/           # pytest suite with fake Plane and GitHub APIs
 ```
 

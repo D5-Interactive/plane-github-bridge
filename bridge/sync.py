@@ -1,8 +1,12 @@
 """The sync rules. Plane owns the task; GitHub owns the code work.
 
 Plane -> GitHub
-  * A work item in a mapped project (and module, if the mapping names one)
-    gets a GitHub issue, once. The issue link is added to the work item.
+  * A work item in a linked module or project gets a GitHub issue, once. The issue
+    link is added to the work item. A module or project is linked to a repo by
+    putting the repo's github.com URL in its description in Plane (or, optionally,
+    by a mapping in config.yaml).
+    Order: config.yaml module, config.yaml project, module description,
+    project description.
   * Later edits to the item's title or description are copied to the issue.
 
 GitHub -> Plane: state
@@ -26,8 +30,8 @@ from collections import defaultdict
 
 from .clients import GitHubClient, PlaneClient
 from .config import Settings
-from .render import (branch_issue_number, closing_refs, esc, issue_body, mention_refs,
-                     normalize_plane_event, plane_html_to_markdown)
+from .render import (branch_issue_number, closing_refs, esc, github_repo_in, issue_body,
+                     mention_refs, normalize_plane_event, plane_html_to_markdown)
 from .store import Link, Store
 
 log = logging.getLogger("bridge")
@@ -95,26 +99,37 @@ class Bridge:
         ref = f"{ident}-{item['sequence_id']}"
         return ref, f"{self.s.plane_public_url}/{self.s.plane_workspace}/browse/{ref}/"
 
+    @staticmethod
+    def _described_repo(entity: dict) -> str | None:
+        return github_repo_in(entity.get("description_html"), entity.get("description"),
+                              entity.get("description_text"))
+
     def _repo_for(self, project_id: str, item: dict) -> str | None:
-        ident = self.plane.project(project_id)["identifier"]
-        mappings = self.s.mappings_for(ident)
-        # A module-specific mapping wins over a project-wide one.
+        project = self.plane.project(project_id)
+        mappings = self.s.mappings_for(project["identifier"])
+        # 1. config.yaml: a module mapping wins over a project-wide one.
         for m in (m for m in mappings if m.module):
             mid = self.plane.module_id(project_id, m.module)
             if mid and self.plane.item_in_module(project_id, mid, item):
                 return m.repo
         for m in (m for m in mappings if not m.module):
             return m.repo
-        return None
+        # 2. A github.com URL in the description of one of the item's modules.
+        for mod in self.plane.modules(project_id):
+            repo = self._described_repo(mod)
+            if repo and self.plane.item_in_module(project_id, mod["id"], item):
+                return repo
+        # 3. A github.com URL in the project's description.
+        return self._described_repo(project)
 
     def _maybe_create_issue(self, project_id: str, item_id: str) -> str:
-        ident = self.plane.project(project_id)["identifier"]
-        if not self.s.mappings_for(ident):
-            return f"ignored: project {ident} has no mapping"
         item = self.plane.work_item(project_id, item_id)
         repo = self._repo_for(project_id, item)
         if not repo:
-            return "ignored: item is not in a mapped module (yet)"
+            return "ignored: item's modules and project aren't linked to a repo"
+        if not self.s.owner_allowed(repo):
+            log.warning("refusing %s: owner not in GITHUB_ALLOWED_OWNERS", repo)
+            return f"ignored: {repo} is not in GITHUB_ALLOWED_OWNERS"
 
         ref, url = self._item_ref(project_id, item)
         body = issue_body(plane_html_to_markdown(item.get("description_html")), ref, url)
