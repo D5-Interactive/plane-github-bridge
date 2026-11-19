@@ -50,19 +50,27 @@ def state_groups(plane: PlaneClient, project_id: str) -> tuple[dict[str, str], i
     return {s["id"]: s.get("group", "") for s in states}, (0 if cached else 1)
 
 
-def repo_issues(gh: GitHubClient, repo: str) -> tuple[list[dict], int]:
-    """Every issue in a repo, open and closed, pull requests left out."""
+def repo_issues(gh: GitHubClient, repo: str, since: str | None = None,
+                max_pages: int = 50) -> tuple[list[dict], int, bool]:
+    """The repo's issues, open and closed, pull requests left out.
+
+    since: only issues updated at or after this ISO time (GitHub's `since`).
+    Returns (issues, calls, truncated): truncated is True when max_pages pages were
+    read and there may be more.
+    """
     calls, out = 0, []
-    for page in range(1, 51):
-        r = gh._request("GET", f"/repos/{repo}/issues",
-                        params={"state": "all", "per_page": 100, "page": page})
+    params: dict = {"state": "all", "per_page": 100}
+    if since:
+        params["since"] = since
+    for page in range(1, max_pages + 1):
+        r = gh._request("GET", f"/repos/{repo}/issues", params={**params, "page": page})
         calls += 1
         _check(r)
         batch = r.json()
         out.extend(i for i in batch if "pull_request" not in i)
         if len(batch) < 100:
-            break
-    return out, calls
+            return out, calls, False
+    return out, calls, True
 
 
 def issue(gh: GitHubClient, repo: str, number: int) -> tuple[dict | None, int]:
