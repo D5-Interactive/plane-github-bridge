@@ -289,21 +289,21 @@ without a separate org webhook. Pick one:
 | **B. Bring your own app** | Your org already has an app it wants the bridge to use |
 | **C. Personal access token** | You can't create or install apps |
 
-Whichever you choose, the app or token gets exactly these permissions and no
-more:
+Whichever you choose, the app or token asks for these permissions. Two of them
+are reserved for later and unused today:
 
 | Permission | Access | Used for |
 |---|---|---|
 | Issues | Read and write | Creating issues and keeping them in step with Plane |
 | Pull requests | Read and write | Reading PRs linked to work items |
-| Checks | Read and write | Reserved for check runs on linked commits and PRs (planned) |
-| Contents | Read | Reserved for the same check runs (planned) |
+| Checks | Read and write | Reserved for a planned feature; unused today |
+| Contents | Read | Reserved for the same planned feature; unused today |
 | Metadata | Read | Reading a repo's name and description (always granted) |
 
-Checks and Contents aren't used yet. They're requested now so that when check
-runs arrive, the app doesn't have to be re-approved by an org owner. If you'd
+Checks and Contents aren't used yet. They're requested now so that when the
+feature ships, the app doesn't have to be re-approved by an org owner. If you'd
 rather grant only what's used today, leave them off; you'll be asked to accept
-the new permissions when the feature ships.
+the new permissions then.
 
 And these webhook events: **Issues, Pull request, Pull request review, Push,
 Create** (branch or tag creation). The bridge never asks for Administration, so
@@ -322,7 +322,8 @@ it can't rename, delete or reconfigure a repo.
    ```
 
    The token changes every time the container starts and stops working once an
-   app exists. Treat the link like a password until then.
+   app exists. Treat the link as a secret until setup is complete: anyone who
+   has it can attach their own app to the bridge.
 
 2. Open the link. Check the organization (filled in from
    `GITHUB_ALLOWED_OWNERS` if set) and the app name, which must be unique on
@@ -441,8 +442,7 @@ if you'd rather they didn't show your name.
    | Permissions | **Issues → Read and write** (Metadata → Read is added automatically) |
 
    Issues is all a token needs: commits, branches, PRs and reviews reach the
-   bridge inside webhook payloads. Check runs on commits and PRs only work with
-   an app, since GitHub doesn't let tokens create them. With **Only select
+   bridge inside webhook payloads. With **Only select
    repositories**, each new repo also has to be added to the token before its
    issues can be created.
 
@@ -504,14 +504,31 @@ account the app isn't installed on, for a repo left out of a **Only select
 repositories** install (the call is retried with the token), for a public repo
 outside the install that the app can read but not write to (GitHub answers
 "Resource not accessible by integration"; the write is retried with the token),
-and while the app itself is failing (a wrong key, a skewed clock, GitHub errors;
-`/health` shows the reason as `github_problem`). After such a failure the bridge
-uses the token for about 45 seconds before trying the app again, so every call
-doesn't pay for the failure, and it retries a failed startup check in the
-background every few minutes. To move from a token to an app later, do option
-A, check that `github_app_missing_on` and `github_app_unknown_on` in `/health`
-are empty, then delete the org webhook. With an app made by `/setup`, both its secret and
+and while the app is failing (`/health` shows the reason, with GitHub's own
+message, as `github_problem`):
+
+- **The whole app** (a key that can't sign, GitHub errors or unreachable): the
+  bridge uses the token for about 45 seconds before calling GitHub as the app
+  again, so every call doesn't pay for the failure. Installation tokens it
+  already has keep working meanwhile.
+- **One account** (GitHub refuses the app there, for example "This installation
+  has been suspended"): only that account uses the token, for 5 minutes or
+  until an installation event for it arrives. Other accounts keep the app.
+
+The startup check of the app runs in the background, so GitHub being slow or
+down never delays startup, and a failed check is retried every few minutes.
+Without `GITHUB_TOKEN`, a request the app can't sign right now isn't sent at
+all; the catch-up sync tries the item again next pass instead of parking it.
+When an installation event arrives (the app installed, or repos added to it),
+items parked for that account's repos are tried again on the next pass.
+
+To move from a token to an app later, do option A, check that
+`github_app_missing_on` and `github_app_unknown_on` in `/health` are empty,
+then delete the org webhook. With an app made by `/setup`, both its secret and
 `GITHUB_WEBHOOK_SECRET` are accepted in the meantime, so nothing is missed.
+Once the org webhook is gone, remove `GITHUB_WEBHOOK_SECRET` from `.env` and
+recreate the container: as long as it's set, deliveries signed with it are
+still accepted.
 
 | Ping shows (any option) | Meaning |
 |---|---|
@@ -912,8 +929,8 @@ and recreate the container again, or the next restart re-checks everything.
 - Both webhooks need a valid HMAC signature. An unset `PLANE_WEBHOOK_SECRET`
   rejects every Plane webhook with `503` rather than accepting unsigned ones.
 - On GitHub the bridge has Issues, Pull requests and Checks (read and write)
-  and Contents and Metadata (read only); Checks and Contents are reserved for
-  planned check runs and unused today. It can't change code, and has no
+  and Contents and Metadata (read only); Checks and Contents are reserved for a
+  planned feature and unused today. It can't change code, and has no
   Administration access, so it can't rename, delete or reconfigure a repo. A
   personal access token needs only Issues.
 - GitHub App installation tokens are minted from the app's private key, cached
@@ -925,9 +942,13 @@ and recreate the container again, or the next restart re-checks everything.
   their own app to your bridge. It also refuses to run while
   `BRIDGE_PUBLIC_URL` is still the `example.com` placeholder.
 - The setup token is in the link's query string, so it can appear in your
-  proxy or tunnel's access logs. It changes on every restart and stops working
-  once an app exists. The one-time code GitHub sends back is kept out of the
-  bridge's own request log unless `LOG_LEVEL=DEBUG`.
+  proxy or tunnel's access logs: treat the link as a secret until setup is
+  complete. It changes on every restart and stops working once an app exists.
+  The bridge keeps `/setup` query strings (the token and the one-time code
+  GitHub sends back) out of its access log, and out of its request log unless
+  `LOG_LEVEL=DEBUG`. The setup
+  pages tell browsers not to send their address to other sites
+  (`Referrer-Policy: no-referrer`).
 - `GITHUB_ALLOWED_OWNERS` stops anyone in Plane from pointing a module at a repo
   outside your org.
 - The container runs as an unprivileged user.
@@ -967,6 +988,10 @@ and recreate the container again, or the next restart re-checks everything.
 | `GitHub App isn't installed on owner` | Install the app on that account; until then the bridge uses `GITHUB_TOKEN` there if set. Checked again every 10 minutes |
 | `GitHub App is not installed on: owner, ...` | Startup check of `GITHUB_ALLOWED_OWNERS`; `/health` shows the live state as `github_app_missing_on` (and `github_app_unknown_on` for accounts it couldn't check) |
 | `GITHUB APP PROBLEM: the app's private key can't be used to sign requests` | The saved or configured key is damaged; calls use `GITHUB_TOKEN` meanwhile. Replace the key |
+| `GITHUB APP PROBLEM: GitHub answered 403 ("This installation has been suspended") ...` | GitHub refuses the app on that account; only that account falls back to `GITHUB_TOKEN`. Unsuspend or reinstall the app there |
+| `GITHUB APP PROBLEM: ... isn't JSON ...` | Something between the bridge and GitHub (a proxy) answered instead of GitHub |
+| `sync: ... failed, retrying next pass (NoGitHubCredentials)` | No app token for that repo right now and no `GITHUB_TOKEN` to fall back to; nothing was sent. See `github_problem` in `/health` |
+| `sync: GitHub App installation changed on owner; cleared N parked item(s)` | Items parked for that account's repos are tried again next pass |
 | `GITHUB APP PROBLEM: ...` (any other reason) | The app can't be used right now; calls fall back to `GITHUB_TOKEN` if set. Shown live in `/health` as `github_problem` |
 | `GitHub App working again` | The problem above cleared itself |
 | `GitHub returned no webhook secret for the new app` | Copy the app's webhook secret into `GITHUB_WEBHOOK_SECRET` and recreate the container |
@@ -1007,7 +1032,8 @@ bridge keeps itself under the limit and recovers when it hits it anyway:
   but a webhook's edit or state change isn't replayed (edit the item again).
 
 **At startup** the bridge checks Plane once, with no retries, so a
-rate-limited Plane can't hold up startup. A 429, a 5xx or an unreachable Plane
+rate-limited Plane can't hold up startup. The GitHub App check runs in the
+background and doesn't hold it up at all. A 429, a 5xx or an unreachable Plane
 is logged as a warning and shown as temporary in `/health`, and the catch-up
 sync starts anyway; a wrong key or workspace slug keeps it off.
 
