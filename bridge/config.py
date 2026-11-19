@@ -31,6 +31,12 @@ class Settings:
     # webhook when an existing work item is added to a module, so this is how
     # those items reach GitHub.
     sync_interval: int = 120
+    # One-off: on startup, re-check that every issue link is on its Plane item
+    # (BRIDGE_RECHECK_LINKS=1). Remove the setting again afterwards.
+    recheck_links: bool = False
+    # Requests per minute the bridge allows itself against Plane's API (0 = no
+    # pacing). Plane limits each API key per minute and answers 429 above it.
+    plane_rate_limit: float = 50
 
     def owner_allowed(self, repo: str) -> bool:
         if not self.allowed_owners:
@@ -82,4 +88,6 @@ def load_settings(config_path: str | None = None) -> Settings:
         mappings=mappings,
         allowed_owners=[o.strip() for o in os.environ.get("GITHUB_ALLOWED_OWNERS", "").split(",") if o.strip()],
         sync_interval=int(os.environ.get("BRIDGE_SYNC_INTERVAL", "120") or 0),
+        recheck_links=os.environ.get("BRIDGE_RECHECK_LINKS", "").strip().lower() in ("1", "true", "yes"),
+        plane_rate_limit=float(os.environ.get("PLANE_RATE_LIMIT", "50") or 0),
     )
