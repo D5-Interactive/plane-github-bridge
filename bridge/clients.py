@@ -9,6 +9,15 @@ import httpx
 log = logging.getLogger("bridge")
 
 
+def _check(r: httpx.Response) -> None:
+    """raise_for_status, but put the server's own error message in the exception and the log."""
+    if r.is_error:
+        detail = r.text.strip().replace("\n", " ")[:500]
+        log.error("%s %s -> %s: %s", r.request.method, r.request.url, r.status_code, detail or "(no body)")
+        raise httpx.HTTPStatusError(f"{r.status_code} from {r.request.method} {r.request.url.path}: {detail}",
+                                    request=r.request, response=r)
+
+
 def _results(data):
     """Plane list endpoints return either a list or {"results": [...]}."""
     if isinstance(data, list):
@@ -36,7 +45,7 @@ class PlaneClient:
 
     def _get(self, path: str, **params):
         r = self.http.get(path, params=params or None)
-        r.raise_for_status()
+        _check(r)
         return r.json()
 
     def _paged(self, path: str) -> list[dict]:
@@ -101,35 +110,35 @@ class PlaneClient:
             self.module_links_supported = False
             log.info("this Plane's API has no module links endpoint; skipping module links")
             return "unsupported"
-        r.raise_for_status()
+        _check(r)
         self.module_links_supported = True
         wanted = url.rstrip("/").lower()
         if any((l.get("url") or "").rstrip("/").lower() == wanted for l in _results(r.json())):
             return "exists"
         r = self.http.post(path, json={"url": url, "title": title})
-        r.raise_for_status()
+        _check(r)
         return "added"
 
     def update_module(self, project_id: str, module_id: str, **fields) -> None:
         r = self.http.patch(f"/projects/{project_id}/modules/{module_id}/", json=fields)
-        r.raise_for_status()
+        _check(r)
         self._modules.pop(project_id, None)
 
     def set_state(self, project_id: str, item_id: str, state_id: str) -> None:
         r = self.http.patch(f"/projects/{project_id}/issues/{item_id}/", json={"state": state_id})
-        r.raise_for_status()
+        _check(r)
 
     def add_comment(self, project_id: str, item_id: str, html: str) -> None:
         r = self.http.post(f"/projects/{project_id}/issues/{item_id}/comments/",
                            json={"comment_html": html})
-        r.raise_for_status()
+        _check(r)
 
     def add_link(self, project_id: str, item_id: str, url: str, title: str) -> None:
         r = self.http.post(f"/projects/{project_id}/issues/{item_id}/links/",
                            json={"url": url, "title": title})
         if r.status_code == 400 and "already" in r.text.lower():
             return  # Plane rejects duplicate URLs; that's fine
-        r.raise_for_status()
+        _check(r)
 
 
 class GitHubClient:
@@ -146,14 +155,14 @@ class GitHubClient:
         r = self.http.get(f"/repos/{repo}")
         if r.status_code in (403, 404):
             return None
-        r.raise_for_status()
+        _check(r)
         return r.json()
 
     def create_issue(self, repo: str, title: str, body: str) -> dict:
         r = self.http.post(f"/repos/{repo}/issues", json={"title": title, "body": body})
-        r.raise_for_status()
+        _check(r)
         return r.json()
 
     def update_issue(self, repo: str, number: int, **fields) -> None:
         r = self.http.patch(f"/repos/{repo}/issues/{number}", json=fields)
-        r.raise_for_status()
+        _check(r)
