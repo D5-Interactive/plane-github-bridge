@@ -22,6 +22,7 @@ class Store:
         self._db = sqlite3.connect(path, check_same_thread=False)
         self._db.executescript(
             """
+            DROP TABLE IF EXISTS own_writes;   -- never shipped; replaced by bridge_writes
             CREATE TABLE IF NOT EXISTS links (
                 plane_item_id    TEXT PRIMARY KEY,
                 plane_project_id TEXT NOT NULL,
@@ -145,6 +146,15 @@ class Store:
             self._db.commit()
             return cur.rowcount
 
+    def clear_failures_for_owner(self, owner: str) -> int:
+        """Forget parked items for one GitHub account's repos (after an installation change)."""
+        prefix = owner.lower() + "/"
+        with self._lock:
+            cur = self._db.execute("DELETE FROM sync_failures WHERE lower(substr(repo, 1, ?)) = ?",
+                                   (len(prefix), prefix))
+            self._db.commit()
+            return cur.rowcount
+
     def clear_failure(self, item_id: str) -> None:
         with self._lock:
             self._db.execute("DELETE FROM sync_failures WHERE plane_item_id = ?", (item_id,))
@@ -159,6 +169,96 @@ class Store:
                 "INSERT OR IGNORE INTO seen_events (event_id) VALUES (?)", (event_id,))
             self._db.commit()
             return cur.rowcount == 1
+
+    def event_seen(self, event_id: str) -> bool:
+        """True if this webhook event was already handled. Reads only."""
+        if not event_id:
+            return False
+        with self._lock:
+            return self._db.execute("SELECT 1 FROM seen_events WHERE event_id = ?",
+                                    (event_id,)).fetchone() is not None
+
+    def mark_seen(self, event_id: str) -> None:
+        """Record a webhook event as handled (after its actions succeeded or were queued)."""
+        if event_id:
+            with self._lock:
+                self._db.execute("INSERT OR IGNORE INTO seen_events (event_id) VALUES (?)", (event_id,))
+                self._db.commit()
+
+    # -------- the bridge's own writes (to ignore the webhook each one causes)
+
+    def _writes_table(self) -> None:
+        self._db.execute("CREATE TABLE IF NOT EXISTS bridge_writes (plane_item_id TEXT NOT NULL, "
+                         "field TEXT NOT NULL, value TEXT NOT NULL, at REAL NOT NULL, "
+                         "PRIMARY KEY (plane_item_id, field))")
+
+    def record_own_write(self, item_id: str, field: str, value, at: float) -> None:
+        """Remember the bridge's latest write of `field` on the item or its issue."""
+        with self._lock:
+            self._writes_table()
+            self._db.execute("INSERT OR REPLACE INTO bridge_writes VALUES (?, ?, ?, ?)",
+                             (item_id, field, str(value), at))
+            self._db.execute("DELETE FROM bridge_writes WHERE at < ?", (at - 3600,))
+            self._db.commit()
+
+    def take_echo(self, item_id: str, field: str, value, since: float, snapshot_holds: bool) -> bool:
+        """Is this webhook the echo of the bridge's last write of `field`?
+
+        Yes only if `value` equals that write (made at or after `since`) and the
+        snapshot still holds it. A write matches one echo at most: it's forgotten
+        either way, so any later change to the field, even back to the same value,
+        counts as a real change.
+        """
+        with self._lock:
+            self._writes_table()
+            row = self._db.execute(
+                "SELECT value, at FROM bridge_writes WHERE plane_item_id = ? AND field = ?",
+                (item_id, field)).fetchone()
+            if row is None:
+                return False
+            self._db.execute("DELETE FROM bridge_writes WHERE plane_item_id = ? AND field = ?",
+                             (item_id, field))
+            self._db.commit()
+        return row[0] == str(value) and row[1] >= since and snapshot_holds
+
+    # -------- the other side is about to catch up (e.g. GitHub closing on "Closes #N")
+
+    def _expect_table(self) -> None:
+        self._db.execute("CREATE TABLE IF NOT EXISTS expected_catch_up (plane_item_id TEXT PRIMARY KEY, "
+                         "until REAL NOT NULL)")
+
+    def expect_catch_up(self, item_id: str, until: float) -> None:
+        with self._lock:
+            self._expect_table()
+            self._db.execute("INSERT OR REPLACE INTO expected_catch_up VALUES (?, ?)", (item_id, until))
+            self._db.commit()
+
+    def catch_up_expected(self, item_id: str, now: float) -> bool:
+        with self._lock:
+            self._expect_table()
+            row = self._db.execute("SELECT until FROM expected_catch_up WHERE plane_item_id = ?",
+                                   (item_id,)).fetchone()
+        return row is not None and row[0] >= now
+
+    def prune_catch_up(self, now: float) -> int:
+        """Forget expectations whose time has passed. Returns how many."""
+        with self._lock:
+            self._expect_table()
+            cur = self._db.execute("DELETE FROM expected_catch_up WHERE until < ?", (now,))
+            self._db.commit()
+            return cur.rowcount
+
+    def clear_catch_up(self, item_id: str) -> None:
+        with self._lock:
+            self._expect_table()
+            self._db.execute("DELETE FROM expected_catch_up WHERE plane_item_id = ?", (item_id,))
+            self._db.commit()
+
+    def pr_link_known(self, item_id: str, pr_url: str) -> bool:
+        """True if this PR link was already added to the item. Reads only."""
+        with self._lock:
+            return self._db.execute("SELECT 1 FROM pr_links WHERE plane_item_id = ? AND pr_url = ?",
+                                    (item_id, pr_url)).fetchone() is not None
 
     def post_is_new(self, item_id: str, key: str) -> bool:
         """True the first time (item, key) is seen; used so GitHub activity is posted to Plane once."""
