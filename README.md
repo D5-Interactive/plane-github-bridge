@@ -724,7 +724,7 @@ Set in `.env`. Only the first block in `.env.example` is required.
 | Setting | Default | What it does |
 |---|---|---|
 | `BRIDGE_MEMBERSHIP_INTERVAL` | `120` | Seconds between membership passes; `0` turns the membership pass off (the retry queue and checks keep running). `BRIDGE_SYNC_INTERVAL` is still read if this isn't set |
-| `BRIDGE_RECONCILE` | `1` | `0` turns off checks of edited modules and repos and the org scan. The retry queue always runs |
+| `BRIDGE_RECONCILE` | `1` | `0` turns off checks of edited modules and repos and the org scan. The retry queue, and the delayed look after a `Closes #N` merge, always run |
 | `BRIDGE_FIRST_CONTACT_FIX` | `0` | `1`: on a pair's first check, fix open/closed differences where both change times are known, instead of only flagging them (see [How syncing works](#how-syncing-works)) |
 | `BRIDGE_QUEUE_MAX_AGE` | `300` | Seconds a queued action may keep failing before it's flagged `stuck` |
 | `BRIDGE_RECONCILE_DELAY` | `30` | Seconds of quiet after the last module or repo edit before its check runs |
@@ -864,8 +864,8 @@ When a PR that says `Closes #12` merges into the default branch, the work item
 moves to Done straight away and GitHub closes the issue a moment later. The
 bridge expects that and doesn't flag the gap; `BRIDGE_RECONCILE_DELAY` seconds
 later it looks again, and only if the issue is still open then is the pair
-flagged `state_differs`. (With `BRIDGE_RECONCILE=0` that second look doesn't
-run; the gap is flagged the next time the pair is synced.)
+flagged `state_differs`. That second look runs even with `BRIDGE_RECONCILE=0`
+(which turns off only module and repo checks and the org scan).
 
 **Work merged into another branch first.** A PR merged into `develop` (or any
 non-default branch) moves its items to In Review. When that work later reaches

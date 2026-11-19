@@ -459,3 +459,51 @@ def test_fork_pr_merged_into_default_is_flagged_not_silent(env):
     assert world.items["item-1"]["state"] == "st-done" and world.issues[1]["state"] == "open"
     (problem,) = bridge.diag.open_problems(kind="state_differs")
     assert problem.plane_item_id == "item-1" and "plane-sync-problem" in world.issues[1]["labels"]
+
+
+def test_reconcile_off_still_flags_a_keyword_merge_github_never_closes(env, monkeypatch):
+    """BRIDGE_RECONCILE=0: the item check still runs from the checks thread."""
+    import time as _time
+
+    import bridge.app as app_module
+    from fastapi.testclient import TestClient
+    bridge, world, clock = env
+    bridge.s.reconcile = False
+    _linked(bridge, world)
+    bridge.handle_github("pull_request", merged_pr(branch="feature-x", body="Closes #1"), "p1")
+    assert bridge.diag.open_problems(kind="state_differs") == []
+    clock.t += bridge.debounce.delay + 1                # GitHub never closed it
+    monkeypatch.setattr(app_module, "CHECK_TICK", 0.02)
+    with TestClient(app_module.build_app(bridge)):
+        deadline = _time.monotonic() + 5
+        while _time.monotonic() < deadline and not bridge.diag.open_problems(kind="state_differs"):
+            _time.sleep(0.02)
+    (problem,) = bridge.diag.open_problems(kind="state_differs")
+    assert problem.plane_item_id == "item-1"
+
+
+def test_item_checks_run_without_pair_checks(env):
+    bridge, world, clock = env
+    bridge.debounce.clock = clock
+    _linked(bridge, world)
+    bridge.handle_github("pull_request", merged_pr(branch="feature-x", body="Closes #1"), "p1")
+    bridge.debounce.touch(f"module:{PROJ}:mod-1")
+    clock.t += bridge.debounce.delay + 1
+    assert bridge.run_reconciles(pairs=False) == []     # the module check is dropped, not run
+    assert bridge.debounce.pending() == 0
+    assert bridge.diag.open_problems(kind="state_differs")
+
+
+def test_expired_catch_up_rows_are_pruned(env):
+    bridge, world, clock = env
+    bridge.store.expect_catch_up("old", clock.t - 1)
+    bridge.store.expect_catch_up("fresh", clock.t + 100)
+    assert bridge.store.prune_catch_up(clock.t) == 1
+    with bridge.store._lock:
+        left = [r[0] for r in bridge.store._db.execute("SELECT plane_item_id FROM expected_catch_up")]
+    assert left == ["fresh"]
+    # the delayed check prunes too
+    bridge.store.expect_catch_up("old", clock.t - 1)
+    bridge._check_caught_up("fresh")
+    with bridge.store._lock:
+        assert bridge.store._db.execute("SELECT COUNT(*) FROM expected_catch_up").fetchone()[0] == 0

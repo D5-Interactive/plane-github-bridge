@@ -1072,10 +1072,14 @@ class Bridge:
                      len(report.fixed), len(report.conflicts))
         return report
 
-    def run_reconciles(self) -> list[str]:
-        """Check the modules and repos that were edited (once the burst of edits is over)."""
+    def run_reconciles(self, pairs: bool = True) -> list[str]:
+        """Check the modules and repos that were edited (once the burst of edits is over),
+        and items whose other side was expected to catch up. pairs=False
+        (BRIDGE_RECONCILE=0): only the item checks run; module and repo keys are dropped."""
         done = []
         keys = self.debounce.due()
+        if not pairs:
+            keys = [k for k in keys if k.startswith("item:")]
         for i, key in enumerate(keys):
             try:
                 with lane(LANE_BACKGROUND):
@@ -1093,16 +1097,18 @@ class Bridge:
     def _check_caught_up(self, item_id: str) -> None:
         """The delay after an expected catch-up has passed: record the pair as it is
         now, which flags state_differs if the other side still hasn't followed."""
-        self.store.clear_catch_up(item_id)
-        link = self.store.by_plane_item(item_id)
-        if not link:
-            return
-        item = self.plane.work_item(link.plane_project_id, item_id)
-        issue, _ = listing.issue(self.gh, link.repo, link.issue_number)
-        if issue is None:
-            return
-        p = plane_side(item, self._groups(link.plane_project_id))
-        self._record_pair(link, p.title, p.closed, issue.get("title", ""), issue.get("state") == "closed")
+        self.store.prune_catch_up(self.clock())
+        with self._lock(item_id):
+            self.store.clear_catch_up(item_id)
+            link = self.store.by_plane_item(item_id)
+            if not link:
+                return
+            item = self.plane.work_item(link.plane_project_id, item_id)
+            issue, _ = listing.issue(self.gh, link.repo, link.issue_number)
+            if issue is None:
+                return
+            p = plane_side(item, self._groups(link.plane_project_id))
+            self._record_pair(link, p.title, p.closed, issue.get("title", ""), issue.get("state") == "closed")
 
     def _reconcile_key(self, key: str) -> list[str]:
         out = []

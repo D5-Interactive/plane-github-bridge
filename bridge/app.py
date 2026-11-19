@@ -72,8 +72,9 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
         last_reflag = 0.0
         while not stop.wait(CHECK_TICK):
             try:
-                if settings.reconcile:
-                    bridge.run_reconciles()
+                # Item checks (an expected catch-up that may not have happened) always
+                # run; module and repo checks only with BRIDGE_RECONCILE on.
+                bridge.run_reconciles(pairs=settings.reconcile)
                 if settings.reconcile and settings.org_scan and bridge.scheduler.due():
                     if bridge.scheduler.defer():
                         log.info("org scan postponed 15 minutes: the host is busy")
@@ -82,6 +83,7 @@ def build_app(bridge: Bridge | None = None) -> FastAPI:
                 if time.monotonic() - last_reflag >= REFLAG_EVERY:
                     last_reflag = time.monotonic()
                     bridge.diag.reflag_pending()
+                    bridge.store.prune_catch_up(bridge.clock())
             except Exception:
                 log.exception("checks failed")
 

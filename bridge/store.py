@@ -231,6 +231,14 @@ class Store:
                                    (item_id,)).fetchone()
         return row is not None and row[0] >= now
 
+    def prune_catch_up(self, now: float) -> int:
+        """Forget expectations whose time has passed. Returns how many."""
+        with self._lock:
+            self._expect_table()
+            cur = self._db.execute("DELETE FROM expected_catch_up WHERE until < ?", (now,))
+            self._db.commit()
+            return cur.rowcount
+
     def clear_catch_up(self, item_id: str) -> None:
         with self._lock:
             self._expect_table()
