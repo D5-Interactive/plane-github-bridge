@@ -272,10 +272,10 @@ def test_title_and_description_edits_pushed(env):
     assert fg.updated[-1][2]["title"] == "Scan command v2"
 
 
-def gh_pr(action, number=5, body="Closes #42", draft=False, merged=False, state="open"):
-    return {"action": action, "repository": {"full_name": "acme/auth-service"},
+def gh_pr(action, number=5, body="Closes #42", draft=False, merged=False, state="open", base="main"):
+    return {"action": action, "repository": {"full_name": "acme/auth-service", "default_branch": "main"},
             "pull_request": {"number": number, "title": "Add scan", "body": body, "draft": draft,
-                             "merged": merged, "state": state,
+                             "merged": merged, "state": state, "base": {"ref": base},
                              "html_url": f"https://github.com/acme/auth-service/pull/{number}"}}
 
 

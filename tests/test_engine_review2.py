@@ -308,3 +308,32 @@ def test_merge_comment_accepted_but_answer_lost_isnt_posted_twice(env):
     assert len(world.gh_comments[1]) == 1
     run_queue_after(bridge, clock, 6)
     assert len(world.gh_comments[1]) == 1 and bridge.queue.stats()["length"] == 0
+
+
+def test_closing_keyword_pr_merged_into_a_non_default_branch_moves_to_in_review(env):
+    """Same rule for issues linked only by "Closes #1": GitHub leaves them open on a
+    non-default merge, and so does the bridge; the item goes to In Review."""
+    bridge, world, clock = env
+    _linked(bridge, world)
+    r = bridge.handle_github("pull_request", merged_pr(branch="feature-x", body="Closes #1", base="develop"), "p1")
+    assert r.endswith("moved to review") and world.items["item-1"]["state"] == "st-review"
+    assert world.issues[1]["state"] == "open" and 1 not in world.gh_comments
+    bridge.run_org_scan()
+    assert world.items["item-1"]["state"] == "st-review" and bridge.diag.counts()["open"] == 0
+
+
+def test_closing_keyword_pr_without_default_branch_fails_closed(env):
+    bridge, world, clock = env
+    _linked(bridge, world)
+    event = merged_pr(branch="feature-x", body="Closes #1")
+    del event["repository"]["default_branch"]
+    bridge.handle_github("pull_request", event, "p1")
+    assert world.items["item-1"]["state"] == "st-review"
+
+
+def test_closing_keyword_pr_merged_into_the_default_branch_still_moves_to_done(env):
+    bridge, world, clock = env
+    _linked(bridge, world)
+    bridge.handle_github("pull_request", merged_pr(branch="feature-x", body="Closes #1"), "p1")
+    assert world.items["item-1"]["state"] == "st-done"
+    assert world.issues[1]["state"] == "open" and 1 not in world.gh_comments   # GitHub closes it itself

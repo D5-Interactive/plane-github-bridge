@@ -869,13 +869,6 @@ class Bridge:
         default = (p.get("repository") or {}).get("default_branch")
         return bool(default) and ((p.get("pull_request") or {}).get("base") or {}).get("ref") == default
 
-    def _branch_merged_elsewhere(self, repo: str, p: dict, link: Link, branch_num: int | None) -> bool:
-        """A PR from this issue's own branch, merged, but not into the default branch."""
-        pr = p.get("pull_request") or {}
-        return (p.get("action") == "closed" and bool(pr.get("merged")) and branch_num is not None
-                and link.repo.lower() == repo.lower() and link.issue_number == branch_num
-                and not self._merged_into_default(p))
-
     def _close_after_merge(self, link: Link, issue: dict, pr_number: int) -> str:
         """A PR from the issue's own branch merged and the item is Done: close the
         issue as completed and say why on it, once (GitHub tells its subscribers)."""
@@ -1383,9 +1376,10 @@ class Bridge:
             extra, link_target = {}, target
             if self._closes_on_merge(repo, p, link, branch_num):
                 extra["close_on_merge"] = int(pr["number"])
-            elif self._branch_merged_elsewhere(repo, p, link, branch_num):
-                # Merged into another branch (develop, a release branch): the work
-                # isn't on the default branch yet, so In Review, and the issue stays open.
+            elif action == "closed" and pr.get("merged") and not self._merged_into_default(p):
+                # Merged into another branch (develop, a release branch): the work isn't
+                # on the default branch yet, so In Review, and the issue stays open, as
+                # GitHub leaves it (it only closes issues on default-branch merges).
                 link_target = "review"
             results.append(self._sync_item(link, {"target": link_target, **extra}))
         return "; ".join(results)

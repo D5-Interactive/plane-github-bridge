@@ -845,8 +845,8 @@ Activity on any other issue is ignored.
 |---|---|
 | PR opened as a draft, converted to draft, or closed without merging | In Progress |
 | PR opened (not draft), marked ready, reopened, edited, or new commits pushed to it | In Review |
-| PR merged (except the case below) | Done (and see below for the issue) |
-| PR from the issue's branch merged into another branch | In Review |
+| PR merged into the default branch | Done (and see below for the issue) |
+| PR merged into any other branch (`develop`, a release branch) | In Review; the issue stays open, as GitHub leaves it. If GitHub's event doesn't say which branch is the default, the bridge assumes it isn't |
 | Issue closed as completed | Done |
 | Issue closed as not planned | Cancelled |
 | Issue reopened | Todo |
