@@ -857,11 +857,24 @@ class Bridge:
         head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name") or ""
         if head_repo.lower() != repo.lower():
             return False
-        default = (p.get("repository") or {}).get("default_branch")
-        if not default or (pr.get("base") or {}).get("ref") != default:
+        if not self._merged_into_default(p):
             return False
         refs = closing_refs(f"{pr.get('title', '')}\n{pr.get('body') or ''}", repo)
         return (repo.lower(), branch_num) not in {(r.lower(), n) for r, n in refs}
+
+    @staticmethod
+    def _merged_into_default(p: dict) -> bool:
+        """True only if the PR merged into the repo's default branch. A payload without
+        default_branch counts as not (fail closed: In Review, issue left open)."""
+        default = (p.get("repository") or {}).get("default_branch")
+        return bool(default) and ((p.get("pull_request") or {}).get("base") or {}).get("ref") == default
+
+    def _branch_merged_elsewhere(self, repo: str, p: dict, link: Link, branch_num: int | None) -> bool:
+        """A PR from this issue's own branch, merged, but not into the default branch."""
+        pr = p.get("pull_request") or {}
+        return (p.get("action") == "closed" and bool(pr.get("merged")) and branch_num is not None
+                and link.repo.lower() == repo.lower() and link.issue_number == branch_num
+                and not self._merged_into_default(p))
 
     def _close_after_merge(self, link: Link, issue: dict, pr_number: int) -> str:
         """A PR from the issue's own branch merged and the item is Done: close the
@@ -1367,10 +1380,14 @@ class Bridge:
             if what:
                 self._comment(link, f"pr:{pr.get('number')}:{action}:{pr.get('updated_at', '')}",
                               f"{self._pr_html(repo, pr)} {what} by <code>{esc(user)}</code>")
-            extra = {}
+            extra, link_target = {}, target
             if self._closes_on_merge(repo, p, link, branch_num):
                 extra["close_on_merge"] = int(pr["number"])
-            results.append(self._sync_item(link, {"target": target, **extra}))
+            elif self._branch_merged_elsewhere(repo, p, link, branch_num):
+                # Merged into another branch (develop, a release branch): the work
+                # isn't on the default branch yet, so In Review, and the issue stays open.
+                link_target = "review"
+            results.append(self._sync_item(link, {"target": link_target, **extra}))
         return "; ".join(results)
 
     def _state_id(self, project_id: str, target: str) -> str | None:

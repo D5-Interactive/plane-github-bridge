@@ -21,6 +21,7 @@ REPO = "acme/api"
 STATES = [
     {"id": "st-todo", "name": "Todo", "group": "unstarted"},
     {"id": "st-prog", "name": "In Progress", "group": "started"},
+    {"id": "st-review", "name": "In Review", "group": "started"},
     {"id": "st-done", "name": "Done", "group": "completed"},
     {"id": "st-cancel", "name": "Cancelled", "group": "cancelled"},
 ]

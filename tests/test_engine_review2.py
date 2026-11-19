@@ -240,12 +240,40 @@ def _linked(bridge, world):
     bridge.handle_plane(created())
 
 
-def test_merge_into_a_non_default_branch_doesnt_close_the_issue(env):
+def test_merge_into_a_non_default_branch_moves_to_in_review(env):
+    """Aaban's decision: 1-scan merged into develop is In Review, the issue stays
+    open with no comment, and checks treat that as in sync."""
     bridge, world, clock = env
     _linked(bridge, world)
-    bridge.handle_github("pull_request", merged_pr(base="develop"), "p1")
-    assert world.items["item-1"]["state"] == "st-done"          # the Done move itself is unchanged
+    r = bridge.handle_github("pull_request", merged_pr(base="develop"), "p1")
+    assert r.endswith("moved to review")
+    assert world.items["item-1"]["state"] == "st-review"
     assert world.issues[1]["state"] == "open" and 1 not in world.gh_comments
+    bridge.debounce.clock = clock
+    bridge.debounce.touch(f"module:{PROJ}:mod-1")
+    clock.t += 31
+    bridge.run_reconciles()
+    bridge.run_org_scan()
+    assert world.items["item-1"]["state"] == "st-review" and world.issues[1]["state"] == "open"
+    assert bridge.diag.counts()["open"] == 0 and world.issues[1]["labels"] == []
+
+
+def test_merge_without_default_branch_in_the_payload_fails_closed(env):
+    bridge, world, clock = env
+    _linked(bridge, world)
+    event = merged_pr()
+    del event["repository"]["default_branch"]
+    bridge.handle_github("pull_request", event, "p1")
+    assert world.items["item-1"]["state"] == "st-review"
+    assert world.issues[1]["state"] == "open" and 1 not in world.gh_comments
+
+
+def test_merge_into_the_default_branch_is_unchanged(env):
+    bridge, world, clock = env
+    _linked(bridge, world)
+    bridge.handle_github("pull_request", merged_pr(), "p1")
+    assert world.items["item-1"]["state"] == "st-done"
+    assert world.issues[1]["state"] == "closed" and len(world.gh_comments[1]) == 1
 
 
 def test_branch_pr_that_says_closes_is_left_to_github(env):

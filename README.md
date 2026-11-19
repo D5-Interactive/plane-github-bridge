@@ -845,7 +845,8 @@ Activity on any other issue is ignored.
 |---|---|
 | PR opened as a draft, converted to draft, or closed without merging | In Progress |
 | PR opened (not draft), marked ready, reopened, edited, or new commits pushed to it | In Review |
-| PR merged | Done (and see below for the issue) |
+| PR merged (except the case below) | Done (and see below for the issue) |
+| PR from the issue's branch merged into another branch | In Review |
 | Issue closed as completed | Done |
 | Issue closed as not planned | Cancelled |
 | Issue reopened | Todo |
@@ -864,8 +865,12 @@ closes the issue as completed too, and posts one comment on it saying it was
 closed because PR #N merged and the work item moved to Done, so the issue's
 subscribers are told. This only applies when all of these hold:
 
-- the PR was merged into the repo's **default branch** (a merge into `develop`
-  moves the work item but leaves the issue open);
+- the PR was merged into the repo's **default branch**. A merge from the
+  issue's branch into any other branch (`develop`, a release branch) moves the
+  work item to **In Review** instead of Done and leaves the issue open with no
+  comment; checks treat an open issue with an In Review item as in sync. If
+  GitHub's event doesn't say which branch is the default, the bridge assumes
+  it isn't (In Review);
 - the PR's title and description have **no closing keyword** for the issue
   (`Closes #12`, `Fixes #12`, ...); GitHub closes those itself;
 - the branch is in the **same repo**, not a fork that happens to use a name
