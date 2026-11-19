@@ -11,7 +11,7 @@ import yaml
 class Mapping:
     project: str               # Plane project identifier, e.g. "API"
     repo: str                  # GitHub "owner/name", e.g. "your-org/auth-service"
-    module: str | None = None  # Plane module name; None = every work item in the project
+    module: str                # Plane module name
 
 
 @dataclass
@@ -58,8 +58,8 @@ def load_settings(config_path: str | None = None) -> Settings:
 
     mappings = []
     for m in raw.get("mappings", []):
-        if not m.get("project") or not m.get("repo"):
-            raise RuntimeError(f"Each mapping needs 'project' and 'repo': {m!r}")
+        if not m.get("project") or not m.get("repo") or not m.get("module"):
+            raise RuntimeError(f"Each mapping needs 'project', 'module' and 'repo': {m!r}")
         if m["repo"].count("/") != 1:
             raise RuntimeError(f"repo must look like owner/name: {m['repo']!r}")
         mappings.append(Mapping(project=m["project"], repo=m["repo"], module=m.get("module")))

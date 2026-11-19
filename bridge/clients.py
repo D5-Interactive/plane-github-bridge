@@ -85,9 +85,8 @@ class PlaneClient:
         members = self._paged(f"/projects/{project_id}/modules/{module_id}/module-issues/")
         return any((m.get("id") or m.get("issue")) == item["id"] for m in members)
 
-    def update_module_description(self, project_id: str, module_id: str, html: str, text: str) -> None:
-        r = self.http.patch(f"/projects/{project_id}/modules/{module_id}/",
-                            json={"description_html": html, "description": text})
+    def update_module(self, project_id: str, module_id: str, **fields) -> None:
+        r = self.http.patch(f"/projects/{project_id}/modules/{module_id}/", json=fields)
         r.raise_for_status()
         self._modules.pop(project_id, None)
 

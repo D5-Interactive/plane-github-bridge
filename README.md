@@ -386,19 +386,28 @@ docker compose logs -f bridge
 
 ## ◆ Linking Plane to repos
 
-Anyone who can edit a module in Plane can link it to a repo. No server access
-is needed.
+Only work items in a **linked module** go to GitHub. Everything else stays in
+Plane, which keeps admin, planning and other organizational work off GitHub:
+
+| Work item is in | Goes to GitHub? |
+|---|---|
+| A module whose description has a GitHub repo link | ✓ Yes, to that repo |
+| A module with no repo link | ✕ No, stays in Plane |
+| No module at all | ✕ No, stays in Plane |
+
+Anyone who can edit a module in Plane can link it. No server access is needed.
 
 1. In Plane, open the project → **Modules** → the module (or create one).
 2. Paste the repo's GitHub URL **anywhere** in the module's description, for
    example `code is at https://github.com/your-org/auth-service, ask Sam`.
-3. Save. Within a few seconds the bridge rewrites the description to a clean
-   header, the repo link and the repo's own GitHub description:
+3. Save. Within a few seconds the bridge tidies the module:
+   - **Name** becomes the repo's name, e.g. `auth-service`.
+   - **Description** becomes the repo link and the repo's GitHub description:
 
-   ```
-   https://github.com/your-org/auth-service
-   Login, sessions and token refresh for the web app.
-   ```
+     ```
+     https://github.com/your-org/auth-service
+     Login, sessions and token refresh for the web app.
+     ```
 
    If the repo has no description on GitHub, only the link is kept. To change
    that second line, edit the repo's **About** on GitHub, then save the module
@@ -407,26 +416,19 @@ is needed.
    items get theirs the next time they're edited or moved into the module.
 
 > [!NOTE]
-> The rewrite replaces everything else in the module description, so keep
-> notes in Plane Pages or the work items instead. Nothing is rewritten if the
-> GitHub token can't see the repo or its owner isn't in `GITHUB_ALLOWED_OWNERS`.
+> The tidy-up replaces everything else in the module's name and description, so
+> keep notes in Plane Pages or the work items instead. If another module in the
+> project already has the repo's name, only the description is updated. Nothing
+> changes if the GitHub token can't see the repo or its owner isn't in
+> `GITHUB_ALLOWED_OWNERS`.
 
-To send **every** work item in a project to one repo, put the URL in the
-**project's** description instead (**Project settings → General**). A module
-link wins over the project link.
-
-| Where the URL is | Which work items sync |
-|---|---|
-| Module description | Items in that module |
-| Project description | Every item in the project that isn't in a linked module |
-| Neither | Nothing; the items stay Plane-only |
-
-Changes take effect within a minute. To unlink, remove the URL; issues that
-already exist stay linked.
+Changes take effect within a minute. To unlink a module, remove the URL from
+its description; issues that already exist stay linked.
 
 > [!NOTE]
-> Admins can also pin mappings in `config.yaml`, which take priority over
-> anything set in Plane. See the comments in `config.example.yaml`.
+> Admins can also pin module mappings in `config.yaml`, which take priority over
+> links set in Plane. See the comments in `config.example.yaml`. Mappings there
+> match the module by name, so update them if the module is renamed.
 
 ## ◆ Team workflow
 
@@ -441,8 +443,9 @@ already exist stay linked.
 
 ## ◆ Limits
 
-- Only work items in linked modules or projects sync. Moving an item into a
-  linked module later also creates its issue.
+- Only work items in linked modules sync. Work items in unlinked modules or in
+  no module stay in Plane. Moving an item into a linked module later creates its
+  issue.
 - Deleting a work item doesn't delete or close its issue.
 - A PR only moves a work item if it says it closes the linked issue or its
   branch is named after it.

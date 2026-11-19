@@ -1,12 +1,13 @@
 """The sync rules. Plane owns the task; GitHub owns the code work.
 
 Plane -> GitHub
-  * A work item in a linked module or project gets a GitHub issue, once. The issue
-    link is added to the work item. A module or project is linked to a repo by
-    putting the repo's github.com URL in its description in Plane (or, optionally,
-    by a mapping in config.yaml).
-    Order: config.yaml module, config.yaml project, module description,
-    project description.
+  * Only work items in a *linked module* go to GitHub. A module is linked by putting
+    a github.com repo URL anywhere in its description (or, for admins, by a mapping
+    in config.yaml, which wins). Items in unlinked modules, and items in no module at
+    all, stay in Plane: that's where admin and organisational work lives.
+  * A linked module is tidied: renamed to the repo's name, and its description set
+    to the repo link plus the repo's GitHub description.
+  * A synced work item gets a GitHub issue, once, and the issue link is added to it.
   * Later edits to the item's title or description are copied to the issue.
 
 GitHub -> Plane: state
@@ -113,15 +114,13 @@ class Bridge:
                               entity.get("description_text"))
 
     def _repo_for(self, project_id: str, item: dict) -> str | None:
+        """The repo for an item's linked module, or None: the item stays in Plane."""
         project = self.plane.project(project_id)
-        mappings = self.s.mappings_for(project["identifier"])
-        # 1. config.yaml: a module mapping wins over a project-wide one.
-        for m in (m for m in mappings if m.module):
+        # 1. config.yaml module mappings (admin overrides).
+        for m in self.s.mappings_for(project["identifier"]):
             mid = self.plane.module_id(project_id, m.module)
             if mid and self.plane.item_in_module(project_id, mid, item):
                 return m.repo
-        for m in (m for m in mappings if not m.module):
-            return m.repo
         # 2. A github.com URL in the description of one of the item's modules.
         for mod in self.plane.modules(project_id):
             repo = self._described_repo(mod)
@@ -131,11 +130,12 @@ class Bridge:
                 except Exception:
                     log.exception("couldn't tidy the description of module %s", mod.get("id"))
                 return repo
-        # 3. A github.com URL in the project's description.
-        return self._described_repo(project)
+        # Unlinked module, or no module at all: keep it off GitHub.
+        return None
 
     def tidy_module_description(self, project_id: str, module: dict) -> str:
-        """If a module's description mentions a repo, rewrite it to:
+        """If a module's description mentions a repo, rename the module after the repo
+        and rewrite its description to:
 
             https://github.com/owner/repo
             <the repo's GitHub description>
@@ -152,17 +152,34 @@ class Bridge:
         url = meta.get("html_url") or f"https://github.com/{repo}"
         wanted = repo_description_html(url, meta.get("description"))
         current = module.get("description_html") or module.get("description") or ""
-        if plain_text(current) == plain_text(wanted):
-            return "unchanged: module description already tidy"
-        self.plane.update_module_description(project_id, module["id"], wanted, plain_text(wanted))
-        log.info("rewrote description of module %s for %s", module.get("name", module["id"]), repo)
-        return f"module description set for {meta.get('full_name', repo)}"
+        changes: dict = {}
+        if plain_text(current) != plain_text(wanted):
+            changes.update(description_html=wanted, description=plain_text(wanted))
+        name = meta.get("name") or repo.split("/", 1)[1]
+        if name and (module.get("name") or "") != name:
+            changes["name"] = name
+        if not changes:
+            return "unchanged: module already tidy"
+        try:
+            self.plane.update_module(project_id, module["id"], **changes)
+        except Exception:
+            if "name" not in changes:
+                raise
+            # Usually another module in the project already has that name.
+            log.warning("couldn't rename module %r to %r; updating its description only",
+                        module.get("name"), name)
+            changes.pop("name")
+            if not changes:
+                return f"unchanged: couldn't rename module to {name}"
+            self.plane.update_module(project_id, module["id"], **changes)
+        log.info("tidied module %r for %s (%s)", module.get("name", module["id"]), repo, ", ".join(changes))
+        return f"module tidied for {meta.get('full_name', repo)}"
 
     def _maybe_create_issue(self, project_id: str, item_id: str) -> str:
         item = self.plane.work_item(project_id, item_id)
         repo = self._repo_for(project_id, item)
         if not repo:
-            return "ignored: item's modules and project aren't linked to a repo"
+            return "kept in Plane: item isn't in a module linked to a repo"
         if not self.s.owner_allowed(repo):
             log.warning("refusing %s: owner not in GITHUB_ALLOWED_OWNERS", repo)
             return f"ignored: {repo} is not in GITHUB_ALLOWED_OWNERS"

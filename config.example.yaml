@@ -1,22 +1,19 @@
 # OPTIONAL. Most teams don't need this file: link a Plane module to a repo by
-# pasting the repo's github.com URL into the module's description in Plane
-# (or into the project's description to link the whole project).
+# pasting the repo's github.com URL anywhere in the module's description in Plane.
 #
 # Mappings here are for admins who want to pin a link that Plane users can't
 # change. They take priority over links set in Plane.
 #
 #   project: the Plane project identifier (the prefix in IDs like API-12)
-#   module:  optional Plane module name. With it, only items in that module sync.
-#            Without it, every item in the project syncs to that repo.
+#   module:  the Plane module name (required). Only items in this module sync.
 #   repo:    the GitHub repository, owner/name
+#
+# Work items outside a linked module always stay in Plane.
 
 mappings: []
 
 # Example:
 # mappings:
 #   - project: API
-#     module: Auth
+#     module: auth-service
 #     repo: your-org/auth-service
-#
-#   - project: WEB
-#     repo: your-org/website

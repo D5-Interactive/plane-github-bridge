@@ -37,7 +37,9 @@ class FakePlane:
                      "description_html": DESC, "project": PROJ}
         self.module_members = {ITEM}
         self.module_desc = ""
+        self.module_name = "Auth"
         self.module_patches = []
+        self.reject_rename = False
         self.project_desc = ""
         self.links, self.patches, self.comments = [], [], []
 
@@ -51,14 +53,17 @@ class FakePlane:
         if req.method == "GET" and p == f"/projects/{PROJ}/states/":
             return httpx.Response(200, json={"results": STATES, "next_page_results": False})
         if req.method == "GET" and p == f"/projects/{PROJ}/modules/":
-            return httpx.Response(200, json={"results": [{"id": MOD, "name": "Auth",
+            return httpx.Response(200, json={"results": [{"id": MOD, "name": self.module_name,
                                                           "description_html": self.module_desc}]})
         if req.method == "GET" and p == f"/projects/{PROJ}/modules/{MOD}/module-issues/":
             return httpx.Response(200, json={"results": [{"id": i} for i in self.module_members]})
         if req.method == "PATCH" and p == f"/projects/{PROJ}/modules/{MOD}/":
             body = json.loads(req.content)
+            if "name" in body and self.reject_rename:
+                return httpx.Response(400, json={"error": "module with this name already exists"})
             self.module_patches.append(body)
-            self.module_desc = body["description_html"]
+            self.module_desc = body.get("description_html", self.module_desc)
+            self.module_name = body.get("name", self.module_name)
             return httpx.Response(200, json={})
         if req.method == "PATCH" and p == f"/projects/{PROJ}/issues/{ITEM}/":
             body = json.loads(req.content)
@@ -77,7 +82,7 @@ class FakePlane:
 class FakeGitHub:
     def __init__(self):
         self.created, self.updated = [], []
-        self.repos = {"acme/from-plane": {"full_name": "acme/from-plane",
+        self.repos = {"acme/from-plane": {"full_name": "acme/from-plane", "name": "from-plane",
                                           "html_url": "https://github.com/acme/from-plane",
                                           "description": "Tools <for> testing"}}
 
@@ -176,15 +181,15 @@ def test_created_item_in_module_makes_issue_once(env):
 def test_item_added_to_module_later(env):
     bridge, fp, fg = env
     fp.module_members = set()
-    assert "aren't linked to a repo" in bridge.handle_plane(plane_event())
+    assert "kept in Plane" in bridge.handle_plane(plane_event())
     fp.module_members = {ITEM}
     assert bridge.handle_plane(plane_event("workitem.updated", "e2")).startswith("created")
 
 
-def test_unlinked_project_ignored(env):
+def test_item_in_unlinked_module_stays_in_plane(env):
     bridge, fp, fg = env
-    bridge.s.mappings = [Mapping(project="WEB", repo="acme/website")]
-    assert "aren't linked to a repo" in bridge.handle_plane(plane_event())
+    bridge.s.mappings = [Mapping(project="WEB", module="Site", repo="acme/website")]
+    assert bridge.handle_plane(plane_event()) == "kept in Plane: item isn't in a module linked to a repo"
     assert not fg.created
 
 
@@ -209,15 +214,16 @@ def test_module_link_only_applies_to_items_in_that_module(env):
     bridge.s.mappings = []
     fp.module_desc = "https://github.com/acme/from-plane"
     fp.module_members = set()
-    assert "aren't linked" in bridge.handle_plane(plane_event())
+    assert "kept in Plane" in bridge.handle_plane(plane_event())
 
 
-def test_project_description_is_the_fallback(env):
+def test_item_in_no_module_stays_in_plane_even_with_repo_in_project_description(env):
     bridge, fp, fg = env
     bridge.s.mappings = []
     fp.module_members = set()
     fp.project_desc = "All work for https://github.com/acme/monorepo"
-    assert bridge.handle_plane(plane_event()) == "created acme/monorepo#42"
+    assert "kept in Plane" in bridge.handle_plane(plane_event())
+    assert not fg.created
 
 
 def test_config_mapping_wins_over_description(env):
@@ -389,16 +395,17 @@ def test_pr_linked_by_branch_name_without_closes(env):
 
 # ---------------------------------------------------------------- module description tidy-up
 
-def module_event(desc, eid="m1"):
+def module_event(desc, eid="m1", name="Auth"):
     return {"event": "module.updated", "event_id": eid, "entity_type": "module", "entity_id": MOD,
-            "data": {"id": MOD, "project_id": PROJ, "name": "Auth", "description_html": desc}}
+            "data": {"id": MOD, "project_id": PROJ, "name": name, "description_html": desc}}
 
 
 def test_module_link_anywhere_is_rewritten_to_link_plus_description(env):
     bridge, fp, fg = env
     out = bridge.handle_plane(module_event("<p>We keep the code over at "
                                            "https://github.com/acme/from-plane, ping Zep with questions</p>"))
-    assert out == "module description set for acme/from-plane"
+    assert out == "module tidied for acme/from-plane"
+    assert fp.module_patches[-1]["name"] == "from-plane"
     html = fp.module_patches[-1]["description_html"]
     assert html == ('<p><a href="https://github.com/acme/from-plane">https://github.com/acme/from-plane</a></p>'
                     "<p>Tools &lt;for&gt; testing</p>")
@@ -409,7 +416,7 @@ def test_tidy_is_idempotent_so_our_own_edit_does_not_loop(env):
     bridge, fp, fg = env
     bridge.handle_plane(module_event("https://github.com/acme/from-plane"))
     # Plane fires module.updated for our own edit; it must be a no-op
-    assert bridge.handle_plane(module_event(fp.module_desc, "m2")) == "unchanged: module description already tidy"
+    assert bridge.handle_plane(module_event(fp.module_desc, "m2", fp.module_name)) == "unchanged: module already tidy"
     assert len(fp.module_patches) == 1
 
 
@@ -438,3 +445,21 @@ def test_normalize_module_events():
     assert normalize_plane_event({"event": "module.updated"}) == ("module", "updated")
     assert normalize_plane_event({"event": "module", "action": "update"}) == ("module", "updated")
     assert normalize_plane_event({"event": "WebhookScope.ScopeChoices.MODULE_CREATED"}) == ("module", "created")
+
+
+def test_rename_conflict_still_tidies_description(env):
+    bridge, fp, fg = env
+    fp.reject_rename = True
+    assert bridge.handle_plane(module_event("https://github.com/acme/from-plane")) == "module tidied for acme/from-plane"
+    assert "name" not in fp.module_patches[-1] and fp.module_name == "Auth"
+
+
+def test_config_mapping_requires_module(tmp_path, monkeypatch):
+    from bridge.config import load_settings
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("mappings:\n  - project: API\n    repo: acme/x\n")
+    for k in ("PLANE_BASE_URL", "PLANE_PUBLIC_URL", "PLANE_WORKSPACE", "PLANE_API_KEY",
+              "GITHUB_TOKEN", "GITHUB_WEBHOOK_SECRET"):
+        monkeypatch.setenv(k, "x")
+    with pytest.raises(RuntimeError, match="module"):
+        load_settings(str(cfg))
