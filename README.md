@@ -401,8 +401,11 @@ Anyone who can edit a module in Plane can link it. No server access is needed.
 1. In Plane, open the project → **Modules** → the module (or create one).
 2. Paste the repo's GitHub URL **anywhere** in the module's description, for
    example `code is at https://github.com/your-org/auth-service, ask Sam`.
-3. Save. Within a few seconds the bridge tidies the module:
+3. Save. Within a few seconds the bridge tidies the module, which is also how
+   you can tell the link worked:
    - **Name** becomes the repo's name, e.g. `auth-service`.
+   - **Links** gets the repo, titled `GitHub: your-org/auth-service` (see the
+     note below on Plane versions).
    - **Description** becomes the repo link and the repo's GitHub description:
 
      ```
@@ -584,10 +587,16 @@ item is synced through a module. If the module's description links a repo that
 the token can see and the owner is allowed:
 
 1. **Name** → the repo's name (`auth-service`). If another module in the
-   project already has that name, Plane refuses the rename and only the
-   description is updated.
+   project already has that name, Plane refuses the rename and the rest still
+   happens.
 2. **Description** → the repo link, then the repo's GitHub description (its
    **About** text). No About text, just the link.
+
+3. **Links** → the repo URL, titled `GitHub: owner/repo`, added once. Plane's
+   public API doesn't document module links, so this is best effort: if your
+   Plane version doesn't accept it, the bridge logs
+   `this Plane's API has no module links endpoint` once, stops trying, and the
+   renamed module and its description serve as the confirmation instead.
 
 The comparison is on the visible text, so the `module.updated` webhook caused by
 the bridge's own edit changes nothing and can't loop. Anything else that was in
@@ -630,7 +639,8 @@ A SQLite database at `/data/bridge.db`, in the `bridge-data` Docker volume:
 | `plane: created owner/repo#12` | New issue made for a work item |
 | `plane: kept in Plane: ...` | The item isn't in a linked module; working as intended |
 | `plane: updated owner/repo#12` | Title/description edit pushed to the issue |
-| `plane: module tidied for owner/repo` | Module renamed and/or its description rewritten |
+| `plane: module tidied for owner/repo` | Module renamed, description rewritten and/or repo link added |
+| `this Plane's API has no module links endpoint` | Your Plane can't take module links from the API; name and description still update |
 | `plane: unchanged: module already tidy` | The bridge's own edit coming back; harmless |
 | `plane: ignored: token can't see owner/repo` | Add the repo to the GitHub token, or fix the URL |
 | `plane: ignored: ... GITHUB_ALLOWED_OWNERS` | The module links a repo outside the allowed owners |

@@ -5,8 +5,9 @@ Plane -> GitHub
     a github.com repo URL anywhere in its description (or, for admins, by a mapping
     in config.yaml, which wins). Items in unlinked modules, and items in no module at
     all, stay in Plane: that's where admin and organisational work lives.
-  * A linked module is tidied: renamed to the repo's name, and its description set
-    to the repo link plus the repo's GitHub description.
+  * A linked module is tidied: renamed to the repo's name, its description set to
+    the repo link plus the repo's GitHub description, and the repo added to its
+    Links section (where this Plane's API supports module links).
   * A synced work item gets a GitHub issue, once, and the issue link is added to it.
   * Later edits to the item's title or description are copied to the issue.
 
@@ -134,8 +135,8 @@ class Bridge:
         return None
 
     def tidy_module_description(self, project_id: str, module: dict) -> str:
-        """If a module's description mentions a repo, rename the module after the repo
-        and rewrite its description to:
+        """If a module's description mentions a repo, rename the module after the repo,
+        add the repo to its Links, and rewrite its description to:
 
             https://github.com/owner/repo
             <the repo's GitHub description>
@@ -158,8 +159,16 @@ class Bridge:
         name = meta.get("name") or repo.split("/", 1)[1]
         if name and (module.get("name") or "") != name:
             changes["name"] = name
+
+        try:
+            link = self.plane.ensure_module_link(project_id, module["id"], url,
+                                                 f"GitHub: {meta.get('full_name', repo)}")
+        except Exception:
+            log.exception("couldn't add the repo link to module %s", module.get("id"))
+            link = "failed"
+
         if not changes:
-            return "unchanged: module already tidy"
+            return "unchanged: module already tidy" + (" (repo link added)" if link == "added" else "")
         try:
             self.plane.update_module(project_id, module["id"], **changes)
         except Exception:
@@ -172,7 +181,8 @@ class Bridge:
             if not changes:
                 return f"unchanged: couldn't rename module to {name}"
             self.plane.update_module(project_id, module["id"], **changes)
-        log.info("tidied module %r for %s (%s)", module.get("name", module["id"]), repo, ", ".join(changes))
+        log.info("tidied module %r for %s (%s; link %s)", module.get("name", module["id"]), repo,
+                 ", ".join(changes), link)
         return f"module tidied for {meta.get('full_name', repo)}"
 
     def _maybe_create_issue(self, project_id: str, item_id: str) -> str:

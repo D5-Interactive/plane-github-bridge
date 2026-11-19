@@ -30,6 +30,9 @@ class PlaneClient:
         # Module and project descriptions hold repo links people edit in Plane,
         # so they're only cached briefly.
         self.cache_seconds = 60.0
+        # Plane's public API doesn't document module links; set to False the first
+        # time the endpoint turns out not to exist, so we stop asking.
+        self.module_links_supported: bool | None = None
 
     def _get(self, path: str, **params):
         r = self.http.get(path, params=params or None)
@@ -84,6 +87,28 @@ class PlaneClient:
             return module_id in ids
         members = self._paged(f"/projects/{project_id}/modules/{module_id}/module-issues/")
         return any((m.get("id") or m.get("issue")) == item["id"] for m in members)
+
+    def ensure_module_link(self, project_id: str, module_id: str, url: str, title: str) -> str:
+        """Add url to the module's Links section if it isn't there.
+
+        Returns "added", "exists" or "unsupported" (this Plane's API has no module links).
+        """
+        if self.module_links_supported is False:
+            return "unsupported"
+        path = f"/projects/{project_id}/modules/{module_id}/module-links/"
+        r = self.http.get(path)
+        if r.status_code in (404, 405):
+            self.module_links_supported = False
+            log.info("this Plane's API has no module links endpoint; skipping module links")
+            return "unsupported"
+        r.raise_for_status()
+        self.module_links_supported = True
+        wanted = url.rstrip("/").lower()
+        if any((l.get("url") or "").rstrip("/").lower() == wanted for l in _results(r.json())):
+            return "exists"
+        r = self.http.post(path, json={"url": url, "title": title})
+        r.raise_for_status()
+        return "added"
 
     def update_module(self, project_id: str, module_id: str, **fields) -> None:
         r = self.http.patch(f"/projects/{project_id}/modules/{module_id}/", json=fields)

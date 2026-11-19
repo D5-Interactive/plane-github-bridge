@@ -40,6 +40,7 @@ class FakePlane:
         self.module_name = "Auth"
         self.module_patches = []
         self.reject_rename = False
+        self.module_links, self.module_links_supported = [], True
         self.project_desc = ""
         self.links, self.patches, self.comments = [], [], []
 
@@ -57,6 +58,13 @@ class FakePlane:
                                                           "description_html": self.module_desc}]})
         if req.method == "GET" and p == f"/projects/{PROJ}/modules/{MOD}/module-issues/":
             return httpx.Response(200, json={"results": [{"id": i} for i in self.module_members]})
+        if p == f"/projects/{PROJ}/modules/{MOD}/module-links/":
+            if not self.module_links_supported:
+                return httpx.Response(404, json={})
+            if req.method == "GET":
+                return httpx.Response(200, json={"results": self.module_links})
+            self.module_links.append(json.loads(req.content))
+            return httpx.Response(201, json={})
         if req.method == "PATCH" and p == f"/projects/{PROJ}/modules/{MOD}/":
             body = json.loads(req.content)
             if "name" in body and self.reject_rename:
@@ -463,3 +471,19 @@ def test_config_mapping_requires_module(tmp_path, monkeypatch):
         monkeypatch.setenv(k, "x")
     with pytest.raises(RuntimeError, match="module"):
         load_settings(str(cfg))
+
+
+def test_tidy_adds_repo_to_module_links_once(env):
+    bridge, fp, fg = env
+    bridge.handle_plane(module_event("https://github.com/acme/from-plane"))
+    assert fp.module_links == [{"url": "https://github.com/acme/from-plane", "title": "GitHub: acme/from-plane"}]
+    bridge.handle_plane(module_event(fp.module_desc, "m2", fp.module_name))
+    assert len(fp.module_links) == 1
+
+
+def test_tidy_still_works_when_plane_has_no_module_links_api(env):
+    bridge, fp, fg = env
+    fp.module_links_supported = False
+    assert bridge.handle_plane(module_event("https://github.com/acme/from-plane")) == "module tidied for acme/from-plane"
+    assert fp.module_name == "from-plane"
+    assert bridge.plane.module_links_supported is False
