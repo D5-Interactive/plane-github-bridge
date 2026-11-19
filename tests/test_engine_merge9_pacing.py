@@ -250,3 +250,103 @@ def test_moved_to_another_repo_without_credentials_updates_the_check(env, monkey
     run_queue_after(bridge, clock, 601)
     entry = bridge.queue.get("create_issue", "item-1")
     assert entry.payload["cred_repo"] == "third/api" and not world.issues
+
+
+# ---------------------------------------------------------------- R1 / R2 / nits
+
+def test_spent_account_doesnt_block_other_accounts_retries(env):
+    """Auditor repro (test_queue_xaccount.py) with the bridge's own queue runner: A's
+    budget is spent; B's due entries still run, and A's others wait untouched."""
+    from bridge.queue import run_due
+    bridge, world, clock = env
+    bridge.gh.auth.app = FakeApp({"acct-a": "A", "acct-b": "B"})
+    q = bridge.queue
+    q.put("x", "a1", {"repo": "acct-a/r"})
+    clock.t += 1
+    q.put("x", "a2", {"repo": "acct-a/s"})
+    clock.t += 1
+    q.put("x", "b1", {"repo": "acct-b/r"})
+    ran = []
+
+    def handler(p):
+        if p["repo"].startswith("acct-a"):
+            e = PaceTooLong(1500, "core")
+            e.cred = "app:acct-a"
+            raise e
+        ran.append(p["repo"])
+
+    summary = run_due(q, {"x": handler}, stop=bridge._stops_queue_round,
+                      group=bridge._entry_cred, skip=bridge._skip_cred)
+    assert ran == ["acct-b/r"]
+    assert summary == {"done": 1, "failed": 1, "stopped": False, "skipped": 1}
+    assert q.get("x", "a2").attempts == 0           # left for the next round, not failed
+
+
+def test_github_rate_limit_from_the_client_carries_its_credential():
+    def handler(req):
+        return httpx.Response(200, headers=limits(1, 3600), json={"full_name": "x"})
+
+    gh, clock, sleeps = client(handler, GitHubAuth(pat="P", app=FakeApp({"acct-a": "A"})))
+    with pytest.raises(PaceTooLong) as info:
+        for _ in range(20):
+            gh.get_repo("acct-a/one")
+    assert info.value.cred == "app:acct-a"
+
+
+def test_plane_rate_limit_still_stops_the_round(env):
+    bridge, world, clock = env
+    req = httpx.Request("GET", "http://plane.local/api/v1/workspaces/acme/projects/")
+    e = httpx.HTTPStatusError("429", request=req, response=httpx.Response(429, request=req))
+    assert bridge._stops_queue_round(e) is True and bridge._skip_cred(e, None) is None
+
+
+def test_github_401_on_the_pat_skips_everything_the_pat_signs(env):
+    bridge, world, clock = env
+    bridge.gh.auth.app = FakeApp({"acct-a": "A"}, missing=["acct-c"])
+    req = httpx.Request("GET", "https://api.github.com/repos/acct-c/r")
+    req.extensions["bridge_cred"] = "pat"
+    e = httpx.HTTPStatusError("401", request=req, response=httpx.Response(401, request=req))
+
+    class E:
+        payload = {"repo": "acct-c/r"}
+    assert bridge._stops_queue_round(e) is False and bridge._skip_cred(e, E) == "pat"
+
+
+def test_full_attempts_are_capped_per_round_and_run_in_the_background_lane(env, monkeypatch):
+    from bridge import sync as sync_module
+    from bridge.clients import LANE_BACKGROUND, current_lane
+    bridge, world, clock = env
+    no_creds(bridge, FakeApp(missing=["other"]))
+    monkeypatch.setattr(sync_module, "FULL_ATTEMPTS_PER_ROUND", 2)
+    for n in range(5):
+        bridge.queue.put("create_issue", f"item-{n}", {"project_id": "proj-1", "item_id": f"item-{n}",
+                                                       "cred_repo": "other/api", "resolved_at": 0,
+                                                       "_retry": True, "_key": f"item-{n}"})
+    lanes = []
+    monkeypatch.setitem(bridge.handlers, "create_issue", lambda p: lanes.append(current_lane()))
+    bridge.run_queue()
+    assert lanes == [LANE_BACKGROUND, LANE_BACKGROUND]      # two full attempts, the rest staggered
+    assert bridge.queue.stats()["length"] == 3
+
+
+def test_expired_needs_pat_entries_are_pruned():
+    clock = Clock()
+    auth = GitHubAuth(pat="P", app=FakeApp({"acme": "A"}), clock=clock)
+    auth._remember_pat("acme/one")
+    assert auth._pat_remembered("acme/one")
+    clock.t += auth.needs_pat_ttl + 1
+    assert not auth._pat_remembered("acme/one") and auth._needs_pat == {}
+    for i in range(1001):
+        auth._remember_pat(f"acme/r{i}")
+    clock.t += auth.needs_pat_ttl + 1
+    auth._remember_pat("acme/new")
+    assert list(auth._needs_pat) == ["acme/new"]
+
+
+def test_health_names_the_personal_token_pacer(env):
+    from fastapi.testclient import TestClient
+    from bridge.app import build_app
+    bridge, world, clock = env
+    with TestClient(build_app(bridge)) as c:
+        body = c.get("/health").json()
+    assert body["github_pat_pacer"] == body["github_pacer"] and "pat" in body["github_pacers"]

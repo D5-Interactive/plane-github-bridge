@@ -509,9 +509,21 @@ class GitHubAuth(httpx.Auth):
         return f"app:{owner.lower()}" if owner else "pat"
 
     def _pat_remembered(self, repo_full: str) -> bool:
+        key, now = repo_full.lower(), self.clock()
         with self._needs_pat_lock:
-            until = self._needs_pat.get(repo_full.lower())
-        return until is not None and until > self.clock()
+            until = self._needs_pat.get(key)
+            if until is not None and until <= now:
+                del self._needs_pat[key]      # expired: forget it
+                until = None
+        return until is not None
+
+    def _remember_pat(self, repo_full: str) -> None:
+        now = self.clock()
+        with self._needs_pat_lock:
+            self._needs_pat[repo_full.lower()] = now + self.needs_pat_ttl
+            if len(self._needs_pat) > 1000:   # drop expired entries now and then
+                for k in [k for k, until in self._needs_pat.items() if until <= now]:
+                    del self._needs_pat[k]
 
     def predict_key(self, path: str) -> str:
         """The credential a request to `path` will most likely use."""
@@ -612,8 +624,7 @@ class GitHubAuth(httpx.Auth):
             if m and response.is_success:
                 # The token reached what the installation couldn't: remember for a
                 # while (not on a plain 404 both answer, such as a deleted issue).
-                with self._needs_pat_lock:
-                    self._needs_pat[f"{m.group(1)}/{m.group(2)}".lower()] = self.clock() + self.needs_pat_ttl
+                self._remember_pat(f"{m.group(1)}/{m.group(2)}")
 
 
 def load_private_key(path: str) -> str:

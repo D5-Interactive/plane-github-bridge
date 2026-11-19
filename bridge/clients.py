@@ -634,7 +634,12 @@ class GitHubClient:
     def _send(self, method: str, path: str, own_hold: float | None = None, **kwargs) -> httpx.Response:
         # Wait on the pacer of the credential this request will most likely use. A
         # long wait in the interactive lane raises PaceTooLong (queued) instead.
-        self.pacer_for(self.auth.predict_key(path)).wait(own_hold=own_hold, max_wait=MAX_WAIT)
+        key = self.auth.predict_key(path)
+        try:
+            self.pacer_for(key).wait(own_hold=own_hold, max_wait=MAX_WAIT)
+        except PaceTooLong as e:
+            e.cred = key                    # which credential is spent (for the retry queue)
+            raise
         return self.http.request(method, path, **kwargs)
 
     def _used(self, r: httpx.Response, path: str) -> Pacer:

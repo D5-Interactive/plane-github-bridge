@@ -260,7 +260,9 @@ def build_app(bridge: Bridge | None = None,
             out["github_problem"] = problem
         out["queue"] = bridge.queue.stats()
         out["plane_pacer"] = bridge.plane.pacer.snapshot()
-        out["github_pacer"] = bridge.gh.pacer.snapshot()
+        # github_pacer: the personal token's pacer (kept under its old name too);
+        # github_pacers: every credential's, keyed app:<account> or pat.
+        out["github_pat_pacer"] = out["github_pacer"] = bridge.gh.pacer.snapshot()
         out["github_pacers"] = bridge.gh.pacer_snapshots()
         out["scheduler"] = (bridge.scheduler.snapshot() if settings.reconcile and settings.org_scan
                             else {"enabled": False})

@@ -80,6 +80,8 @@ SINCE_SKEW = 120
 # case it moved to another module) at most this often; between, it backs off
 # without reading Plane.
 RESOLVE_AGAIN_SECONDS = 600
+# ...and at most this many such full attempts run per queue round (staggered).
+FULL_ATTEMPTS_PER_ROUND = 10
 
 
 # GET .../issues/<id>/ : reading one work item (not its links or comments).
@@ -798,10 +800,15 @@ class Bridge:
         """Retry due queued actions. Each handler re-reads the current state first (guards),
         so an action that took effect before its response was lost isn't done twice.
         Each runs in the pacing lane it was queued from."""
+        self._full_attempts_left = FULL_ATTEMPTS_PER_ROUND
+
         def wrap(kind):
             def run(payload: dict) -> None:
-                self._precheck_credentials(kind, payload)
-                with self._lock(self._lock_key(kind, payload)), lane(payload.get("lane", LANE_INTERACTIVE)):
+                resolving = self._precheck_credentials(kind, payload)
+                # A periodic full attempt for an entry still waiting on credentials is
+                # upkeep, not a webhook someone waits on: background lane.
+                which = LANE_BACKGROUND if resolving else payload.get("lane", LANE_INTERACTIVE)
+                with self._lock(self._lock_key(kind, payload)), lane(which):
                     try:
                         self.handlers[kind](payload)
                     except Exception as e:
@@ -819,7 +826,39 @@ class Bridge:
                 log.info("retried %s: done", kind)
             return run
         return run_due(self.queue, {k: wrap(k) for k in self.handlers}, limit=limit,
-                       stop=lambda e: _failure_kind(e) in ("rate", "auth"))
+                       stop=self._stops_queue_round, group=self._entry_cred, skip=self._skip_cred)
+
+    # -------- one credential's limit doesn't hold up the others
+
+    def _entry_cred(self, entry) -> str:
+        """The GitHub credential (pacer key) an entry's GitHub calls use, or "" when
+        its repo isn't known."""
+        repo = entry.payload.get("cred_repo") or entry.payload.get("repo") or ""
+        predict = getattr(getattr(self.gh, "auth", None), "predict_key", None)
+        if "/" not in repo or predict is None:
+            return ""
+        return predict(f"/repos/{repo}")
+
+    @staticmethod
+    def _is_github_error(e: Exception) -> bool:
+        if isinstance(e, PaceTooLong):
+            return True
+        return isinstance(e, httpx.HTTPStatusError) and e.request.url.host.endswith("github.com")
+
+    def _stops_queue_round(self, e: Exception) -> bool:
+        """A Plane rate limit or rejected key stops the round (every entry reads
+        Plane). GitHub ones only skip the credential involved (see _skip_cred)."""
+        return _failure_kind(e) in ("rate", "auth") and not self._is_github_error(e)
+
+    def _skip_cred(self, e: Exception, entry) -> str | None:
+        """A GitHub rate limit or rejected credential: skip that credential's other
+        entries this round (an installation token per account, or the personal
+        token for everything it signs); other accounts' entries carry on."""
+        if _failure_kind(e) not in ("rate", "auth") or not self._is_github_error(e):
+            return None
+        if isinstance(e, PaceTooLong):
+            return getattr(e, "cred", None) or self._entry_cred(entry)
+        return e.request.extensions.get("bridge_cred") or self._entry_cred(entry)
 
     _GITHUB_BOUND = ("create_issue", "push_edit", "sync_item")
 
@@ -832,18 +871,26 @@ class Bridge:
             e.repo = repo
             raise e
 
-    def _precheck_credentials(self, kind: str, payload: dict) -> None:
+    def _precheck_credentials(self, kind: str, payload: dict) -> bool:
         """Before a queued GitHub-bound action re-reads anything from Plane: if nothing
         can sign for the repo's owner right now (known cheaply, no network), fail it
-        straight away so it backs off, instead of spending Plane calls each retry."""
+        straight away so it backs off, instead of spending Plane calls each retry.
+
+        Returns True when this is the periodic full attempt of such an entry (to
+        re-resolve its repo); at most FULL_ATTEMPTS_PER_ROUND per round, the rest
+        wait for a later round."""
         repo = payload.get("cred_repo") or payload.get("repo") or ""
         can_sign = getattr(getattr(self.gh, "auth", None), "can_sign", None)
         if kind in self._GITHUB_BOUND and "/" in repo and can_sign and not can_sign(repo.split("/", 1)[0]):
-            if self.clock() - (payload.get("resolved_at") or 0) < RESOLVE_AGAIN_SECONDS:
+            if self.clock() - (payload.get("resolved_at") or 0) < RESOLVE_AGAIN_SECONDS or \
+                    getattr(self, "_full_attempts_left", 1) <= 0:
                 raise NoGitHubCredentials(f"no GitHub credentials for {repo.split('/', 1)[0]} yet")
             # Now and then, run it fully anyway: the item may have moved to a module
             # whose repo does have credentials (the membership pass also notices that).
+            self._full_attempts_left = getattr(self, "_full_attempts_left", 1) - 1
             self.queue.set_payload_field(kind, payload.get("_key", ""), "resolved_at", self.clock())
+            return True
+        return False
 
     def github_account_changed(self, owner: str) -> int:
         """An installation changed on a GitHub account: forget cached answers and make

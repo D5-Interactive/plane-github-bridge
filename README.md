@@ -540,7 +540,13 @@ Each credential (the app's token for each account, and the personal token) has
 its own GitHub rate limit, so the bridge paces each one separately: one account
 running low doesn't slow the others, and a rate limit on one doesn't pause the
 rest. A webhook action that would have to wait more than 60 seconds for its
-credential's budget isn't held up: it goes into the retry queue. `/health`
+credential's budget isn't held up: it goes into the retry queue. In the queue,
+a GitHub rate limit (or a rejected credential) on one account only holds back
+that account's waiting actions for the round; other accounts' retries go
+ahead. A Plane rate limit still pauses the whole round, since every action
+reads Plane. Actions waiting on an account with no credentials try a full run
+(to see whether the item moved to another repo) at most every 10 minutes, at
+most 10 per round, in the background lane. `/health`
 shows the pacers under `github_pacers`. A repo the app's installation
 can't reach but the token can is remembered for 10 minutes (or until an
 installation event), so it costs one request per call, not two.
@@ -919,9 +925,10 @@ unless `BRIDGE_TRUST_PROXY_HEADERS=1`, which takes it from `CF-Connecting-IP` or
 |---|---|
 | `ok`, `mappings`, `plane_webhook_ready`, `plane_api_ok`, `plane_problem`, `plane_problem_temporary` | See [setup step 3](#3-start-the-bridge) |
 | `github_auth`, `github_webhook_ready`, `github_app`, `github_app_installed_on`, `github_app_missing_on`, `github_app_unknown_on`, `github_problem` | How the bridge signs GitHub calls; see [setup step 5](#5-connect-github) |
-| `github_pacers` | One pacer per GitHub credential (`app:<account>` for the app's token on each account, `pat` for the personal token), same fields as `github_pacer` (which is the personal token's) |
+| `github_pacers` | One pacer per GitHub credential (`app:<account>` for the app's token on each account, `pat` for the personal token), same fields as `plane_pacer` |
+| `github_pat_pacer` | The personal token's pacer (`github_pacers.pat`). `github_pacer` is the same, kept under its old name for existing monitoring |
 | `queue` | `length`: actions waiting to be retried; `oldest_age`: seconds the oldest has waited; `stale`: how many were flagged `stuck` |
-| `plane_pacer`, `github_pacer` | The pacing in force. `source`: `headers` (learned from the last response), `configured` (`PLANE_RATE_LIMIT`, until headers are seen) or `off`; `limit` and `limit_source` (`header`, or `inferred`, see [API usage](#api-usage)); `remaining`, `reset_in`; `interval` and `background_interval` (seconds between calls); `background_blocked_for`; `reserve_share`; `hold_in` (seconds left of a hold after a 429); `waiting` (callers waiting per lane) |
+| `plane_pacer` | The pacing in force (the same fields appear in each GitHub pacer). `source`: `headers` (learned from the last response), `configured` (`PLANE_RATE_LIMIT` for Plane, until headers are seen) or `off`; `limit` and `limit_source` (`header`, or `inferred`, see [API usage](#api-usage)); `remaining`, `reset_in`; `interval` and `background_interval` (seconds between calls); `background_blocked_for`; `reserve_share`; `hold_in` (seconds left of a hold after a 429); `waiting` (callers waiting per lane) |
 | `scheduler` | The org scan: `class` of the last scan (`light`, `heavy`, `slow`), `next_run`, `last_run` and its measurements in `last`, and `quiet_hours_only` (the next run may only start in the quiet hours); `{"enabled": false}` when the org scan or checks are off |
 | `problems` | `open` sync problems, `by_kind`, and `flags_pending` (label changes waiting to be retried) |
 | `reconcile_pending` | Module and repo checks waiting for their burst of edits to settle |

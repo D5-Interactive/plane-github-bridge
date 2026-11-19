@@ -208,11 +208,25 @@ def short_reason(e: Exception) -> str:
 
 
 def run_due(queue: RetryQueue, handlers: dict[str, Callable[[dict], None]], *,
-            limit: int = 20, stop: Callable[[Exception], bool] = lambda exc: False) -> dict:
+            limit: int = 20, stop: Callable[[Exception], bool] = lambda exc: False,
+            group: Callable[[Entry], str] | None = None,
+            skip: Callable[[Exception, Entry], str | None] | None = None) -> dict:
     """Run the due entries once. Success removes an entry; a failure reschedules it.
-    If stop(exc) is true (a rate limit, say), the run ends after recording that failure."""
+
+    stop(exc) true (a rate limit on something every entry needs): the run ends
+    after recording that failure. skip(exc, entry) returning a group key (a rate
+    limit on one GitHub credential): the rest of that group's entries are left
+    for the next round, untouched, and the run carries on with the others.
+    group(entry) gives an entry's group key.
+    """
     summary = {"done": 0, "failed": 0, "stopped": False}
+    if group is not None:
+        summary["skipped"] = 0
+    skipped: set[str] = set()
     for e in queue.due(limit):
+        if group is not None and skipped and group(e) in skipped:
+            summary["skipped"] += 1
+            continue
         handler = handlers.get(e.kind)
         if handler is None:
             queue.failed(e.id, f"no handler for {e.kind}")
@@ -226,6 +240,9 @@ def run_due(queue: RetryQueue, handlers: dict[str, Callable[[dict], None]], *,
             if stop(exc):
                 summary["stopped"] = True
                 break
+            key = skip(exc, e) if skip is not None else None
+            if key is not None:
+                skipped.add(key)
         else:
             queue.done(e.id, version=e.version)
             summary["done"] += 1
