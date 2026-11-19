@@ -542,8 +542,10 @@ running low doesn't slow the others, and a rate limit on one doesn't pause the
 rest. A webhook action that would have to wait more than 60 seconds for its
 credential's budget isn't held up: it goes into the retry queue. In the queue,
 a GitHub rate limit (or a rejected credential) on one account only holds back
-that account's waiting actions for the round; other accounts' retries go
-ahead. A Plane rate limit still pauses the whole round, since every action
+that account's waiting actions: they're set aside until its limit resets (no
+attempt counted, no `stuck` flag), so other accounts' retries go ahead even
+when the limited account has hundreds waiting. A retry that falls back to the
+personal token waits on the personal token's own budget. A Plane rate limit still pauses the whole round, since every action
 reads Plane. Actions waiting on an account with no credentials try a full run
 (to see whether the item moved to another repo) at most every 10 minutes, at
 most 10 per round, in the background lane. `/health`
@@ -880,7 +882,7 @@ Anything the bridge can't settle on its own is a **sync problem**:
 
 | Kind | Meaning | Flagged | Clears when |
 |---|---|---|---|
-| `stuck` | A queued action is still failing after `BRIDGE_QUEUE_MAX_AGE` seconds | Item and issue | The action succeeds |
+| `stuck` | A queued action is still failing after `BRIDGE_QUEUE_MAX_AGE` seconds. Waiting out a GitHub rate limit doesn't count (it heals by itself; see `held` in `/health`) unless it lasts an hour longer than that | Item and issue | The action succeeds |
 | `refused` | Plane or GitHub refused an action for a lasting reason | Item and issue | A later action on the item succeeds, or the item is edited in Plane (it's tried again) |
 | `state_differs` | Open on one side, closed on the other, and the bridge can't tell which is right (first contact, or both changed), or a sync left them that way (for example a fork PR merged into the default branch: Done in Plane, issue still open) | Item and issue | The two sides match |
 | `title_differs` | The titles differ and the bridge can't tell which side is right | Item and issue | The two sides match |
@@ -927,7 +929,7 @@ unless `BRIDGE_TRUST_PROXY_HEADERS=1`, which takes it from `CF-Connecting-IP` or
 | `github_auth`, `github_webhook_ready`, `github_app`, `github_app_installed_on`, `github_app_missing_on`, `github_app_unknown_on`, `github_problem` | How the bridge signs GitHub calls; see [setup step 5](#5-connect-github) |
 | `github_pacers` | One pacer per GitHub credential (`app:<account>` for the app's token on each account, `pat` for the personal token), same fields as `plane_pacer` |
 | `github_pat_pacer` | The personal token's pacer (`github_pacers.pat`). `github_pacer` is the same, kept under its old name for existing monitoring |
-| `queue` | `length`: actions waiting to be retried; `oldest_age`: seconds the oldest has waited; `stale`: how many were flagged `stuck` |
+| `queue` | `length`: actions waiting to be retried; `oldest_age`: seconds the oldest has waited; `stale`: how many were flagged `stuck`; `held`: actions waiting out one GitHub credential's rate limit, per credential |
 | `plane_pacer` | The pacing in force (the same fields appear in each GitHub pacer). `source`: `headers` (learned from the last response), `configured` (`PLANE_RATE_LIMIT` for Plane, until headers are seen) or `off`; `limit` and `limit_source` (`header`, or `inferred`, see [API usage](#api-usage)); `remaining`, `reset_in`; `interval` and `background_interval` (seconds between calls); `background_blocked_for`; `reserve_share`; `hold_in` (seconds left of a hold after a 429); `waiting` (callers waiting per lane) |
 | `scheduler` | The org scan: `class` of the last scan (`light`, `heavy`, `slow`), `next_run`, `last_run` and its measurements in `last`, and `quiet_hours_only` (the next run may only start in the quiet hours); `{"enabled": false}` when the org scan or checks are off |
 | `problems` | `open` sync problems, `by_kind`, and `flags_pending` (label changes waiting to be retried) |

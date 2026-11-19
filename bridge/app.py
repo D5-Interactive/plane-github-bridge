@@ -258,7 +258,7 @@ def build_app(bridge: Bridge | None = None,
         problem = auth.app.problem_now() if auth.app else None
         if problem:                               # live: why the app can't be used right now
             out["github_problem"] = problem
-        out["queue"] = bridge.queue.stats()
+        out["queue"] = {**bridge.queue.stats(), "held": bridge.queue.held()}
         out["plane_pacer"] = bridge.plane.pacer.snapshot()
         # github_pacer: the personal token's pacer (kept under its old name too);
         # github_pacers: every credential's, keyed app:<account> or pat.

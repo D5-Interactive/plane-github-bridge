@@ -38,10 +38,14 @@ def ensure_schema(store) -> None:
                    next_at        REAL NOT NULL,
                    stale_reported INTEGER NOT NULL DEFAULT 0,
                    version        INTEGER NOT NULL DEFAULT 0,
+                   held_by        TEXT NOT NULL DEFAULT '',
                    UNIQUE (kind, key))""")
         cols = {r[1] for r in store._db.execute("PRAGMA table_info(retry_queue)")}
         if "version" not in cols:
             store._db.execute("ALTER TABLE retry_queue ADD COLUMN version INTEGER NOT NULL DEFAULT 0")
+        if "held_by" not in cols:
+            # The credential whose rate limit an entry is waiting out ('' = none).
+            store._db.execute("ALTER TABLE retry_queue ADD COLUMN held_by TEXT NOT NULL DEFAULT ''")
         store._db.commit()
 
 
@@ -94,9 +98,30 @@ class RetryQueue:
                    ON CONFLICT (kind, key) DO UPDATE SET
                        payload = excluded.payload, reason = excluded.reason,
                        updated_at = excluded.updated_at, next_at = excluded.next_at,
-                       version = retry_queue.version + 1""",
+                       version = retry_queue.version + 1, held_by = ''""",
                 (kind, key, data, reason, now, now, now))
             self.store._db.commit()
+
+    def hold_group(self, group: Callable[[Entry], str], key: str, until: float) -> int:
+        """Every entry in this group (e.g. one GitHub credential's) waits until `until`
+        without counting an attempt: it leaves the due window, so other groups'
+        entries get their turn. Returns how many."""
+        with self.store._lock:
+            rows = self.store._db.execute(f"SELECT {_COLS} FROM retry_queue WHERE next_at < ?",
+                                          (until,)).fetchall()
+            ids = [r[0] for r in rows if group(_entry(r)) == key]
+            self.store._db.executemany("UPDATE retry_queue SET next_at = ?, held_by = ? WHERE id = ?",
+                                       [(until, key, i) for i in ids])
+            self.store._db.commit()
+        return len(ids)
+
+    def held(self) -> dict[str, int]:
+        """Entries waiting out a credential's rate limit, per credential (for /health)."""
+        with self.store._lock:
+            rows = self.store._db.execute(
+                "SELECT held_by, COUNT(*) FROM retry_queue WHERE held_by != '' AND next_at > ? "
+                "GROUP BY held_by", (self.clock(),)).fetchall()
+        return dict(rows)
 
     def set_payload_field(self, kind: str, key: str, field: str, value) -> None:
         """Add a detail learned while running an entry (e.g. its repo) without
@@ -138,9 +163,16 @@ class RetryQueue:
             self.store._db.commit()
             return cur.rowcount > 0
 
-    def failed(self, entry_id: int, reason: str, version: int | None = None) -> Entry | None:
+    # A rate-limit wait is known and heals itself: it only turns into a "stuck"
+    # report this long past max_age.
+    rate_limit_grace = 3600.0
+
+    def failed(self, entry_id: int, reason: str, version: int | None = None,
+               rate_limited: bool = False) -> Entry | None:
         """Record a failed attempt and schedule the next one. Returns the updated entry.
-        If a newer payload was merged in since `version`, it stays due now."""
+        If a newer payload was merged in since `version`, it stays due now.
+        rate_limited: the failure was a rate limit, which counts toward "stuck" only
+        after rate_limit_grace more."""
         now = self.clock()
         with self.store._lock:
             row = self.store._db.execute(
@@ -152,7 +184,8 @@ class RetryQueue:
             delay = self.backoff[min(attempts - 1, len(self.backoff) - 1)]
             if version is not None and e.version != version:
                 delay = 0
-            report = (not e.stale_reported) and (now - e.first_seen > self.max_age)
+            allowed = self.max_age + (self.rate_limit_grace if rate_limited else 0)
+            report = (not e.stale_reported) and (now - e.first_seen > allowed)
             self.store._db.execute(
                 """UPDATE retry_queue SET attempts = ?, reason = ?, updated_at = ?, next_at = ?,
                                           stale_reported = ? WHERE id = ?""",
@@ -210,23 +243,33 @@ def short_reason(e: Exception) -> str:
 def run_due(queue: RetryQueue, handlers: dict[str, Callable[[dict], None]], *,
             limit: int = 20, stop: Callable[[Exception], bool] = lambda exc: False,
             group: Callable[[Entry], str] | None = None,
-            skip: Callable[[Exception, Entry], str | None] | None = None) -> dict:
+            skip: Callable[[Exception, Entry], str | None] | None = None,
+            hold: Callable[[Exception, str], float] | None = None,
+            rate_limited: Callable[[Exception], bool] | None = None) -> dict:
     """Run the due entries once. Success removes an entry; a failure reschedules it.
 
     stop(exc) true (a rate limit on something every entry needs): the run ends
     after recording that failure. skip(exc, entry) returning a group key (a rate
     limit on one GitHub credential): the rest of that group's entries are left
     for the next round, untouched, and the run carries on with the others.
-    group(entry) gives an entry's group key.
+    group(entry) gives an entry's group key. A skipped group's entries are also
+    held (moved out of the due window until hold(exc, key), by default the wait
+    the error names), and the run looks past `limit` so a group with many old
+    entries can't keep the others from ever running.
     """
     summary = {"done": 0, "failed": 0, "stopped": False}
     if group is not None:
         summary["skipped"] = 0
-    skipped: set[str] = set()
-    for e in queue.due(limit):
+    skipped: dict[str, float] = {}
+    attempted = 0
+    window = queue.due(limit * 10 if group is not None else limit)
+    for e in window:
+        if attempted >= limit:
+            break
         if group is not None and skipped and group(e) in skipped:
             summary["skipped"] += 1
             continue
+        attempted += 1
         handler = handlers.get(e.kind)
         if handler is None:
             queue.failed(e.id, f"no handler for {e.kind}")
@@ -235,15 +278,21 @@ def run_due(queue: RetryQueue, handlers: dict[str, Callable[[dict], None]], *,
         try:
             handler(e.payload)
         except Exception as exc:
-            queue.failed(e.id, short_reason(exc), version=e.version)
+            key = skip(exc, e) if skip is not None else None
+            soft = rate_limited(exc) if rate_limited is not None else key is not None
+            queue.failed(e.id, short_reason(exc), version=e.version, rate_limited=soft)
             summary["failed"] += 1
             if stop(exc):
                 summary["stopped"] = True
                 break
-            key = skip(exc, e) if skip is not None else None
-            if key is not None:
-                skipped.add(key)
+            if key is not None and key not in skipped:
+                until = hold(exc, key) if hold is not None else \
+                    queue.clock() + min(max(float(getattr(exc, "seconds", 60) or 60), 5.0), 3600.0)
+                skipped[key] = until
         else:
             queue.done(e.id, version=e.version)
             summary["done"] += 1
+    if group is not None:
+        for key, until in skipped.items():
+            queue.hold_group(group, key, until)
     return summary

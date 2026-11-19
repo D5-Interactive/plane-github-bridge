@@ -826,7 +826,19 @@ class Bridge:
                 log.info("retried %s: done", kind)
             return run
         return run_due(self.queue, {k: wrap(k) for k in self.handlers}, limit=limit,
-                       stop=self._stops_queue_round, group=self._entry_cred, skip=self._skip_cred)
+                       stop=self._stops_queue_round, group=self._entry_cred, skip=self._skip_cred,
+                       hold=self._hold_until, rate_limited=lambda e: _failure_kind(e) == "rate")
+
+    def _hold_until(self, e: Exception, key: str) -> float:
+        """Until when a limited credential's queued entries wait: its pacer's next
+        free slot (hold end or budget reset), at least a few seconds; a rejected
+        credential waits a minute."""
+        wait = 60.0
+        if _failure_kind(e) == "rate" and hasattr(self.gh, "pacer_for") and key:
+            wait = self.gh.pacer_for(key).ready_in()
+            if isinstance(e, PaceTooLong):
+                wait = max(wait, e.seconds)
+        return self.clock() + min(max(wait, 5.0), 3600.0)
 
     # -------- one credential's limit doesn't hold up the others
 
@@ -857,8 +869,10 @@ class Bridge:
         if _failure_kind(e) not in ("rate", "auth") or not self._is_github_error(e):
             return None
         if isinstance(e, PaceTooLong):
-            return getattr(e, "cred", None) or self._entry_cred(entry)
-        return e.request.extensions.get("bridge_cred") or self._entry_cred(entry)
+            key = getattr(e, "cred", None) or self._entry_cred(entry)
+        else:
+            key = e.request.extensions.get("bridge_cred") or self._entry_cred(entry)
+        return key or None          # an unknown credential: don't hold back unrelated entries
 
     _GITHUB_BOUND = ("create_issue", "push_edit", "sync_item")
 

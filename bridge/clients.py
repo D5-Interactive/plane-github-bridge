@@ -295,6 +295,16 @@ class Pacer:
 
     # ------------------------------------------------------------ reporting
 
+    def ready_in(self) -> float:
+        """Seconds until an interactive call could go (hold, budget and spacing)."""
+        with self._lock:
+            now = self.clock()
+            interval, budget_start, tolerance = self._plan(now, LANE_INTERACTIVE)
+            start = max(self._hold_until, budget_start, now)
+            if interval:
+                start = max(start, self._next - tolerance)
+            return max(0.0, start - now)
+
     def snapshot(self) -> dict:
         """The pacer's current view, for /health."""
         with self._lock:
@@ -613,6 +623,16 @@ class GitHubClient:
         self._pacers_lock = threading.Lock()
         self.pacer = self.pacer_for("pat")      # the personal token's (and /health's github_pacer)
         self.auth.observer = self._observe
+        self.auth.pace = self._pace
+
+    def _pace(self, key: str) -> None:
+        """Wait for a slot on a credential's pacer (a resend inside the auth flow);
+        in the interactive lane, PaceTooLong instead of a long wait."""
+        try:
+            self.pacer_for(key).wait(max_wait=MAX_WAIT)
+        except PaceTooLong as e:
+            e.cred = key
+            raise
 
     def pacer_for(self, key: str) -> Pacer:
         with self._pacers_lock:

@@ -350,3 +350,91 @@ def test_health_names_the_personal_token_pacer(env):
     with TestClient(build_app(bridge)) as c:
         body = c.get("/health").json()
     assert body["github_pat_pacer"] == body["github_pacer"] and "pat" in body["github_pacers"]
+
+
+# ---------------------------------------------------------------- chaperone: starvation, holds
+
+def _spent_a_and_one_b(bridge, clock, n_a=200):
+    bridge.gh.auth.app = FakeApp({"acct-a": "A", "acct-b": "B"})
+    q = bridge.queue
+    for i in range(n_a):
+        q.put("x", f"a{i}", {"repo": "acct-a/r"})
+        clock.t += 0.01
+    q.put("x", "b1", {"repo": "acct-b/r"})
+    ran = []
+
+    def handler(p):
+        if p["repo"].startswith("acct-a"):
+            e = PaceTooLong(1500, "core")
+            e.cred = "app:acct-a"
+            raise e
+        ran.append(p["repo"])
+    return q, ran, handler
+
+
+def test_many_spent_entries_dont_starve_another_account(env):
+    """Chaperone repro: 200 older entries for spent account A, one for B."""
+    from bridge.queue import run_due
+    bridge, world, clock = env
+    q, ran, handler = _spent_a_and_one_b(bridge, clock)
+    for _ in range(2):
+        clock.t += 2
+        run_due(q, {"x": handler}, limit=20, stop=bridge._stops_queue_round,
+                group=bridge._entry_cred, skip=bridge._skip_cred, hold=bridge._hold_until)
+    assert ran == ["acct-b/r"]
+    attempts = [q.get("x", f"a{i}").attempts for i in range(200)]
+    assert sum(attempts) == 1                      # one A entry tried; the rest held, not counted
+    assert q.get("x", "a199").next_at >= clock.t + 1000 and q.held() == {"app:acct-a": 200}
+
+
+def test_rate_limit_waits_dont_turn_into_stuck_labels(env):
+    from bridge.queue import run_due
+    bridge, world, clock = env
+    reports = []
+    bridge.queue.on_stale = reports.append
+    q, ran, handler = _spent_a_and_one_b(bridge, clock, n_a=3)
+    for _ in range(8):                             # well past max_age (300 s), within the grace
+        clock.t += 400
+        run_due(q, {"x": handler}, limit=20, stop=bridge._stops_queue_round, group=bridge._entry_cred,
+                skip=bridge._skip_cred, hold=bridge._hold_until,
+                rate_limited=lambda e: isinstance(e, PaceTooLong))
+    assert reports == []
+    clock.t += q.rate_limit_grace                  # a wait far past any reset: flagged after all
+    run_due(q, {"x": handler}, limit=20, stop=bridge._stops_queue_round, group=bridge._entry_cred,
+            skip=bridge._skip_cred, hold=bridge._hold_until,
+            rate_limited=lambda e: isinstance(e, PaceTooLong))
+    assert len(reports) == 1
+
+
+def test_health_shows_held_entries_per_credential(env):
+    from fastapi.testclient import TestClient
+    from bridge.app import build_app
+    from bridge.queue import run_due
+    bridge, world, clock = env
+    q, ran, handler = _spent_a_and_one_b(bridge, clock, n_a=4)
+    run_due(q, {"x": handler}, limit=20, stop=bridge._stops_queue_round,
+            group=bridge._entry_cred, skip=bridge._skip_cred, hold=bridge._hold_until)
+    bridge.gh.auth.app = None                      # the fake app isn't a full AppTokens
+    with TestClient(build_app(bridge)) as c:
+        assert c.get("/health").json()["queue"]["held"] == {"app:acct-a": 4}
+
+
+def test_pat_fallback_resend_is_paced_on_the_pat_budget():
+    seen = []
+
+    def handler(req):
+        token = req.headers["Authorization"].split()[1]
+        seen.append(token)
+        if token == "C":
+            return httpx.Response(404, headers=limits(4500, 3000), json={"message": "Not Found"})
+        return httpx.Response(200, headers=limits(1, 3600), json={"full_name": "acme-c/private"})
+
+    gh, clock, sleeps = client(handler, GitHubAuth(pat="P", app=FakeApp({"acme-c": "C"})))
+    gh.get_repo("acme-c/private")                  # the PAT now reports 1 call left this hour
+    gh.auth._needs_pat.clear()                     # so the next call tries the app first again
+    with pytest.raises(PaceTooLong) as info:
+        for _ in range(20):
+            gh.get_repo("acme-c/private")
+            gh.auth._needs_pat.clear()
+    assert info.value.cred == "pat"
+    assert all(s <= MAX_WAIT for s in sleeps)

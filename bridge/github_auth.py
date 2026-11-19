@@ -499,6 +499,10 @@ class GitHubAuth(httpx.Auth):
         # re-mint or PAT-fallback resend inside one request, so the right pacer
         # learns from it. Set by GitHubClient.
         self.observer = None
+        # Called with a credential key before a resend inside one request (re-mint,
+        # PAT fallback), so the resend waits for that credential's slot. Set by
+        # GitHubClient; may raise (PaceTooLong) to stop the resend.
+        self.pace = None
 
     # -------- which credential a request uses (for pacing), without network calls
 
@@ -607,6 +611,8 @@ class GitHubAuth(httpx.Auth):
             self.app.forget(owner)
             token, owner = self._token(request.url.path)
             self._set(request, token)
+            if self.pace is not None:
+                self.pace(self.cred_key(owner))
             response = yield request
             self._sent(request, owner, response)
         if not (owner and self.app and self.pat):
@@ -616,8 +622,10 @@ class GitHubAuth(httpx.Auth):
             # 404: the installation can't see this repo (not in a "select
             # repositories" install). 403 "not accessible by integration": a public
             # repo outside the install, where reads work but writes are refused.
-            # Either way the personal token may be allowed.
+            # Either way the personal token may be allowed, paced on its own budget.
             self._set(request, self.pat)
+            if self.pace is not None:
+                self.pace("pat")
             response = yield request
             self._sent(request, None, response)
             m = _REPO_PATH.match(request.url.path)
