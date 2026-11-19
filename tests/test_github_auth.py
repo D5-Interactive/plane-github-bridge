@@ -117,6 +117,58 @@ def wait_for(cond, timeout=3.0):
         _time.sleep(0.01)
 
 
+class CountingLock:
+    """Wraps a lock and counts threads that have reached it, so a test can wait
+    until every thread is queued behind a call in flight before releasing it."""
+
+    def __init__(self, inner=None):
+        import threading
+        self.inner = inner or threading.Lock()
+        self.arrived = 0
+        self._count = threading.Lock()
+
+    def __enter__(self):
+        with self._count:
+            self.arrived += 1
+        return self.inner.__enter__()
+
+    def __exit__(self, *exc):
+        return self.inner.__exit__(*exc)
+
+
+def queue_behind_one_call(target, n, entered, release, lock):
+    """Start one thread, wait until it's inside the fake transport, start n-1 more,
+    wait until all of them have reached `lock`, then let the first call finish."""
+    import threading
+    threads = [threading.Thread(target=target) for _ in range(n)]
+    threads[0].start()
+    assert entered.wait(5), "the first call never reached GitHub"
+    for t in threads[1:]:
+        t.start()
+    wait_for(lambda: lock.arrived >= n)
+    release.set()
+    for t in threads:
+        t.join(5)
+        assert not t.is_alive()
+
+
+def owner_lock_counter(tokens):
+    """Make AppTokens' per-account locks CountingLocks; .arrived totals all of them."""
+    locks = {}
+
+    def owner_lock(key):
+        with tokens._guard:
+            return locks.setdefault(key, CountingLock())
+
+    class Shared:
+        @property
+        def arrived(self):
+            return sum(lk.arrived for lk in locks.values())
+
+    tokens._owner_lock = owner_lock
+    return Shared()
+
+
 def creds(pem):
     return AppCredentials(app_id="123", private_key=pem, webhook_secret="app-secret")
 
@@ -575,24 +627,22 @@ def test_installation_event_resets_the_cached_token(bare, keypair):
 
 def test_concurrent_requests_for_one_account_mint_once(keypair):
     import threading
-    import time as _time
     pem, public = keypair
     clock = Clock()
     fake = FakeAppGitHub(public, clock)
+    entered, release = threading.Event(), threading.Event()
 
-    def slow(req):
+    def held(req):
         if req.url.path.endswith("/access_tokens"):
-            _time.sleep(0.2)
+            entered.set()
+            assert release.wait(5)
         return fake.handler(req)
 
-    tokens = AppTokens(creds(pem), transport=httpx.MockTransport(slow), clock=clock)
+    tokens = AppTokens(creds(pem), transport=httpx.MockTransport(held), clock=clock)
+    lock = owner_lock_counter(tokens)
     out = []
-    threads = [threading.Thread(target=lambda: out.append(tokens.token_for("acme"))) for _ in range(8)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert fake.minted == 1 and set(out) == {"ghs_900_1"}
+    queue_behind_one_call(lambda: out.append(tokens.token_for("acme")), 8, entered, release, lock)
+    assert fake.minted == 1 and out == ["ghs_900_1"] * 8
 
 
 def test_forget_does_not_wait_for_a_mint_in_progress(keypair):
@@ -601,17 +651,18 @@ def test_forget_does_not_wait_for_a_mint_in_progress(keypair):
     pem, public = keypair
     clock = Clock()
     fake = FakeAppGitHub(public, clock)
-    release = threading.Event()
+    entered, release = threading.Event(), threading.Event()
 
     def blocking(req):
         if req.url.path.endswith("/access_tokens"):
-            release.wait(5)
+            entered.set()
+            assert release.wait(5)
         return fake.handler(req)
 
     tokens = AppTokens(creds(pem), transport=httpx.MockTransport(blocking), clock=clock)
     minting = threading.Thread(target=tokens.token_for, args=("acme",))
     minting.start()
-    _time.sleep(0.1)                             # the mint is now stuck on the network
+    assert entered.wait(5)                       # the mint is now stuck on the network
     started = _time.monotonic()
     tokens.forget("acme")
     tokens.forget("other")
@@ -746,15 +797,16 @@ def test_missing_webhook_secret_from_github_is_warned_about(keypair, caplog):
 
 def test_two_callbacks_at_once_save_only_one_app(bare, keypair, tmp_path):
     import threading
-    import time as _time
     pem, public = keypair
     fake = FakeAppGitHub(public, Clock())
     conversions = []
+    entered, release = threading.Event(), threading.Event()
 
     def handler(req):
         if req.url.path.startswith("/app-manifests/"):
             conversions.append(req.url.path)
-            _time.sleep(0.3)                      # GitHub is slow; the second tab submits meanwhile
+            entered.set()                         # GitHub is slow; the second tab submits meanwhile
+            assert release.wait(5)
             return httpx.Response(201, json={"id": 123, "slug": "s", "pem": pem,
                                              "webhook_secret": "w", "html_url": "https://github.com/apps/s"})
         return fake.handler(req)
@@ -765,12 +817,11 @@ def test_two_callbacks_at_once_save_only_one_app(bare, keypair, tmp_path):
     states = [re.search(r"state=([\w-]+)", client.get(f"/setup?token={token}").text).group(1)
               for _ in range(2)]
     results = []
-    threads = [threading.Thread(target=lambda st=st: results.append(
-        client.get(f"/setup/callback?code=c{st[:4]}&state={st}").status_code)) for st in states]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    lock = CountingLock(app.state.setup._callback_lock)
+    app.state.setup._callback_lock = lock
+    pending = list(states)
+    queue_behind_one_call(lambda: (st := pending.pop(0), results.append(
+        client.get(f"/setup/callback?code=c{st[:4]}&state={st}").status_code)), 2, entered, release, lock)
     assert sorted(results) == [303, 404]
     assert len(conversions) == 1                  # the second never reached GitHub
 
@@ -1084,26 +1135,24 @@ def test_a_cached_token_is_used_during_a_pause(keypair):
 
 def test_concurrent_requests_during_a_failure_make_one_lookup(keypair):
     import threading
-    import time as _time
     pem, _ = keypair
     lookups, repo_calls = [], []
+    entered, release = threading.Event(), threading.Event()
 
     def handler(req):
         if req.url.path.endswith("/installation"):
             lookups.append(1)
-            _time.sleep(0.2)
+            entered.set()
+            assert release.wait(5)
             return httpx.Response(500, json={})
         repo_calls.append(req.headers.get("Authorization"))
         return httpx.Response(200, json={})
 
     t = httpx.MockTransport(handler)
-    gh = GitHubClient(GitHubAuth(pat="ghp_pat", app=AppTokens(AppCredentials("1", pem), transport=t)),
-                      transport=t)
-    threads = [threading.Thread(target=gh.get_repo, args=("acme/r",)) for _ in range(5)]
-    for th in threads:
-        th.start()
-    for th in threads:
-        th.join()
+    tokens = AppTokens(AppCredentials("1", pem), transport=t, clock=Clock())
+    lock = owner_lock_counter(tokens)
+    gh = GitHubClient(GitHubAuth(pat="ghp_pat", app=tokens), transport=t)
+    queue_behind_one_call(lambda: gh.get_repo("acme/r"), 5, entered, release, lock)
     assert len(lookups) == 1
     assert repo_calls == ["Bearer ghp_pat"] * 5
 
